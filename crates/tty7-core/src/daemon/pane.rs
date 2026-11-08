@@ -3686,15 +3686,27 @@ struct ObservedFacts {
 
 fn observed_facts(st: &PaneState) -> ObservedFacts {
     let cwd = st.cwd.as_ref().map(|p| p.to_string_lossy().into_owned());
-    let agent = st.agent.map(|agent| crate::core::machine::AgentFacts {
-        agent,
-        session_id: st.agent_session.as_ref().and_then(|s| s.session_id.clone()),
-        launch_argv: st
+    let agent = st.agent.map(|agent| {
+        let launch_argv = st
             .agent_session
             .as_ref()
             .and_then(|s| s.launch_argv.clone())
-            .or_else(|| st.agent_argv.clone()),
-        status: st.agent_session.as_ref().map(|s| s.status),
+            .or_else(|| st.agent_argv.clone());
+        let session_id = st
+            .agent_session
+            .as_ref()
+            .and_then(|s| s.session_id.clone())
+            .or_else(|| {
+                launch_argv
+                    .as_deref()
+                    .and_then(|argv| agent.session_id_from_argv(argv).map(str::to_string))
+            });
+        crate::core::machine::AgentFacts {
+            agent,
+            session_id,
+            launch_argv,
+            status: st.agent_session.as_ref().map(|s| s.status),
+        }
     });
     ObservedFacts {
         cwd,

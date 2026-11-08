@@ -364,6 +364,91 @@ impl CLIAgent {
         })
     }
 
+    /// Extracts a session id that was passed on the command line (e.g.
+    /// `--resume <id>`, `--session <id>`, `resume <id>`) so a resumed agent
+    /// that has not yet fired another hook event still preserves its session id
+    /// across subsequent server restarts.
+    pub fn session_id_from_argv(self, argv: &[String]) -> Option<&str> {
+        let valid_id = |id: &str| {
+            !id.is_empty()
+                && !id.starts_with('-')
+                && id
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
+        };
+        let flags: &[&str] = match self {
+            CLIAgent::Claude
+            | CLIAgent::Gemini
+            | CLIAgent::Cursor
+            | CLIAgent::Copilot
+            | CLIAgent::Auggie
+            | CLIAgent::Hermes
+            | CLIAgent::Qwen
+            | CLIAgent::QoderCLI
+            | CLIAgent::QoderCLICn
+            | CLIAgent::CodeBuddy => &["--resume", "-r", "--session-id"],
+            CLIAgent::Droid => &["--resume", "-r", "--fork", "--session-id", "-s"],
+            CLIAgent::Goose => &["--session-id", "--id"],
+            CLIAgent::Vibe | CLIAgent::Jcode => &["--resume"],
+            CLIAgent::Antigravity => &["--conversation"],
+            CLIAgent::OpenCode | CLIAgent::Crush => &["--session", "-s"],
+            CLIAgent::Pi | CLIAgent::OhMyPi | CLIAgent::PrimeAgent => {
+                &["--session", "--session-id", "--fork", "--resume", "-r"]
+            }
+            CLIAgent::Empryo => &["--session"],
+            CLIAgent::Kimi => &["--session", "-S", "--resume", "-r"],
+            CLIAgent::Grok => &["--resume", "-r", "--load", "--session-id", "-s"],
+            CLIAgent::TraeCode => &["--resume", "--session-id"],
+            _ => &[],
+        };
+        let mut iter = argv.iter().map(String::as_str).peekable();
+        while let Some(tok) = iter.next() {
+            if flags.contains(&tok) {
+                if let Some(&next) = iter.peek()
+                    && valid_id(next)
+                {
+                    return Some(next);
+                }
+            } else if let Some(val) = flags
+                .iter()
+                .filter(|f| f.len() > 2)
+                .find_map(|f| tok.strip_prefix(&format!("{f}=")))
+                && valid_id(val)
+            {
+                return Some(val);
+            } else if matches!(self, CLIAgent::Codex | CLIAgent::TraeCode | CLIAgent::Muse)
+                && matches!(tok, "resume" | "fork")
+                && let Some(&next) = iter.peek()
+                && valid_id(next)
+            {
+                return Some(next);
+            } else if matches!(self, CLIAgent::Amp)
+                && matches!(tok, "threads" | "t")
+                && let Some(&verb) = iter.peek()
+                && matches!(verb, "continue" | "c" | "fork" | "f" | "handoff" | "h")
+            {
+                iter.next();
+                if let Some(&next) = iter.peek()
+                    && valid_id(next)
+                {
+                    return Some(next);
+                }
+            } else if matches!(self, CLIAgent::Auggie)
+                && tok == "session"
+                && let Some(&verb) = iter.peek()
+                && matches!(verb, "resume" | "continue")
+            {
+                iter.next();
+                if let Some(&next) = iter.peek()
+                    && valid_id(next)
+                {
+                    return Some(next);
+                }
+            }
+        }
+        None
+    }
+
     fn session_command_flags(
         self,
         session_id: &str,
@@ -435,6 +520,26 @@ impl CLIAgent {
         {
             tail.remove(0);
             if tail.first().is_some_and(|t| !t.starts_with('-')) {
+                tail.remove(0);
+            }
+        }
+
+        // cursor-agent's launcher is `exec -a "$0" "$NODE_BIN" [--use-system-ca]
+        // "$SCRIPT_DIR/index.js" "$@"`. The process table therefore shows the
+        // binary name first (from `-a`), then Node's own `--use-system-ca` and
+        // the path to `index.js`, then the real flags. Those two tokens are not
+        // cursor-agent options — replaying them builds
+        // `cursor-agent --use-system-ca …/index.js --resume <id>`, which the CLI
+        // rejects as an unknown option. Drop them whether or not the CA flag is
+        // present; an `index.js` that is not the entry script never sits here.
+        if matches!(self, CLIAgent::Cursor) {
+            if matches!(tail.first(), Some(&"--use-system-ca")) {
+                tail.remove(0);
+            }
+            if tail
+                .first()
+                .is_some_and(|t| t.split(['/', '\\']).next_back() == Some("index.js"))
+            {
                 tail.remove(0);
             }
         }
@@ -2528,6 +2633,106 @@ mod tests {
                 .fork_command("q-1", Some(&persistent))
                 .as_deref(),
             Some("qodercli --model qoder-1 --resume q-1 --fork-session")
+        );
+    }
+
+    #[test]
+    fn cursor_resume_strips_node_launcher_argv() {
+        let argv = |parts: &[&str]| parts.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+        assert_eq!(
+            CLIAgent::Cursor
+                .resume_command(
+                    "abc-123",
+                    Some(&argv(&[
+                        "/Users/me/.local/bin/cursor-agent",
+                        "--use-system-ca",
+                        "/Users/me/.local/share/cursor-agent/versions/2026.01.01-abc/index.js",
+                        "--model",
+                        "gpt-5",
+                    ]))
+                )
+                .as_deref(),
+            Some("cursor-agent --model gpt-5 --resume abc-123"),
+            "exec -a leaves Node's --use-system-ca and index.js ahead of the real flags"
+        );
+        assert_eq!(
+            CLIAgent::Cursor
+                .resume_command(
+                    "abc-123",
+                    Some(&argv(&[
+                        "cursor-agent",
+                        "/Users/me/.local/share/cursor-agent/versions/x/index.js",
+                        "--model",
+                        "gpt-5",
+                    ]))
+                )
+                .as_deref(),
+            Some("cursor-agent --model gpt-5 --resume abc-123"),
+            "the same launcher without --use-system-ca still drops index.js"
+        );
+        assert_eq!(
+            CLIAgent::Cursor
+                .resume_command(
+                    "abc-123",
+                    Some(&argv(&[
+                        "cursor-agent",
+                        "--use-system-ca",
+                        r"C:\Users\me\cursor-agent\versions\x\index.js",
+                    ]))
+                )
+                .as_deref(),
+            Some("cursor-agent --resume abc-123"),
+            "a bare launch (no extra flags) resumes cleanly, Windows path included"
+        );
+        assert_eq!(
+            CLIAgent::Cursor
+                .resume_command(
+                    "abc-123",
+                    Some(&argv(&["cursor-agent", "--model", "gpt-5"]))
+                )
+                .as_deref(),
+            Some("cursor-agent --model gpt-5 --resume abc-123"),
+            "a direct launch with no Node wrapper is unchanged"
+        );
+    }
+
+    #[test]
+    fn session_id_from_argv_extracts_id_and_ignores_unrelated_flags() {
+        let argv = |parts: &[&str]| parts.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+        assert_eq!(
+            CLIAgent::Cursor
+                .session_id_from_argv(&argv(&["cursor-agent", "--resume", "sess-123",])),
+            Some("sess-123")
+        );
+        assert_eq!(
+            CLIAgent::Kimi.session_id_from_argv(&argv(&["kimi", "--session=kimi-42", "--yolo"])),
+            Some("kimi-42")
+        );
+        assert_eq!(
+            CLIAgent::Codex.session_id_from_argv(&argv(&[
+                "codex",
+                "-s",
+                "workspace-write",
+                "resume",
+                "th_99",
+            ])),
+            Some("th_99"),
+            "Codex's -s is --sandbox, not a session flag"
+        );
+        assert_eq!(
+            CLIAgent::Claude.session_id_from_argv(&argv(&["claude", "-s", "not-a-session"])),
+            None,
+            "Claude does not use -s for session ids"
+        );
+        assert_eq!(
+            CLIAgent::Amp.session_id_from_argv(&argv(&["amp", "threads", "continue", "t-77"])),
+            Some("t-77")
+        );
+        assert_eq!(
+            CLIAgent::Auggie.session_id_from_argv(&argv(&["auggie", "session", "resume", "au-88"])),
+            Some("au-88")
         );
     }
 
