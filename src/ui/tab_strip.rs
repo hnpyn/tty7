@@ -1761,6 +1761,39 @@ impl Tty7App {
             .into_any_element()
     }
 
+    pub(crate) fn split_mark(
+        &self,
+        id: impl Into<gpui::ElementId>,
+        panes: usize,
+        cx: &App,
+    ) -> gpui::AnyElement {
+        let lang = cx
+            .try_global::<Config>()
+            .map(|c| c.gui_language.as_str())
+            .unwrap_or("en");
+        let tip = SharedString::from(match lang {
+            "zh-CN" | "zh" => format!("{panes} 个窗格"),
+            _ => format!("{panes} panes"),
+        });
+        h_flex()
+            .id(id)
+            .flex_shrink_0()
+            .items_center()
+            .justify_center()
+            .h(px(15.))
+            .px(px(4.))
+            .gap(px(2.5))
+            .rounded(px(4.))
+            .bg(cx.theme().muted)
+            .text_color(cx.theme().muted_foreground)
+            .text_size(px(10.))
+            .font_weight(FontWeight::MEDIUM)
+            .child(Icon::new(IconName::LayoutDashboard).size(px(10.)))
+            .child(panes.to_string())
+            .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+            .into_any_element()
+    }
+
     /// The full title behind a shortened one, for the row to name on hover.
     ///
     /// `tab_label` hands back a path elided to its last three segments and then
@@ -2516,6 +2549,9 @@ impl Tty7App {
                 .when(asleep, |chip| {
                     chip.child(self.sleep_mark(("tab-asleep", i), cx))
                 })
+                .when(tab.pane_count() > 1, |chip| {
+                    chip.child(self.split_mark(("tab-split", i), tab.pane_count(), cx))
+                })
                 .child(label_region)
                 .when(show_badges && i < 9, |chip| {
                     chip.child(
@@ -2613,60 +2649,57 @@ impl Tty7App {
 
         // Same bargain the rail's own tiles keep when the Appearance switch is
         // on: present in the layout, painted only while the pointer is on the
-        // bar. The New Tab button that trails the chips is left alone — it is
-        // part of the row of tabs, not of the window's chrome.
-        let auto_hide_chrome = cx.global::<Config>().auto_hide_titlebar_buttons;
+        // bar. In vertical tab mode (`!show_chips`), the bar floats over the
+        // terminal column, so the search pill and buttons always rest hidden
+        // until the pointer enters the top bar (`strip_chrome_hover`).
+        let auto_hide_chrome = !show_chips || cx.global::<Config>().auto_hide_titlebar_buttons;
         let strip_chrome_shown =
             crate::ui::app::titlebar_chrome_shown(auto_hide_chrome, self.strip_chrome_hover.get());
         let rail_collapsed = !show_chips && !self.left_panel_open(cx);
         let left_group = rail_collapsed.then(|| {
-            h_flex()
-                .flex_shrink_0()
-                .items_center()
-                .gap(px(2.))
-                .ml(px(crate::ui::app::title_bar_hug_offset()))
-                .when_some(crate::ui::app::window_mark(), |group, mark| {
-                    group.child(
-                        div()
-                            .flex_shrink_0()
-                            .pl(px(crate::ui::app::CONTENT_INSET
-                                - crate::ui::app::tile_trailing_inset()))
-                            .pr(px(4.))
-                            .child(mark),
-                    )
-                })
-                // The logo above stays put: it is the window's mark, not a
-                // control, and a window that loses its identity when nobody is
-                // pointing at it reads as a different window.
-                .child(
-                    crate::ui::app::resting_chrome(
-                        div().occlude().flex_shrink_0(),
-                        strip_chrome_shown,
-                    )
-                    .child(self.new_tab_button("titlebar-add-collapsed", cx)),
-                )
-                .child(
-                    crate::ui::app::resting_chrome(
-                        div().occlude().flex_shrink_0(),
-                        strip_chrome_shown,
-                    )
-                    .child(
-                        chrome_tile(
-                            Button::new("titlebar-expand-sidebar")
-                                .icon(Icon::empty().path("icons/panel-left-collapsed.svg")),
-                            false,
-                            cx,
-                        )
-                        .rounded_lg()
-                        .accessible_label(t(L10nKey::TabTooltipShowSidebar))
-                        .tooltip_element(chord_tooltip(
-                            t(L10nKey::TabTooltipShowSidebar),
-                            "ToggleLeftPanel",
-                            cx,
+            crate::ui::app::resting_chrome(
+                h_flex()
+                    .flex_shrink_0()
+                    .items_center()
+                    .gap(px(2.))
+                    .ml(px(crate::ui::app::title_bar_hug_offset())),
+                strip_chrome_shown,
+            )
+            .when_some(crate::ui::app::window_mark(), |group, mark| {
+                group.child(
+                    div()
+                        .flex_shrink_0()
+                        .pl(px(
+                            crate::ui::app::CONTENT_INSET - crate::ui::app::tile_trailing_inset()
                         ))
-                        .on_click(cx.listener(|this, _, _window, cx| this.toggle_left_panel(cx))),
-                    ),
+                        .pr(px(4.))
+                        .child(mark),
                 )
+            })
+            .child(
+                div()
+                    .occlude()
+                    .flex_shrink_0()
+                    .child(self.new_tab_button("titlebar-add-collapsed", cx)),
+            )
+            .child(
+                div().occlude().flex_shrink_0().child(
+                    chrome_tile(
+                        Button::new("titlebar-expand-sidebar")
+                            .icon(Icon::empty().path("icons/panel-left-collapsed.svg")),
+                        false,
+                        cx,
+                    )
+                    .rounded_lg()
+                    .accessible_label(t(L10nKey::TabTooltipShowSidebar))
+                    .tooltip_element(chord_tooltip(
+                        t(L10nKey::TabTooltipShowSidebar),
+                        "ToggleLeftPanel",
+                        cx,
+                    ))
+                    .on_click(cx.listener(|this, _, _window, cx| this.toggle_left_panel(cx))),
+                ),
+            )
         });
 
         // macOS places these controls in the open panel's own title bar, and
@@ -2676,7 +2709,7 @@ impl Tty7App {
         // beside the panel's own tab row — which is painted whenever the panel
         // is, so a band that grew a button on hover read as a glitch next to
         // it. Once the panel is open they belong to its chrome, and stay.
-        let right_chrome_shown = strip_chrome_shown || self.right_panel_open(cx);
+        let right_chrome_shown = strip_chrome_shown || (show_chips && self.right_panel_open(cx));
         let right_chrome = strip_chrome.then(|| {
             crate::ui::app::resting_chrome(div().flex_shrink_0(), right_chrome_shown)
                 .child(self.window_chrome(cx))
@@ -2713,67 +2746,71 @@ impl Tty7App {
             // Two equal springs either side keep the box centred; each stops
             // at the band's `clear`, and past that it is the box that gives.
             let spring = || div().flex_1().min_w(px(band.clear));
-            div()
-                .absolute()
-                .top_0()
-                .bottom_0()
-                .left(px(band.left))
-                .right(px(band.right))
-                .flex()
-                .items_center()
-                .child(spring())
-                .child(
-                    h_flex()
-                        .id("titlebar-search")
-                        .occlude()
-                        .w(px(TITLEBAR_SEARCH_W))
-                        .min_w_0()
-                        // Enough of the bar that the label and its chord still
-                        // fit with a document docked beside the terminal; at a
-                        // half it read `Search Everywhe…` in exactly the
-                        // layout people search from most.
-                        .max_w(gpui::relative(0.6))
-                        .h(px(TITLEBAR_SEARCH_H))
-                        .items_center()
-                        .gap(px(7.))
-                        .pl(px(10.))
-                        .pr(px(10.))
-                        .rounded(px(7.))
-                        // The left rail's fill (`Surfaces::rail`, #f5f5f3 /
-                        // #1e1e20 on the default pair) — not `sidebar`, which
-                        // is the window's own fill and vanished into the bar.
-                        .bg(gpui::rgb(
-                            cx.global::<crate::ui::presets::Surfaces>().rail.base,
-                        ))
-                        .cursor_pointer()
-                        .text_size(window.rem_size() * 0.8125)
-                        .text_color(cx.theme().muted_foreground)
-                        .hover(|s| s.text_color(cx.theme().foreground))
-                        .child(Icon::new(IconName::Search).size(px(12.)).flex_shrink_0())
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .truncate()
-                                .child(t(L10nKey::AppMenuSearchEverywhere)),
-                        )
-                        .when_some(chord, |row, chord| {
-                            row.child(div().flex_shrink_0().child(chord))
-                        })
-                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                        .on_click(
-                            cx.listener(|this, _, window, cx| match this.search.is_some() {
-                                true => this.close_search(window, cx),
-                                false => this.open_search(SearchTab::All, "", window, cx),
-                            }),
-                        ),
-                )
-                .child(spring())
+            crate::ui::app::resting_chrome(
+                div()
+                    .absolute()
+                    .top_0()
+                    .bottom_0()
+                    .left(px(band.left))
+                    .right(px(band.right))
+                    .flex()
+                    .items_center(),
+                strip_chrome_shown,
+            )
+            .child(spring())
+            .child(
+                h_flex()
+                    .id("titlebar-search")
+                    .occlude()
+                    .w(px(TITLEBAR_SEARCH_W))
+                    .min_w_0()
+                    // Enough of the bar that the label and its chord still
+                    // fit with a document docked beside the terminal; at a
+                    // half it read `Search Everywhe…` in exactly the
+                    // layout people search from most.
+                    .max_w(gpui::relative(0.6))
+                    .h(px(TITLEBAR_SEARCH_H))
+                    .items_center()
+                    .gap(px(7.))
+                    .pl(px(10.))
+                    .pr(px(10.))
+                    .rounded(px(7.))
+                    // The left rail's fill (`Surfaces::rail`, #f5f5f3 /
+                    // #1e1e20 on the default pair) — not `sidebar`, which
+                    // is the window's own fill and vanished into the bar.
+                    .bg(gpui::rgb(
+                        cx.global::<crate::ui::presets::Surfaces>().rail.base,
+                    ))
+                    .cursor_pointer()
+                    .text_size(window.rem_size() * 0.8125)
+                    .text_color(cx.theme().muted_foreground)
+                    .hover(|s| s.text_color(cx.theme().foreground))
+                    .child(Icon::new(IconName::Search).size(px(12.)).flex_shrink_0())
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .child(t(L10nKey::AppMenuSearchEverywhere)),
+                    )
+                    .when_some(chord, |row, chord| {
+                        row.child(div().flex_shrink_0().child(chord))
+                    })
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(
+                        cx.listener(|this, _, window, cx| match this.search.is_some() {
+                            true => this.close_search(window, cx),
+                            false => this.open_search(SearchTab::All, "", window, cx),
+                        }),
+                    ),
+            )
+            .child(spring())
         });
 
         h_flex()
             .id("tab-strip")
             .relative()
+            .h_full()
             .items_center()
             .gap_1p5()
             .when(show_chips, |this| this.w(strip_w))
@@ -2906,13 +2943,19 @@ fn avatar_disc(
             })
             .into_any_element()
         }
-        None => base
-            .child(
-                disc().bg(cx.theme().muted).child(
+        None => {
+            let dark = cx.theme().mode.is_dark();
+            let (bg, fg) = if dark {
+                (gpui::rgb(0xE4E4E7), gpui::rgb(0x18181B))
+            } else {
+                (gpui::rgb(0x27272A), gpui::rgb(0xFFFFFF))
+            };
+            base.child(
+                disc().bg(bg).child(
                     gpui::svg()
                         .path("icons/terminal.svg")
-                        .size(px(size * 0.56))
-                        .text_color(cx.theme().foreground.opacity(0.65)),
+                        .size(px(size * 0.58))
+                        .text_color(fg),
                 ),
             )
             .when_some(ssh, |b, rgb| {
@@ -2925,7 +2968,8 @@ fn avatar_disc(
                     false,
                 ))
             })
-            .into_any_element(),
+            .into_any_element()
+        }
     }
 }
 
@@ -3929,25 +3973,25 @@ mod tests {
             let tab = &app.tabs[index];
             let (view, home) = tab.label_view(Some(window), cx);
             assert_eq!(view.osc_title, None, "the pane never titled itself");
-            assert_eq!(view.cwd.as_deref(), Some("/work/repo"));
+            assert_eq!(
+                view.cwd, None,
+                "tabs show shell/process name rather than cwd"
+            );
 
             let strip = app.tab_label(tab, index, Some(window), cx);
-            assert_eq!(strip, "/work/repo");
+            assert_eq!(strip, view.title);
             assert_ne!(
                 strip,
                 crate::terminal::view::DEFAULT_TITLE,
                 "and is not named after the app any more"
             );
 
-            // The machine tree's reading of the same pane, which is all the
-            // switcher ever has: no title was seen, the cwd is the one above,
-            // and `title` is the foreground process name.
             let from_tree = crate::ui::machine_mirror::TabView {
                 id: tab.tree_id.get(),
                 name: None,
-                title: "zsh".into(),
+                title: view.title.clone(),
                 osc_title: None,
-                cwd: Some("/work/repo".into()),
+                cwd: None,
                 agent: None,
                 status: None,
                 live: true,
@@ -3962,7 +4006,42 @@ mod tests {
             assert_eq!(
                 app.tab_title_tooltip(tab, index, Some(window), cx),
                 None,
-                "and the row is showing the whole path, so it stays quiet"
+                "and the row is showing a process/shell name, so it stays quiet"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn a_split_tab_reports_its_pane_count_while_keeping_single_title(cx: &mut TestAppContext) {
+        use crate::ui::pane::{Pane, PaneSlot};
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        let (app, mut vcx) = crate::ui::app::test_window::harness(cx);
+        let (_s1, _s2) = app.update_in(&mut vcx, |app, window, cx| {
+            let (v1, s1) = crate::terminal::view::quiet_test_pane(1, window, cx);
+            let (v2, s2) = crate::terminal::view::quiet_test_pane(2, window, cx);
+            let split = Pane::Split {
+                axis: gpui::Axis::Horizontal,
+                a: Box::new(Pane::leaf(PaneSlot::Ready(v1))),
+                b: Box::new(Pane::leaf(PaneSlot::Ready(v2))),
+                ratio: Rc::new(Cell::new(0.5)),
+                dragging: Rc::new(Cell::new(false)),
+            };
+            app.tabs.push(crate::ui::app::Tab::new(split));
+            app.active = app.tabs.len() - 1;
+            (s1, s2)
+        });
+        vcx.background_executor.run_until_parked();
+
+        app.update_in(&mut vcx, |app, window, cx| {
+            let index = app.active;
+            let shell = crate::ui::app::shell_program_basename(&crate::core::shells::login_shell())
+                .unwrap_or_else(|| "sh".to_string());
+            assert_eq!(app.tabs[index].pane_count(), 2);
+            assert_eq!(
+                app.tab_label(&app.tabs[index], index, Some(window), cx),
+                shell
             );
         });
     }

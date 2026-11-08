@@ -694,7 +694,18 @@ impl Tab {
     /// The agent a sleeping tab was running when it went to sleep, so its row
     /// still says what it is while nothing in it can.
     pub(crate) fn asleep_agent(&self) -> Option<crate::core::cli_agent::CLIAgent> {
-        self.asleep.as_ref().and_then(|a| a.view.agent)
+        self.asleep.as_ref().and_then(|a| {
+            a.view
+                .agent
+                .or_else(|| view_of_layout(self.tree_id.get(), &a.layout).agent)
+        })
+    }
+
+    pub(crate) fn pane_count(&self) -> usize {
+        match &self.asleep {
+            Some(asleep) => asleep.view.panes,
+            None => self.pane.leaves().len(),
+        }
     }
 
     fn focus_target(&self) -> Option<crate::ui::pane::PaneSlot> {
@@ -792,11 +803,13 @@ impl Tab {
             return (view, asleep.home.clone());
         }
         let Some(leaf) = self.title_leaf(window, cx) else {
+            let default_shell = shell_program_basename(&crate::core::shells::login_shell())
+                .unwrap_or_else(|| "sh".to_string());
             return (
                 tty7_core::core::tab_view::TabView {
                     id: self.tree_id.get(),
                     name,
-                    title: String::new(),
+                    title: default_shell,
                     osc_title: None,
                     cwd: None,
                     agent: None,
@@ -808,22 +821,28 @@ impl Tab {
             );
         };
         let leaf = leaf.read(cx);
+        let raw_cmd = leaf.raw_running_command();
+        let osc_title = leaf
+            .stated_title()
+            .filter(|t| !osc_title_is_path_or_echo(t, leaf.cwd().as_deref(), raw_cmd.as_deref()))
+            .map(str::to_string);
+        let title = leaf.running_command_title().unwrap_or_else(|| {
+            pane_shell_program(leaf, cx)
+                .as_deref()
+                .and_then(shell_program_basename)
+                .or_else(|| shell_program_basename(&crate::core::shells::login_shell()))
+                .unwrap_or_else(|| "sh".to_string())
+        });
         let view = tty7_core::core::tab_view::TabView {
             id: self.tree_id.get(),
             name,
-            // The tree's `title` is the foreground process name — what it falls
-            // back on once a pane has said nothing about itself. A live pane's
-            // equivalent is the placeholder it answers to unprompted: any
-            // *other* default it was given (an SSH host, a workspace name) is a
-            // name tty7 chose for it deliberately, and `stated_title` hands
-            // those up as the title the pane is showing.
-            title: crate::terminal::view::DEFAULT_TITLE.to_string(),
-            osc_title: leaf.stated_title().map(str::to_string),
-            cwd: leaf.cwd().map(|p| p.display().to_string()),
+            title,
+            osc_title,
+            cwd: None,
             agent: leaf.agent(),
             status: leaf.agent_session().map(|s| s.status),
             live: !leaf.terminal.exited,
-            panes: self.pane.terminals().len(),
+            panes: self.pane.leaves().len(),
         };
         (view, leaf.display_home(cx))
     }
@@ -9572,10 +9591,10 @@ impl Render for Tty7App {
         // back painted, with nobody pointing at them, the next time the sheet
         // does. Clear the flag of every sheet not built this frame.
         let auto_hide_chrome = cx.global::<Config>().auto_hide_titlebar_buttons;
-        if !auto_hide_chrome || !rail {
+        if !rail {
             self.sidebar_chrome_hover.set(false);
         }
-        if !auto_hide_chrome {
+        if !auto_hide_chrome && !vertical {
             self.strip_chrome_hover.set(false);
         }
         // Both read before the strip and the sidebar are built: a tab held out
@@ -9776,15 +9795,49 @@ impl Render for Tty7App {
         } else {
             0.
         };
-        let terminal_column = div()
-            .flex_1()
-            .min_w_0()
-            .flex()
-            .flex_col()
-            .relative()
-            .when_some(column_title_bar, |this, bar| this.child(bar))
-            .child(body_area)
-            .children(column_overlays);
+        let terminal_column = if vertical {
+            let strip_hovered = self.strip_chrome_hover.get();
+            let hover_flag = self.strip_chrome_hover.clone();
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .relative()
+                .child(body_area)
+                .when_some(column_title_bar, move |this, bar| {
+                    if strip_hovered {
+                        this.child(div().absolute().top_0().left_0().right_0().child(bar))
+                    } else {
+                        this.child(
+                            div()
+                                .id("strip-chrome-edge-trigger")
+                                .absolute()
+                                .top_0()
+                                .left_0()
+                                .right_0()
+                                .h(px(6.))
+                                .on_hover(move |over, window, _cx| {
+                                    if *over && !hover_flag.get() {
+                                        hover_flag.set(true);
+                                        window.refresh();
+                                    }
+                                }),
+                        )
+                    }
+                })
+                .children(column_overlays)
+        } else {
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .relative()
+                .when_some(column_title_bar, |this, bar| this.child(bar))
+                .child(body_area)
+                .children(column_overlays)
+        };
         let panel_row = div()
             .flex_1()
             .min_h_0()
@@ -10485,7 +10538,11 @@ fn agent_resume_command(
         return None;
     }
     let agent = agent.as_ref()?;
-    let Some(session_id) = session_id else {
+    let fallback_id = session_id
+        .is_none()
+        .then(|| launch_argv.and_then(|argv| agent.session_id_from_argv(argv)))
+        .flatten();
+    let Some(session_id) = session_id.or(fallback_id) else {
         log::info!(
             "{}'s pane had no captured session id; it comes back as a plain shell",
             agent.display_name()
@@ -10514,6 +10571,61 @@ fn pane_shell_program(view: &TerminalView, cx: &App) -> Option<String> {
         Some(shell) if !shell.program.trim().is_empty() => shell.program.clone(),
         _ => crate::core::shells::login_shell(),
     })
+}
+
+pub(crate) fn shell_program_basename(program: &str) -> Option<String> {
+    let first = program.split_whitespace().next()?;
+    let base = first
+        .rsplit(['/', '\\'])
+        .find(|seg| !seg.is_empty())
+        .unwrap_or(first)
+        .trim_start_matches('-');
+    let base = base
+        .strip_suffix(".exe")
+        .or_else(|| base.strip_suffix(".EXE"))
+        .unwrap_or(base);
+    (!base.is_empty()).then(|| base.to_string())
+}
+
+fn osc_title_is_path_or_echo(
+    raw: &str,
+    cwd: Option<&std::path::Path>,
+    running_cmd: Option<&str>,
+) -> bool {
+    let stripped = tty7_core::core::tab_view::strip_host_prefix(raw.trim()).trim();
+    if stripped.is_empty() {
+        return true;
+    }
+    if stripped == "~"
+        || stripped.starts_with('/')
+        || stripped.starts_with("~/")
+        || stripped.starts_with("~\\")
+        || stripped.starts_with("./")
+        || stripped.starts_with("../")
+        || stripped.starts_with(".\\")
+        || stripped.starts_with("..\\")
+    {
+        return true;
+    }
+    let bytes = stripped.as_bytes();
+    if bytes.len() >= 2
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes.len() == 2 || bytes[2] == b'/' || bytes[2] == b'\\')
+    {
+        return true;
+    }
+    if let Some(cwd) = cwd
+        && stripped == cwd.to_string_lossy().as_ref()
+    {
+        return true;
+    }
+    if let Some(cmd) = running_cmd.map(str::trim).filter(|c| !c.is_empty())
+        && stripped == cmd
+    {
+        return true;
+    }
+    false
 }
 
 fn pane_to_session(pane: &Pane, cx: &App) -> SessionPane {
@@ -10769,20 +10881,18 @@ fn view_of_layout(
     }
     let mut all = Vec::new();
     leaves(layout, &mut all);
-    let cwd = all.iter().find_map(|leaf| match leaf {
-        SessionPane::Leaf { cwd, .. } => cwd.as_ref().map(|p| p.display().to_string()),
-        SessionPane::Split { .. } => None,
-    });
     let agent = all.iter().find_map(|leaf| match leaf {
         SessionPane::Leaf { agent, .. } => *agent,
         SessionPane::Split { .. } => None,
     });
+    let default_shell = shell_program_basename(&crate::core::shells::login_shell())
+        .unwrap_or_else(|| "sh".to_string());
     tty7_core::core::tab_view::TabView {
         id,
         name: None,
-        title: String::new(),
+        title: default_shell,
         osc_title: None,
-        cwd,
+        cwd: None,
         agent,
         status: None,
         live: false,

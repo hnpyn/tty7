@@ -25,13 +25,10 @@ use crate::ui::i18n::{L10nKey, t, t_fmt};
 use crate::ui::reorder::{self, Reorder, Surface};
 use crate::ui::right_panel::RESIZE_HANDLE_WIDTH;
 use crate::ui::tab_strip::{
-    DragTab, REORDER_SLIDE_MS, abbreviate_home, elide_end_clusters, elide_label,
-    elide_path_keep_tail, measure_text,
+    DragTab, REORDER_SLIDE_MS, elide_end_clusters, elide_label, measure_text,
 };
 
-pub(crate) const MIN_SIDEBAR_WIDTH: f32 = 180.;
-
-const GRAB_HANDLE_W: f32 = 48.;
+pub(crate) const MIN_SIDEBAR_WIDTH: f32 = 200.;
 
 const ROW_GAP: f32 = 1.;
 
@@ -47,13 +44,13 @@ const PIN_MARK: &str = "icons/pin.svg";
 const PIN_MARK_SIZE: f32 = 11.;
 
 /// A single-line tab row: one line of `text_sm` and a little air.
-const ROW_HEIGHT: f32 = 30.;
+const ROW_HEIGHT: f32 = 28.;
 
 /// A row with a branch line under its title.
-const ROW_HEIGHT_TWO_LINE: f32 = 42.;
+const ROW_HEIGHT_TWO_LINE: f32 = 38.;
 
 /// The air between two groups — what makes a group a group without a box.
-const GROUP_GAP: f32 = 16.;
+const GROUP_GAP: f32 = 12.;
 
 /// A group heading's line.
 const HEADER_HEIGHT: f32 = 22.;
@@ -62,11 +59,7 @@ const HEADER_HEIGHT: f32 = 22.;
 const META_REM: f32 = 11.5 / 16.;
 
 /// The rail's side inset, for its header tiles, controls and rows alike.
-const RAIL_INSET: f32 = 12.;
-
-/// The workspace chip and the search field under the rail's header.
-const HEAD_CONTROL_HEIGHT: f32 = 28.;
-const HEAD_CONTROL_RADIUS: f32 = 7.;
+const RAIL_INSET: f32 = 10.;
 
 /// What sits between a group's branch and its diff counts.
 const META_SEP_TRIMMED: &str = "·";
@@ -83,8 +76,8 @@ fn tabular() -> gpui::FontFeatures {
 mod row_metrics {
     /// `border_r_1` on the sidebar itself.
     pub(super) const BORDER: f32 = 1.;
-    /// `px_3` on the scrolling list that holds the rows.
-    pub(super) const LIST_PAD: f32 = 12.;
+    /// `px` on the scrolling list that holds the rows.
+    pub(super) const LIST_PAD: f32 = 10.;
     /// `pl_2` + `pr_2` on the row.
     pub(super) const ROW_PAD: f32 = 8.;
     /// The avatar handed to `tab_avatar_plain`.
@@ -97,6 +90,8 @@ mod row_metrics {
     pub(super) const BADGE: f32 = 20.;
     /// The zoom mark, when the tab has a pane zoomed over the others.
     pub(super) const ZOOM: f32 = 16.;
+    /// The split mark, when the tab holds more than one pane.
+    pub(super) const SPLIT: f32 = 28.;
     /// `gap_1p5`, between a branch and the counts after it.
     pub(super) const META_GAP: f32 = 6.;
     /// `px_2` on a group header.
@@ -122,12 +117,6 @@ mod row_metrics {
 /// The narrowest a group's heading is allowed to get: three or four capitals
 /// and an ellipsis, which is still a name and not a stub.
 const HEADER_NAME_FLOOR: f32 = 40.;
-
-/// The narrowest a row's title is allowed to get before the working directory
-/// beside it stops taking room, and the narrowest that path may be drawn at:
-/// below this it is an ellipsis and a slash, which names no directory.
-const ROW_TITLE_FLOOR: f32 = 48.;
-const ROW_CWD_FLOOR: f32 = 24.;
 
 /// How a group header divides its line between the heading and the branch its
 /// rows share. The branch takes what it wants up to half the line, and the
@@ -190,7 +179,6 @@ struct SidebarRowShown {
     /// which nothing can expand.
     title: Option<(SharedString, SharedString)>,
     branch: Option<(SharedString, SharedString, u32, u32)>,
-    cwd: Option<(SharedString, SharedString)>,
 }
 
 #[derive(Clone)]
@@ -211,8 +199,6 @@ struct SidebarInfo {
     title: Option<SharedString>,
     /// Full branch plus diff counts, when the row's branch was elided.
     branch: Option<(SharedString, u32, u32)>,
-    /// Full working directory, when the row's second line was elided.
-    cwd: Option<SharedString>,
     /// Remote host, when the avatar only shows a dot for it.
     host: Option<SharedString>,
 }
@@ -299,8 +285,8 @@ impl Tty7App {
             .min_h_0()
             .w_full()
             .overflow_y_scroll()
-            .px_3()
-            .pb(px(20.))
+            .px(px(row_metrics::LIST_PAD))
+            .pb(px(14.))
             .gap(px(GROUP_GAP));
 
         let keys: Rc<Vec<Option<GroupKey>>> = Rc::new(self.sidebar_group_keys(cx));
@@ -625,6 +611,12 @@ impl Tty7App {
                 } else {
                     zoom_extra
                 };
+                let pane_count = tab.pane_count();
+                let split_extra = if pane_count > 1 {
+                    row_metrics::SPLIT + row_metrics::GAP
+                } else {
+                    0.
+                };
                 // Status rides at the row's trailing end, where the badge
                 // would be; the badge wins while the modifier is held.
                 let status_dot = match show_badges && badge_pos < 9 {
@@ -637,9 +629,12 @@ impl Tty7App {
                 };
                 // Elision is measured against this budget so the label and
                 // branch never wrap or overflow into CSS truncation.
-                let label_avail =
-                    (row_metrics::text_budget(width) - badge_extra - zoom_extra - status_extra)
-                        .max(48.);
+                let label_avail = (row_metrics::text_budget(width)
+                    - badge_extra
+                    - zoom_extra
+                    - split_extra
+                    - status_extra)
+                    .max(48.);
                 let title_size = 0.875 * rem;
                 let meta_size = META_REM * rem;
                 let title_font = if is_active { &title_font_active } else { &font };
@@ -677,7 +672,6 @@ impl Tty7App {
                     }
                 };
                 let mut branch_shown: Option<(SharedString, SharedString, u32, u32)> = None;
-                let mut cwd_shown: Option<(SharedString, SharedString)> = None;
                 let git_line = match shared_git.is_some() {
                     true => None,
                     false => tab.git_status(Some(window), cx),
@@ -751,75 +745,13 @@ impl Tty7App {
                     }
                     line
                 });
-                // Outside a repo there is no branch line, and the working
-                // directory rides on the title's own line rather than growing
-                // a second one under it: a group of plain shells was a column
-                // of two-line rows describing paths that mostly agree, which
-                // is twice the height for a line of small grey text nobody
-                // was reading. A row keeps its second line only for a branch.
-                let cwd_full: Option<SharedString> = match git_line.is_none()
-                    && shared_git.is_none()
-                {
-                    false => None,
-                    true => tab
-                        .pane
-                        .focused_or_first(window, cx)
-                        .and_then(|leaf| {
-                            let leaf = leaf.read(cx);
-                            Some((leaf.effective_cwd()?, leaf.display_home(cx)))
-                        })
-                        .map(|(cwd, home)| {
-                            let text = cwd.display().to_string();
-                            SharedString::from(abbreviate_home(&text, home.as_deref()).into_owned())
-                        })
-                        // The title already carries the whole path; a second
-                        // copy adds noise, not information.
-                        .filter(|full| full.as_ref() != title_text.as_ref()),
-                };
-                // The path takes what it needs up to half the line and the
-                // title keeps the rest — the same split a group header makes
-                // with the branch beside its heading. Flex would hand the
-                // overflow to the two of them in proportion to what each
-                // asked for, which cuts the longer string hardest.
-                let cwd_want = cwd_full.as_ref().map(|full| {
-                    row_metrics::META_GAP
-                        + measure_text(&window.text_system(), &font, meta_size, full)
-                });
-                let title_avail = match cwd_want {
-                    Some(want) => (label_avail - want.min(label_avail * 0.5)).max(ROW_TITLE_FLOOR),
-                    None => label_avail,
-                };
                 let shown_title = elide_label(
                     &window.text_system(),
                     title_font,
                     title_size,
                     &title_text,
-                    title_avail,
+                    label_avail,
                 );
-                if let Some(full) = cwd_full {
-                    // Measured against what the title actually took, not what
-                    // it was allowed to: a short title hands the slack back
-                    // instead of leaving the path elided around a gap.
-                    let avail = (label_avail
-                        - measure_text(
-                            &window.text_system(),
-                            title_font,
-                            title_size,
-                            &shown_title,
-                        )
-                        - row_metrics::META_GAP)
-                        .max(0.);
-                    if avail >= ROW_CWD_FLOOR {
-                        let shown = elide_path_keep_tail(
-                            &window.text_system(),
-                            &font,
-                            meta_size,
-                            &full,
-                            avail,
-                        );
-                        cwd_shown = Some((shown, full));
-                    }
-                }
                 let rename_input = self
                     .renaming
                     .as_ref()
@@ -829,7 +761,6 @@ impl Tty7App {
                 let shown = SidebarRowShown {
                     title: full_title.map(|full| (shown_title.clone(), full)),
                     branch: branch_shown.clone(),
-                    cwd: cwd_shown.clone(),
                 };
                 let info = self.sidebar_info(tab, window, cx, &shown);
                 // Colors are captured by value so the tooltip builder (which
@@ -922,15 +853,6 @@ impl Tty7App {
                                                 c.child(line)
                                             },
                                         )
-                                        .when_some(info.cwd.clone(), |c, cwd| {
-                                            c.child(
-                                                div()
-                                                    .max_w(px(420.))
-                                                    .text_xs()
-                                                    .text_color(muted)
-                                                    .child(cwd),
-                                            )
-                                        })
                                         .when_some(info.host.clone(), |c, host| {
                                             c.child(
                                                 h_flex()
@@ -960,26 +882,20 @@ impl Tty7App {
                                 .gap_1p5()
                                 .child(
                                     div()
-                                        .flex_1()
                                         .min_w_0()
                                         .truncate()
                                         .text_sm()
                                         .when(is_active, |d| d.font_weight(FontWeight::MEDIUM))
                                         .child(shown_title),
                                 )
-                                // The path is elided to the room the title
-                                // left, so it may not shrink again here — a
-                                // second cut would come out of its tail, the
-                                // half that says which directory this is.
-                                .when_some(cwd_shown.map(|(cwd, _)| cwd), |line, cwd| {
-                                    line.child(
-                                        div()
-                                            .flex_shrink_0()
-                                            .text_xs()
-                                            .text_color(cx.theme().muted_foreground)
-                                            .child(cwd),
-                                    )
-                                }),
+                                .when(pane_count > 1, |line| {
+                                    line.child(self.split_mark(
+                                        ("sidebar-split", i),
+                                        pane_count,
+                                        cx,
+                                    ))
+                                })
+                                .child(div().flex_1().min_w_0()),
                         )
                         .children(git_line)
                         .into_any_element(),
@@ -1021,7 +937,7 @@ impl Tty7App {
                     .items_center()
                     .justify_between()
                     .gap(px(row_metrics::GAP))
-                    .px_2()
+                    .px(px(row_metrics::ROW_PAD))
                     .rounded(crate::ui::rounding::ROW_RADIUS)
                     .when(is_active, |s| {
                         s.bg(gpui::rgb(sf.selected))
@@ -1311,7 +1227,7 @@ impl Tty7App {
                     .w_full()
                     .items_center()
                     .gap_1p5()
-                    .px_2()
+                    .px(px(row_metrics::ROW_PAD))
                     // The air above a heading is the list's `GROUP_GAP`;
                     // the heading itself is one short caption line.
                     .h(px(HEADER_HEIGHT))
@@ -1737,21 +1653,27 @@ impl Tty7App {
             auto_hide_chrome,
             self.sidebar_chrome_hover.get(),
         );
+        let lead = if cfg!(target_os = "macos") && !window.is_fullscreen() {
+            crate::ui::app::TITLE_BAR_LEAD
+        } else {
+            RAIL_INSET
+        };
+        let workspace_shown = chrome_shown || self.workspace_rename.is_some();
         let controls = h_flex()
             .flex_shrink_0()
             .title_strip_row(px(TITLE_BAR_BORDER), cx.theme().transparent)
-            .justify_end()
             .gap(px(2.))
+            .pl(px(lead))
             .pr(px(RAIL_INSET))
             .when_some(crate::ui::app::window_mark(), |row, mark| {
-                row.child(
-                    div()
-                        .flex_shrink_0()
-                        .pl(px(crate::ui::app::CONTENT_INSET))
-                        .child(mark),
-                )
-                .child(div().flex_1().min_w(px(GRAB_HANDLE_W)))
+                row.child(div().flex_shrink_0().pr(px(4.)).child(mark))
             })
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .when(workspace_shown, |d| d.child(self.workspace_head(cx))),
+            )
             .child(
                 crate::ui::app::resting_chrome(div().occlude().flex_shrink_0(), chrome_shown)
                     // These are the same controls as the collapsed title bar's
@@ -1778,49 +1700,6 @@ impl Tty7App {
                         .on_click(cx.listener(|this, _, _window, cx| this.toggle_left_panel(cx))),
                     ),
             );
-        // The tile inside asks for `w_full`, and a percentage is only a width
-        // while some box above it has a real one. This row used to have none of
-        // its own and borrowed the column's by cross-axis stretch, which did not
-        // always hold; `w_full` here swapped that for a second percentage, and a
-        // row whose width is `Percent` is no longer `auto`, so it lost stretch
-        // as well — on the passes that size the column from its content there
-        // was still nothing to resolve against and the tile fell back to hugging
-        // the workspace name. Hand the row real pixels: the rail is
-        // `w(px(width))` and layout is border-box, so its content is one pixel
-        // narrower than that because of the right border.
-        let search = h_flex()
-            .w_full()
-            .flex_shrink_0()
-            .items_center()
-            .gap(px(7.))
-            .h(px(HEAD_CONTROL_HEIGHT))
-            .pl_2()
-            .pr_1()
-            .rounded(px(HEAD_CONTROL_RADIUS))
-            .bg(cx.theme().muted)
-            .child(
-                Icon::new(IconName::Search)
-                    .size(px(12.))
-                    .flex_shrink_0()
-                    .text_color(cx.theme().muted_foreground),
-            )
-            .child(
-                div().flex_1().min_w_0().child(
-                    Input::new(&self.sidebar_search)
-                        .appearance(false)
-                        .cleanable(true)
-                        .pl_0(),
-                ),
-            );
-        let workspace_head = v_flex()
-            .w(px(width - 1.))
-            .flex_shrink_0()
-            .gap(px(10.))
-            .px(px(RAIL_INSET))
-            .pt(px(4.))
-            .pb(px(16.))
-            .child(self.workspace_head(cx))
-            .child(search);
 
         let container: Rc<Cell<Option<Bounds<Pixels>>>> = Rc::new(Cell::new(None));
         // Read while there is still a `cx` to read it from: the drag handler
@@ -1937,7 +1816,6 @@ impl Tty7App {
                         window,
                         cx,
                     ))
-                    .child(workspace_head)
                     .child(crate::ui::scrollbar::with_vertical_scrollbar(
                         "tab-sidebar-scrollbar",
                         list,
@@ -1945,12 +1823,10 @@ impl Tty7App {
                     )),
             )
             .child(handle)
-            .when(auto_hide_chrome, |rail| {
-                rail.child(crate::ui::app::hover_sheet(
-                    "sidebar-chrome-hover",
-                    &self.sidebar_chrome_hover,
-                ))
-            })
+            .child(crate::ui::app::hover_sheet(
+                "sidebar-chrome-hover",
+                &self.sidebar_chrome_hover,
+            ))
     }
 
     /// The boundary between the kept groups and the derived ones, recording
@@ -2141,10 +2017,6 @@ impl Tty7App {
                 .as_ref()
                 .filter(|(shown, full, _, _)| shown != full)
                 .map(|(_, full, added, removed)| (full.clone(), *added, *removed)),
-            // The cwd only earns a card line when it was rendered *and*
-            // elided: a repo row already shows the full path as its title, so
-            // repeating the cwd under it would be noise, not information.
-            cwd: elided(&shown.cwd),
             host: None,
         };
         // The host is read off the same leaf the title and cwd came from; a
@@ -2157,8 +2029,7 @@ impl Tty7App {
         }) {
             info.host = Some(target);
         }
-        (info.title.is_some() || info.branch.is_some() || info.cwd.is_some() || info.host.is_some())
-            .then_some(info)
+        (info.title.is_some() || info.branch.is_some() || info.host.is_some()).then_some(info)
     }
 
     /// Where a tab being dragged in the sidebar would land if let go now,

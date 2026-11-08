@@ -909,6 +909,36 @@ fn clamp_command(cmd: &str) -> String {
     }
 }
 
+fn extract_command_name(raw: &str) -> Option<String> {
+    fn base(tok: &str) -> &str {
+        tok.rsplit(['/', '\\'])
+            .find(|seg| !seg.is_empty())
+            .unwrap_or(tok)
+    }
+    let mut tokens = raw
+        .split_whitespace()
+        .map(|t| t.trim_matches(['"', '\'']))
+        .filter(|t| !t.is_empty())
+        .skip_while(|t| !t.starts_with('-') && t.contains('='));
+    let first = tokens.next()?;
+    let head = base(first);
+    if matches!(
+        head,
+        "sudo" | "env" | "command" | "builtin" | "exec" | "nohup" | "time"
+    ) {
+        for next in tokens {
+            if next.starts_with('-') || next.contains('=') {
+                continue;
+            }
+            let inner = base(next);
+            if !inner.is_empty() {
+                return Some(inner.to_string());
+            }
+        }
+    }
+    (!head.is_empty()).then(|| head.to_string())
+}
+
 impl TerminalView {
     fn notify_command_finished(
         &self,
@@ -2329,6 +2359,20 @@ impl TerminalView {
                 false => self.running_title.clone(),
             },
         }))
+    }
+
+    pub(crate) fn raw_running_command(&self) -> Option<String> {
+        if self.terminal.exited {
+            return None;
+        }
+        let raw = unescape_mark_text(&self.terminal.running_command());
+        let trimmed = raw.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_string())
+    }
+
+    pub(crate) fn running_command_title(&self) -> Option<String> {
+        let raw = self.raw_running_command()?;
+        extract_command_name(&raw)
     }
 
     pub fn agent_result_unread(&self) -> bool {
