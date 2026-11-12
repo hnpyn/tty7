@@ -4267,9 +4267,9 @@ impl Tty7App {
     /// Only on the way in, and only from the action: entering is an instant in
     /// which the window buttons disappear, and a window that starts fullscreen
     /// because the setting says so is not a surprise anybody needs explaining.
-    /// The chord comes from the keymap rather than from a string, because it is
-    /// `F11` on Windows and Linux, `Cmd+Enter` on macOS, and either of them may
-    /// have been rebound.
+    /// The chord comes from the keymap rather than from a string, because the
+    /// default (`F11` on Windows and Linux, unbound on macOS) may have been
+    /// rebound.
     ///
     /// The hint carries an id of its own, which is what keeps a held-down
     /// `F11` to one notice rather than a column of identical ones: pushing

@@ -4,7 +4,7 @@ use crate::core::actions::*;
 use crate::core::config::{Config, KeybindingOverride};
 use crate::terminal::view::{
     AlternatePaste, ClearScrollback, CopyRaw, CopyText, FindInTerminal, FindNext, FindPrevious,
-    InsertNewline, InsertNewlineFallback, PasteText, RunReverseSearchSelection, ToggleComposer,
+    InsertNewline, InsertNewlineFallback, PasteText, ToggleComposer,
 };
 use crate::ui::i18n::{L10nKey, t, t_fmt};
 use crate::ui::palette;
@@ -53,16 +53,6 @@ fn fixed_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("secondary-+", IncreaseFontSize, None),
         KeyBinding::new("tab", SendTab, Some("Terminal")),
         KeyBinding::new("shift-tab", SendBackTab, Some("Terminal")),
-        // The Ctrl+R menu runs its selection on Cmd+Enter, which on macOS is
-        // also `ToggleFullscreen`. Scoped to the open menu, it is deeper in
-        // the dispatch path than the window binding and wins only there.
-        // `cmd`, not `secondary`: the menu's own key handler runs on the
-        // platform key everywhere, and Ctrl+Enter off macOS only accepts.
-        KeyBinding::new(
-            "cmd-enter",
-            RunReverseSearchSelection,
-            Some("Terminal && reverse_search"),
-        ),
     ];
     // The switcher's footer tells you Tab is the way across to the tab column
     // once a query is in the box. gpui-component's Root binds `tab` to its
@@ -134,7 +124,7 @@ fn fixed_bindings() -> Vec<KeyBinding> {
         bindings.push(KeyBinding::new("alt-f3", EditorPeekChange, input));
     }
     // The code editor's line commands, for the same tie: ⌘/ is the shortcut
-    // sheet, ⌘↵ fullscreen, ⌘⇧↵ maximize and ⌥↑/⌥↓ pane focus off macOS, all
+    // sheet, ⌘⇧↵ maximize and ⌥↑/⌥↓ pane focus off macOS, all
     // context-free. Bound on `CodeEditor`, which only a multi-line code
     // editor declares, so every other text field and the terminal keep the
     // app's keys.
@@ -576,7 +566,7 @@ fn shipped_bindings() -> Vec<(&'static str, &'static str)> {
         // the PTY as `\E[23;<mods>~`, and the whole chord is one line of
         // config away from being retired. See
         // `f11_is_the_only_default_on_a_bare_function_key`.
-        ("ToggleFullscreen", per_platform("secondary-enter", "f11")),
+        ("ToggleFullscreen", per_platform("", "f11")),
         ("ToggleTabSidebar", ""),
         (
             "ToggleLeftPanel",
@@ -666,9 +656,8 @@ fn shipped_bindings() -> Vec<(&'static str, &'static str)> {
             },
         ),
         ("ZoomWindow", ""),
-        // `secondary-enter` is `ToggleFullscreen` on macOS. That is not a
-        // clash: `ScmCommit` binds inside the `ScmCommit` key context, so it
-        // only wins while the caret sits in the commit box.
+        // `ScmCommit` binds inside the `ScmCommit` key context, so it
+        // only fires while the caret sits in the commit box.
         ("ScmCommit", "secondary-enter"),
         ("ScmCommitAmend", ""),
         ("ScmStageAll", ""),
@@ -2183,9 +2172,6 @@ mod tests {
 
     #[test]
     fn the_commit_key_only_fires_inside_the_commit_box() {
-        // `secondary-enter` is `ToggleFullscreen` on macOS. The two coexist
-        // only because the commit binding is scoped; drop the context and
-        // committing steals full screen everywhere.
         assert_eq!(action_context("ScmCommit"), Some("ScmCommit"));
         assert_eq!(action_context("ScmCommitAmend"), Some("ScmCommit"));
         assert_eq!(action_context("ToggleFullscreen"), None);
@@ -2449,14 +2435,12 @@ mod tests {
                 .map(|(_, k)| *k)
                 .unwrap()
         };
-        assert_eq!(
-            key_of("ToggleFullscreen"),
-            per_platform("secondary-enter", "f11")
-        );
+        assert_eq!(key_of("ToggleFullscreen"), per_platform("", "f11"));
         assert_eq!(key_of("ToggleMaximizePane"), "secondary-shift-enter");
-        for window_chord in ["secondary-enter", "secondary-shift-enter"] {
-            assert_ne!(window_chord, INSERT_NEWLINE_DEFAULT);
-            assert_ne!(window_chord, INSERT_NEWLINE_ALT_DEFAULT);
+        assert_eq!(key_of("ScmCommit"), "secondary-enter");
+        for chord in [key_of("ToggleMaximizePane"), key_of("ScmCommit")] {
+            assert_ne!(chord, INSERT_NEWLINE_DEFAULT);
+            assert_ne!(chord, INSERT_NEWLINE_ALT_DEFAULT);
         }
         for chord in [INSERT_NEWLINE_DEFAULT, INSERT_NEWLINE_ALT_DEFAULT] {
             assert_ne!(chord, "shift-alt-enter");
@@ -2590,8 +2574,7 @@ mod tests {
         // focus chain outwards, so a chord bound inside a narrow context and
         // again with no context is not a clash — the narrow one wins while
         // that element has focus and the global one applies everywhere else.
-        // `ScmCommit` and `ToggleFullscreen` both take secondary-enter on that
-        // basis. Two bindings sharing a chord *and* a context is still a bug,
+        // Two bindings sharing a chord *and* a context is still a bug,
         // because then which one fires is arbitrary.
         // `same_chord`, not string equality: `secondary-shift-]` and
         // `secondary-}` are two spellings of one keystroke and both install it.
@@ -2955,7 +2938,7 @@ mod gpui_tests {
     }
 
     /// The code editor's line commands sit on chords the app also spends —
-    /// ⌘/ is the shortcut sheet, ⌘↵ fullscreen, ⌘⇧↵ maximize, ⌥↑/⌥↓ pane
+    /// ⌘/ is the shortcut sheet, ⌘⇧↵ maximize, ⌥↑/⌥↓ pane
     /// focus off macOS. `fixed_bindings` re-adds them on the `CodeEditor`
     /// context the editor declares beside `Input`, after the app's table, so
     /// inside the editor they win and everywhere else nothing changes.

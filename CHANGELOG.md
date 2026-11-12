@@ -35,6 +35,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **<kbd>⌘ ⏎</kbd> no longer enters fullscreen by default on macOS** —
+  `ToggleFullscreen` is now unbound by default on macOS (Windows and Linux keep
+  `F11`), so the <kbd>⌃ R</kbd> history menu and the completion menu get
+  <kbd>⌘ ⏎</kbd> back. If you want a fullscreen shortcut on macOS, bind
+  `ToggleFullscreen` yourself in `config.json` or **Settings → Keybindings**,
+  and pick a chord that does not conflict with in-pane menus.
+
 - **Filled document headers share the terminal button** — Both the editor and
   diff show the current terminal's name in Fill Window. Clicking it docks the
   document beside the terminal and keeps its content open (#1178).

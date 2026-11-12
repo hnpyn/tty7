@@ -842,11 +842,9 @@ impl Tty7App {
 
     /// The message box.
     ///
-    /// `key_context` rather than a focus trap: `secondary-enter` is
-    /// `ToggleFullscreen` at the window level, and the two coexist because
-    /// gpui resolves a keystroke by walking outwards from the focused node —
-    /// the narrow context wins while the box has focus, and the window keeps
-    /// the chord everywhere else.
+    /// `key_context` rather than a focus trap: `ScmCommit` is bound inside
+    /// `COMMIT_KEY_CONTEXT` so `secondary-enter` only commits while the box has
+    /// focus.
     ///
     /// A hairline and no fill, like every other framed thing in the panel.
     /// Focus recolours the same hairline to `theme.ring` rather than adding
@@ -2487,7 +2485,7 @@ fn verb_all_tooltip(verb: RowVerb) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::actions::{ScmCommit, ToggleFullscreen};
+    use crate::core::actions::ScmCommit;
     use crate::core::config::{CoreConfig, DiffViewMode, RightPanelTab};
     use crate::ui::app::test_window::harness;
     use gpui::TestAppContext;
@@ -2988,17 +2986,13 @@ mod tests {
         crate::core::config::pin_test_config_dir();
         let (_app, mut vcx) = harness(cx);
 
-        let (in_box, outside, window_wide) = vcx.update(|window, _cx| {
+        let (in_box, outside) = vcx.update(|window, _cx| {
             let scoped = gpui::KeyContext::parse(COMMIT_KEY_CONTEXT)
                 .expect("the context the panel installs parses");
             (
                 window.bindings_for_action_in_context(&ScmCommit, scoped),
                 window.bindings_for_action_in_context(
                     &ScmCommit,
-                    gpui::KeyContext::new_with_defaults(),
-                ),
-                window.bindings_for_action_in_context(
-                    &ToggleFullscreen,
                     gpui::KeyContext::new_with_defaults(),
                 ),
             )
@@ -3012,20 +3006,6 @@ mod tests {
             outside.is_empty(),
             "outside the box the chord must not commit anything"
         );
-        assert!(
-            !window_wide.is_empty(),
-            "the window keeps its own binding for the same chord"
-        );
-        if cfg!(target_os = "macos") {
-            // The whole point: one chord, two meanings, separated only by the
-            // context the box installs. If they ever stopped colliding this
-            // test would still pass for the wrong reason, so assert they do.
-            assert_eq!(
-                in_box[0].keystrokes(),
-                window_wide[0].keystrokes(),
-                "secondary-enter is shared, and scope is what tells them apart"
-            );
-        }
     }
 
     #[gpui::test]

@@ -128,8 +128,7 @@ actions!(
         ClearScrollback,
         InsertNewline,
         InsertNewlineFallback,
-        ToggleComposer,
-        RunReverseSearchSelection
+        ToggleComposer
     ]
 );
 
@@ -3002,6 +3001,13 @@ impl TerminalView {
                 }
                 CmdKey::Consumed
             }
+            "enter"
+                if !m.shift
+                    && self.input_active()
+                    && (self.reverse_search.is_some() || self.completion.is_some()) =>
+            {
+                CmdKey::FallThrough
+            }
             _ => CmdKey::Bubble,
         }
     }
@@ -3459,9 +3465,6 @@ impl TerminalView {
         // below is about.
         if self.frame_alt_screen {
             context.add("alt_screen");
-        }
-        if self.reverse_search.is_some() {
-            context.add("reverse_search");
         }
         context
     }
@@ -5651,20 +5654,6 @@ impl TerminalView {
                 self.cmd.set(&line);
                 self.submit_command(cx);
             }
-        }
-        cx.notify();
-    }
-
-    /// The menu's Cmd+Enter, which arrives as an action rather than a key:
-    /// on macOS the chord is `ToggleFullscreen`, and a window-wide binding is
-    /// matched before the pane's key handler ever sees the keystroke.
-    fn run_reverse_search_selection(&mut self, cx: &mut Context<Self>) {
-        let Some(rs) = self.reverse_search.take() else {
-            return;
-        };
-        if let Some(line) = rs.selected_line(&self.history).map(str::to_string) {
-            self.cmd.set(&line);
-            self.submit_command(cx);
         }
         cx.notify();
     }
@@ -8065,9 +8054,6 @@ impl Render for TerminalView {
             }))
             .on_action(cx.listener(|this, _: &ToggleComposer, window, cx| {
                 this.toggle_composer(window, cx);
-            }))
-            .on_action(cx.listener(|this, _: &RunReverseSearchSelection, _w, cx| {
-                this.run_reverse_search_selection(cx);
             }))
             .on_action(cx.listener(|this, _: &SendTab, _w, cx| {
                 this.tab_pressed(true, cx);
@@ -14383,6 +14369,94 @@ mod gpui_tests {
             next_input_until_timeout(&mut daemon),
             Some(b"git status\r".to_vec()),
             "Cmd+Enter ships the selected line to the PTY"
+        );
+    }
+
+    #[gpui::test]
+    fn cmd_enter_dispatches_through_window_to_reverse_search_and_completion(
+        cx: &mut TestAppContext,
+    ) {
+        crate::core::config::pin_test_config_dir();
+
+        let (window, mut daemon) = harness(cx);
+        cx.update(|cx| {
+            crate::ui::keymap::init(cx);
+            cx.on_action(
+                |_: &crate::core::actions::ToggleFullscreen, _: &mut gpui::App| {
+                    panic!("ToggleFullscreen must not intercept cmd-enter");
+                },
+            );
+        });
+        prompt_ready(&window, cx, &mut daemon);
+
+        window
+            .update(cx, |view, window, cx| {
+                window.activate_window();
+                view.focus_handle.focus(window, cx);
+                view.history = ["git status", "cargo test"]
+                    .into_iter()
+                    .map(String::from)
+                    .collect();
+                view.history_frecency = vec![0.0; view.history.len()];
+                view.start_reverse_search();
+                assert!(view.reverse_search.is_some());
+            })
+            .unwrap();
+
+        let mut vcx = gpui::VisualTestContext::from_window(window.into(), cx);
+        vcx.simulate_keystrokes("cmd-enter");
+
+        window
+            .update(&mut vcx, |view, _, _| {
+                assert!(
+                    view.reverse_search.is_none(),
+                    "cmd-enter runs and closes the reverse-search menu"
+                );
+                assert!(view.cmd.is_empty());
+            })
+            .unwrap();
+        assert_eq!(
+            next_input_until_timeout(&mut daemon),
+            Some(b"cargo test\r".to_vec()),
+            "cmd-enter submits the selected reverse-search entry"
+        );
+
+        prompt_ready(&window, &mut vcx, &mut daemon);
+        window
+            .update(&mut vcx, |view, _, _| {
+                view.cmd.set_with_cursor("git ", 4);
+                view.open_completion(CompletionSession::new(
+                    4,
+                    String::new(),
+                    vec![completion::Candidate {
+                        text: "status".to_string(),
+                        kind: CandidateKind::Command,
+                        start: 4,
+                        end: 4,
+                        description: None,
+                        icon: None,
+                    }],
+                    0,
+                ));
+                assert!(view.completion.is_some());
+            })
+            .unwrap();
+
+        vcx.simulate_keystrokes("cmd-enter");
+
+        window
+            .update(&mut vcx, |view, _, _| {
+                assert!(
+                    view.completion.is_none(),
+                    "cmd-enter accepts and closes the completion menu"
+                );
+                assert!(view.cmd.is_empty());
+            })
+            .unwrap();
+        assert_eq!(
+            next_input_until_timeout(&mut daemon),
+            Some(b"git status \r".to_vec()),
+            "cmd-enter accepts the completion and submits the line"
         );
     }
 

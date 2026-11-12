@@ -1103,8 +1103,7 @@ fn match_range(title: &str, query: &str) -> Option<std::ops::Range<usize>> {
 /// It cannot be `→`: gpui-component's `Input` binds bare `right` to MoveRight
 /// in its own key context, so with the query field focused the search never
 /// sees the key — the old `→ edit` badge was advertising a gesture that could
-/// not fire. `⌘↵` is no better; the app binds it to ToggleFullscreen, which
-/// wins for the same reason. `secondary-e` is claimed by neither.
+/// not fire. `secondary-e` is not claimed by the input field or the window.
 const EDIT_GESTURE: &str = "secondary-e";
 
 /// Matches `EDIT_GESTURE` against a live keystroke. Keep the two in step.

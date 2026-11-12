@@ -149,8 +149,8 @@ pub(crate) fn set_menus(cx: &mut App) {
             MenuItem::action(t(L10nKey::AppMenuClearScrollback), ClearScrollback),
             // No "Enter Full Screen" here: AppKit puts its own at the bottom of
             // any menu named View, so ours sat directly above it — the same
-            // command twice, under two different shortcuts. ⌘↵ still works and
-            // is listed on the Keybindings page.
+            // command twice. ToggleFullscreen remains bindable on the
+            // Keybindings page.
         ]),
         Menu::new(t(L10nKey::AppMenuWindow)).items(window_menu_items(cx)),
         Menu::new(t(L10nKey::AppMenuHelp)).items([
