@@ -37,8 +37,19 @@ no undo for that one.
 ## Actions with no default key
 
 Some actions ship deliberately unbound, because there is no obvious key left to
-take: pane resize and swap, workspace selection, most git commands, SFTP, and
-the panel tabs. They are all in Search Everywhere, and all bindable here.
+take: `ToggleFullscreen` on macOS, pane resize and swap, workspace selection,
+most git commands, SFTP, and the panel tabs. They are all in Search Everywhere,
+and all bindable here.
+
+<Note>
+  If you bind `ToggleFullscreen` on macOS — for example,
+  `"keybindings": { "ToggleFullscreen": "ctrl-cmd-f" }` — pick a chord that
+  nothing else uses. `ToggleFullscreen` is a window-level binding and is matched
+  before in-pane key handling: binding it to `cmd-enter` takes <kbd>⌘ ⏎</kbd>
+  back from the <kbd>⌃ R</kbd> history menu (run the selection) and the
+  completion menu (accept and run). The commit box's `ScmCommit` is scoped to
+  its own context, so it is not affected.
+</Note>
 
 ## Editing `config.json` instead
 
