@@ -113,8 +113,8 @@ Source: "{#StageDir}\server\*"; DestDir: "{app}\server"; Flags: ignoreversion re
 ; itself (HKCU, at every launch, so it always names the running exe); the
 ; uninstaller below removes that registration.
 [Icons]
-Name: "{autoprograms}\ntty7"; Filename: "{app}\ntty7.exe"; AppUserModelID: "com.github.ntty7"; AppUserModelToastActivatorCLSID: "4E1F6381-E90B-4BED-9156-A9013F718FE6"
-Name: "{autodesktop}\ntty7"; Filename: "{app}\ntty7.exe"; Tasks: desktopicon; AppUserModelID: "com.github.ntty7"; AppUserModelToastActivatorCLSID: "4E1F6381-E90B-4BED-9156-A9013F718FE6"
+Name: "{autoprograms}\ntty7"; Filename: "{app}\ntty7.exe"; AppUserModelID: "com.github.ntty7"; AppUserModelToastActivatorCLSID: "7B4A9D2E-5C18-4F63-9A41-2E8D6B0C9F77"
+Name: "{autodesktop}\ntty7"; Filename: "{app}\ntty7.exe"; Tasks: desktopicon; AppUserModelID: "com.github.ntty7"; AppUserModelToastActivatorCLSID: "7B4A9D2E-5C18-4F63-9A41-2E8D6B0C9F77"
 
 [Run]
 ; skipifsilent because a silent run is the elevated in-place update: launching
@@ -180,22 +180,6 @@ begin
     RegWriteStringValue(HKEY_CURRENT_USER, 'Environment', 'Path', Rebuilt);
 end;
 
-(* Remove the optional Explorer verbs if this user enabled them in Settings.
-
-  The application owns only the final `tty7` subkeys. Deleting those trees
-  removes their command children without touching another application's verb
-  or a shared `shell` parent. Missing keys are the normal default and make both
-  calls harmless no-ops. This cleanup is uninstall-only: upgrades keep the
-  user's explicit registration, and the next app launch reports "Needs update"
-  if an install path ever changes. *)
-procedure RemoveExplorerContextMenu();
-begin
-  RegDeleteKeyIncludingSubkeys(
-    HKEY_CURRENT_USER, 'Software\Classes\Directory\shell\tty7');
-  RegDeleteKeyIncludingSubkeys(
-    HKEY_CURRENT_USER, 'Software\Classes\Directory\Background\shell\tty7');
-end;
-
 (* Remove the toast activator's COM registration.
 
   `core::aumid` writes HKCU\Software\Classes\CLSID\{…}\LocalServer32 at launch
@@ -206,7 +190,7 @@ end;
 procedure RemoveToastActivator();
 begin
   RegDeleteKeyIncludingSubkeys(
-    HKEY_CURRENT_USER, 'Software\Classes\CLSID\{4E1F6381-E90B-4BED-9156-A9013F718FE6}');
+    HKEY_CURRENT_USER, 'Software\Classes\CLSID\{7B4A9D2E-5C18-4F63-9A41-2E8D6B0C9F77}');
 end;
 
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
@@ -214,7 +198,6 @@ begin
   if CurUninstallStep = usUninstall then
   begin
     RemoveAppDirFromUserPath();
-    RemoveExplorerContextMenu();
     RemoveToastActivator();
   end;
 end;

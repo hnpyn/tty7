@@ -69,6 +69,7 @@ pub enum RemoteTarget {
 }
 
 impl RemoteTarget {
+    #[cfg(test)]
     pub fn direct(user: impl Into<String>, host: impl Into<String>, port: u16) -> Self {
         Self::Direct {
             user: user.into(),
@@ -131,11 +132,13 @@ impl fmt::Display for RemoteTarget {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg(test)]
 pub struct RemoteRef {
     pub target: RemoteTarget,
     pub workspace: WorkspaceId,
 }
 
+#[cfg(test)]
 impl RemoteRef {
     pub fn new(target: RemoteTarget, workspace: WorkspaceId) -> Self {
         Self { target, workspace }

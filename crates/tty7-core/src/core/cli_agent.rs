@@ -1280,9 +1280,6 @@ pub fn parse_agent_event_body(json: &[u8]) -> Option<AgentEvent> {
     #[derive(Deserialize)]
     struct Wire {
         #[serde(default)]
-        #[allow(dead_code)]
-        v: u32,
-        #[serde(default)]
         agent: Option<String>,
         event: String,
         #[serde(default)]
@@ -2678,7 +2675,8 @@ mod tests {
 
         // `--no-session` means the run never persisted one, so there is
         // nothing to resume from and Oh My Pi rejects `--fork` outright.
-        for id in ["s-4"] {
+        {
+            let id = "s-4";
             assert_eq!(
                 CLIAgent::OhMyPi.resume_command(id, Some(&argv(&["omp", "--no-session"]))),
                 None
@@ -2975,7 +2973,8 @@ mod tests {
         );
 
         // Nothing was persisted, so there is nothing to resume or fork.
-        for id in ["a-1"] {
+        {
+            let id = "a-1";
             assert_eq!(
                 CLIAgent::Auggie
                     .resume_command(id, Some(&argv(&["auggie", "--dont-save-session"]))),

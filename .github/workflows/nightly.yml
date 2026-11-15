@@ -158,7 +158,7 @@ jobs:
         run: |
           set -euo pipefail
           VERSION="${{ needs.plan.outputs.version }}"
-          ZIP="dist/tty7-${VERSION}-macos-${{ matrix.arch }}.zip"
+          ZIP="dist/ntty7-${VERSION}-macos-${{ matrix.arch }}.zip"
           VERIFY_ROOT="$RUNNER_TEMP/tty7-nightly-update-verify"
           rm -rf "$VERIFY_ROOT"
           mkdir -p "$VERIFY_ROOT"
@@ -301,24 +301,17 @@ jobs:
           link() { if [ -e "dist/$2" ]; then printf '[%s](%s/%s)' "$1" "$URL" "$2"; fi; }
           cell() { local out="" x; for x in "$@"; do [ -z "$x" ] || out="${out:+$out · }$x"; done; printf '%s' "$out"; }
           V="$VERSION"
-          # The phone app ships on its own tags; link the newest published one.
-          MOBILE_TAG=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 100 --exclude-drafts \
-            --json tagName -q '[.[].tagName | select(startswith("mobile-v"))][0] // ""')
-          PHONE=$(cell "[iPhone (TestFlight)](https://testflight.apple.com/join/gFcPbPVR)" \
-            "${MOBILE_TAG:+[Android APK](https://github.com/${GITHUB_REPOSITORY}/releases/download/$MOBILE_TAG/tty7-${MOBILE_TAG#mobile-v}-android-arm64.apk)}")
-          ARM64="| **ARM64** (Apple silicon) | $(cell "$(link DMG "tty7-$V-macos-arm64.dmg")" "$(link ZIP "tty7-$V-macos-arm64.zip")") | | | $PHONE |"
-          X64="| **x86-64** (Intel / AMD) | $(cell "$(link DMG "tty7-$V-macos-x86_64.dmg")" "$(link ZIP "tty7-$V-macos-x86_64.zip")") | $(cell "$(link Installer "ntty7-$V-windows-x86_64-setup.exe")" "$(link "Portable ZIP" "ntty7-$V-windows-x86_64.zip")") | $(cell "$(link AppImage "ntty7-$V-linux-x86_64.AppImage")" "$(link tar.gz "ntty7-$V-linux-x86_64.tar.gz")") | |"
+          ARM64="| **ARM64** (Apple silicon) | $(cell "$(link DMG "ntty7-$V-macos-arm64.dmg")" "$(link ZIP "ntty7-$V-macos-arm64.zip")") | | |"
+          X64="| **x86-64** (Intel / AMD) | $(cell "$(link DMG "ntty7-$V-macos-x86_64.dmg")" "$(link ZIP "ntty7-$V-macos-x86_64.zip")") | $(cell "$(link Installer "ntty7-$V-windows-x86_64-setup.exe")" "$(link "Portable ZIP" "ntty7-$V-windows-x86_64.zip")") | $(cell "$(link AppImage "ntty7-$V-linux-x86_64.AppImage")" "$(link tar.gz "ntty7-$V-linux-x86_64.tar.gz")") |"
 
           NOTES="Automated nightly build of \`main\` @ ${GITHUB_SHA::7} ($(date -u +%F)). Rolling prerelease — assets are replaced every night; for the latest stable release see https://github.com/${GITHUB_REPOSITORY}/releases/latest.
 
-          | Architecture | macOS | Windows | Linux | Phone |
-          |---|---|---|---|---|
+          | Architecture | macOS | Windows | Linux |
+          |---|---|---|---|
           $ARM64
           $X64
 
-          SHA-256 for every file: [checksums.txt]($URL/checksums.txt)
-
-          $(cat .github/mobile-install.md)"
+          SHA-256 for every file: [checksums.txt]($URL/checksums.txt)"
 
           if gh release view nightly >/dev/null 2>&1; then
             gh release edit nightly --prerelease --title "$TITLE" --notes "$NOTES"

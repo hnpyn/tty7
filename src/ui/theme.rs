@@ -378,7 +378,7 @@ pub(crate) fn windows_background_appearance(
 /// render identically — hiding them beats misrepresenting them. Below 1809
 /// (17763) there is no blur API at all, so only plain translucency is left.
 /// Pure function so the table is unit-testable on every platform.
-#[cfg(any(target_os = "windows", test))]
+#[cfg(test)]
 pub(crate) fn supported_backdrops_for(build: u32) -> &'static [WindowBackdrop] {
     if build >= 22_621 {
         &[
@@ -636,10 +636,10 @@ pub(crate) fn apply_theme(mut window: Option<&mut Window>, cx: &mut App) {
     // still pushes the appearance. The window passed in refuses a nested
     // update, so it is handled directly and the loop covers the rest.
     let appearance = window_appearance(backdrop, blur, fill_opacity);
-    if let Some(window) = window.as_deref_mut() {
-        if take_appearance_change(window, appearance, cx) {
-            window.set_background_appearance(appearance);
-        }
+    if let Some(window) = window.as_deref_mut()
+        && take_appearance_change(window, appearance, cx)
+    {
+        window.set_background_appearance(appearance);
     }
     for other in cx.windows() {
         let _ = other.update(cx, |_, window, cx| {
@@ -649,7 +649,7 @@ pub(crate) fn apply_theme(mut window: Option<&mut Window>, cx: &mut App) {
         });
     }
 
-    Theme::change(mode, window.as_deref_mut(), cx);
+    Theme::change(mode, window, cx);
     cx.set_global(active);
     cx.set_global(presets::ActiveBackground {
         fill: theme.background.clone(),
@@ -659,7 +659,6 @@ pub(crate) fn apply_theme(mut window: Option<&mut Window>, cx: &mut App) {
     cx.set_global(surfaces.clone());
     cx.set_global(interaction);
     cx.set_global(presets::ActiveAccent(m.accent));
-    cx.set_global(presets::ActiveLanes(theme.lanes()));
 
     if !cx.has_global::<StockUiFont>() {
         let stock = Theme::global(cx).font_family.clone();
@@ -888,7 +887,7 @@ pub(crate) fn apply_theme(mut window: Option<&mut Window>, cx: &mut App) {
     // it would wash out that panel. The workspace sidebar/right-panel
     // surfaces get their translucent variant at render time instead —
     // see `workspace_surface_color`.
-    t.sidebar = sidebar_bg.into();
+    t.sidebar = sidebar_bg;
     t.tokens.sidebar = sidebar_bg.into();
     // The lighter tier: every `sidebar_border` site is a pane meeting another
     // pane, and both already carry their own fill. See `Neutrals`.
@@ -1064,9 +1063,11 @@ mod tests {
 
     #[test]
     fn a_pick_while_not_following_keeps_the_appearance_slots() {
-        let mut cfg = Config::default();
-        cfg.theme_follow_system = false;
-        cfg.theme_preset = "dark".into();
+        let mut cfg = Config(crate::core::config::CoreConfig {
+            theme_follow_system: false,
+            theme_preset: "dark".into(),
+            ..crate::core::config::CoreConfig::default()
+        });
         select_theme_preset(&mut cfg, true, "harbor");
         assert!(!cfg.theme_follow_system);
         assert_eq!(cfg.theme_preset, "harbor");
@@ -1080,10 +1081,12 @@ mod tests {
 
     #[test]
     fn toggling_follow_switches_which_field_is_live() {
-        let mut cfg = Config::default();
-        cfg.theme_preset = "harbor".into();
-        cfg.theme_preset_light = "one_light".into();
-        cfg.theme_preset_dark = "dracula".into();
+        let mut cfg = Config(crate::core::config::CoreConfig {
+            theme_preset: "harbor".into(),
+            theme_preset_light: "one_light".into(),
+            theme_preset_dark: "dracula".into(),
+            ..crate::core::config::CoreConfig::default()
+        });
         assert_eq!(effective_preset_id_from(&cfg, true), "dracula");
 
         toggle_theme_follow(&mut cfg);
@@ -1102,9 +1105,11 @@ mod tests {
     #[gpui::test]
     fn the_theme_menu_checks_follow_and_the_effective_preset(cx: &mut TestAppContext) {
         cx.update(|cx| {
-            let mut cfg = Config::default();
-            cfg.theme_preset_dark = "dracula".into();
-            cfg.theme_preset_light = "one_light".into();
+            let cfg = Config(crate::core::config::CoreConfig {
+                theme_preset_dark: "dracula".into(),
+                theme_preset_light: "one_light".into(),
+                ..crate::core::config::CoreConfig::default()
+            });
             cx.set_global(cfg);
             cx.set_global(SystemAppearance { dark: true });
 

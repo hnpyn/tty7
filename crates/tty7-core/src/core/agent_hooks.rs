@@ -1901,7 +1901,7 @@ fn jcode_hooks_state(target: &HookTarget, path: &Path) -> HooksState {
         .iter()
         .map(|(key, _)| {
             table
-                .get(*key)
+                .get(key)
                 .map(jcode_commands)
                 .transpose()
                 .ok()
@@ -1951,7 +1951,7 @@ fn jcode_hooks_install(target: &HookTarget, path: &Path) -> anyhow::Result<()> {
     let marker = HookAgent::Jcode.marker();
     for (key, event) in JCODE_HOOK_EVENTS {
         let mut commands = table
-            .get(*key)
+            .get(key)
             .map(jcode_commands)
             .transpose()?
             .unwrap_or_default();
@@ -1980,7 +1980,7 @@ fn jcode_hooks_uninstall(target: &HookTarget, path: &Path) -> anyhow::Result<Hoo
     let marker = HookAgent::Jcode.marker();
     let mut removed = false;
     for (key, _) in JCODE_HOOK_EVENTS {
-        let Some(item) = table.get(*key) else {
+        let Some(item) = table.get(key) else {
             continue;
         };
         let mut commands = jcode_commands(item)?;
@@ -4181,7 +4181,7 @@ mod tests {
         );
         let root: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert!(root["hooks"]["SessionStart"].as_array().unwrap().len() >= 1);
+        assert!(!root["hooks"]["SessionStart"].as_array().unwrap().is_empty());
         assert!(
             root["hooks"]["SessionEnd"][0]["hooks"][0]["command"]
                 .as_str()

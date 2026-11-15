@@ -1,7 +1,7 @@
 # Usage: bundle-windows.ps1 <target-triple> <arch-label>
 # Package the release binary twice from one staged payload:
-#   dist/tty7-<version>-windows-<arch>.zip        portable (unzip anywhere)
-#   dist/tty7-<version>-windows-<arch>-setup.exe  Inno Setup installer
+#   dist/ntty7-<version>-windows-<arch>.zip        portable (unzip anywhere)
+#   dist/ntty7-<version>-windows-<arch>-setup.exe  Inno Setup installer
 #     (Program Files or per-user, Start Menu shortcut, "Apps" uninstall entry)
 #
 # Fonts are embedded via include_bytes! and the app icon is compiled into the
@@ -48,32 +48,6 @@ foreach ($File in 'conpty.dll', 'OpenConsole.exe') {
     Copy-Item $Source "$Stage/$File"
 }
 Copy-Item "assets/windows/conpty/LICENSE.txt" "$Stage/LICENSE-ConPTY.txt"
-
-# The Linux musl `tty7-server`, staged at server/ so a WSL distro can be handed
-# the binary this client shipped with (WSL downloads nothing). The
-# lookup path is a contract with `daemon::install::wsl` — it searches
-# <dir of ntty7.exe>/server/<asset> first — so this directory name is not free to
-# change on its own. Missing is a warning, not an error, matching `server-musl`'s
-# own skip-don't-fail probe; WSL then fails at connect time with a message
-# naming the directories it searched.
-#
-# The *filename* is a contract too, not just the directory: `wsl.rs` looks for
-# `<dir>/<asset name>`, so these strings have to stay whatever
-# `install::asset::ASSET_X86_64` / `ASSET_AARCH64` say they are. A WSL distro
-# runs the host's architecture, so each package carries the one that matches it.
-$ServerAsset = @{
-    'x86_64-pc-windows-msvc'  = 'tty7-server-linux-x86_64-musl'
-    'aarch64-pc-windows-msvc' = 'tty7-server-linux-aarch64-musl'
-}[$Target]
-if (-not $ServerAsset) { throw "no bundled WSL server asset known for $Target" }
-$ServerSrc = "bundled-server/$ServerAsset"
-if (Test-Path $ServerSrc) {
-    New-Item -ItemType Directory -Force -Path "$Stage/server" | Out-Null
-    Copy-Item $ServerSrc "$Stage/server/$ServerAsset"
-    Write-Host "OK bundled $ServerAsset"
-} else {
-    Write-Warning "no $ServerAsset to bundle - this build cannot serve WSL distros"
-}
 
 # The marker tells the in-app updater which of the two Windows layouts it is
 # running from, and therefore which release asset can replace it. It says

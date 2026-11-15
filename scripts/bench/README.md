@@ -81,7 +81,7 @@ number painted on screen.
 
 Apple M1 Pro, 32 GB, macOS 26.3.1, grid 155×40, release builds, defaults.
 Optimization = the `VecDeque` replay ring + coalesced `Output` frames +
-backpressure gate (see CHANGELOG "Terminal throughput ~12× faster").
+backpressure gate (the terminal throughput pass).
 
 | Test | tty7 (before) | tty7 (after) | Alacritty | Ghostty | Kitty |
 | --- | ---: | ---: | ---: | ---: | ---: |
@@ -103,7 +103,7 @@ localized this.
 ## Recorded baseline (2026-07-04, second throughput pass)
 
 Same machine and grid, all four terminals re-run the same day. Optimization =
-the CHANGELOG "second throughput pass" batch (16 MiB gate, 256 KiB socket
+the second throughput pass (16 MiB gate, 256 KiB socket
 buffers, client-side Output batching, memchr OSC fast paths, atomic gate,
 QoS promotion).
 

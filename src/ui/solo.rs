@@ -8,13 +8,13 @@ use gpui::{
 };
 #[cfg(target_os = "macos")]
 use gpui::{MouseButton, MouseDownEvent, MouseMoveEvent, WindowControlArea, point};
-use gpui_component::Root;
+use gpui_component::{Root, WindowExt as _};
 
 use crate::core::actions::{
     CloseActiveTab, CloseWindow, DecreaseFontSize, HideApp, HideOthers, IncreaseFontSize,
     MinimizeWindow, NewTab, NewWindow, Quit, ResetFontSize, ShowAll, ToggleFullscreen, ZoomWindow,
 };
-use crate::core::config::{Config, ConfirmClose, FONT_SIZE_MAX, FONT_SIZE_MIN};
+use crate::core::config::{Config, ConfirmClose, FONT_SIZE_MAX, FONT_SIZE_MIN, StartupMode};
 use crate::terminal::view::{ChildExited, PaneBusy, TerminalView};
 use crate::ui::i18n::{L10nKey, t, t_fmt};
 
@@ -61,6 +61,20 @@ pub(crate) fn quit_route(window_live: bool, prompt_open: bool) -> QuitRoute {
     }
 }
 
+pub(crate) fn route_new_window(cx: &mut App) {
+    let cwd = cx.try_global::<LiveSolo>().cloned().and_then(|live| {
+        live.window
+            .update(cx, |_root, _window, cx| {
+                live.solo
+                    .upgrade()
+                    .and_then(|solo| solo.read(cx).terminal.read(cx).local_cwd())
+            })
+            .ok()
+            .flatten()
+    });
+    crate::spawn_new_instance(cwd.as_deref());
+}
+
 pub(crate) fn route_quit(cx: &mut App) {
     let Some(live) = cx.try_global::<LiveSolo>().cloned() else {
         crate::cleanup_and_quit(cx);
@@ -90,17 +104,18 @@ pub(crate) fn route_quit(cx: &mut App) {
 }
 
 impl SoloWindow {
-    fn open(cwd: Option<std::path::PathBuf>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let launched_without_path = cwd.is_none();
+    fn open(
+        parts: crate::terminal::view::ShellParts,
+        launched_without_path: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         crate::ui::theme::apply_theme(Some(window), cx);
-        let cwd = cwd.or_else(crate::core::config::working_directory_base);
-        let parts = TerminalView::spawn_shell_terminal_in(None, cwd, None, None, None)
-            .unwrap_or_else(|error| {
-                log::error!("terminal failed to start: {error:#}");
-                crate::cleanup_runtime();
-                std::process::exit(1);
-            });
+        let notice = parts.shell_notice.clone();
         let terminal = cx.new(|cx| TerminalView::from_shell_parts(parts, window, cx));
+        if let Some(notice) = notice {
+            window.push_notification(notice, cx);
+        }
         let child_exit = Self::quit_when_the_shell_exits(&terminal, cx);
         let config_watch = cx.observe_global::<Config>(|this, cx| this.apply_config(cx));
         let appearance = window.observe_window_appearance(|window, cx| {
@@ -185,11 +200,23 @@ impl SoloWindow {
             Ok(parts) => parts,
             Err(error) => {
                 log::error!("could not open {}: {error:#}", cwd.display());
-                crate::spawn_new_instance(Some(&cwd));
+                window.push_notification(
+                    t_fmt(
+                        L10nKey::ShellCouldNotStart,
+                        &[("error", &format!("{error:#}"))],
+                    ),
+                    cx,
+                );
                 return;
             }
         };
+        let notice = parts.shell_notice.clone();
         let old_pane = self.terminal.read(cx).pane_id;
+        // The reader's teardown warning is for a link that died on its own.
+        // Retiring this view is not that: mark it quit before the pane is
+        // killed, or the close looks like a dropped connection.
+        self.terminal
+            .update(cx, |view, _cx| view.terminal.detach_link());
         let next = cx.new(|cx| TerminalView::from_shell_parts(parts, window, cx));
         // Drop the old quit subscription before the old pane is killed, or
         // its `ChildExited` closes the window we just retargeted.
@@ -197,6 +224,9 @@ impl SoloWindow {
         self.terminal = next;
         self.apply_config(cx);
         TerminalView::kill_pane(old_pane);
+        if let Some(notice) = notice {
+            window.push_notification(notice, cx);
+        }
         window.focus(&self.focus_handle(cx), cx);
         cx.notify();
     }
@@ -383,14 +413,72 @@ fn macos_drag_edge(window: &mut Window, cx: &mut Context<SoloWindow>) -> Vec<gpu
 pub(crate) fn open(cx: &mut App, cwd: Option<std::path::PathBuf>) {
     let cwd = cwd.or_else(crate::take_pending_open);
     crate::mark_window_live(cwd.as_deref());
+    let launched_without_path = cwd.is_none();
+    let cwd = cwd.or_else(crate::core::config::working_directory_base);
+    match TerminalView::spawn_shell_terminal_in(None, cwd, None, None, None) {
+        Ok(parts) => {
+            let options = window_options(cx);
+            let opened = cx.open_window(options, move |window, cx| {
+                let solo = cx.new(|cx| SoloWindow::open(parts, launched_without_path, window, cx));
+                cx.new(|cx| Root::new(solo, window, cx).bg(gpui::transparent_black()))
+            });
+            if let Err(error) = opened {
+                log::error!("failed to open window: {error}");
+                crate::cleanup_and_quit(cx);
+            }
+        }
+        Err(error) => open_startup_failure(cx, &error),
+    }
+}
+
+/// A cold start whose login shell could not open a PTY. The prompt is the
+/// only thing the user sees; quitting is `cleanup_and_quit`, so Dock and
+/// Spotlight still get a window instead of a silent exit.
+fn open_startup_failure(cx: &mut App, error: &anyhow::Error) {
+    log::error!("terminal failed to start: {error:#}");
+    let detail = t_fmt(
+        L10nKey::ShellCouldNotStart,
+        &[("error", &format!("{error:#}"))],
+    );
     let options = window_options(cx);
     let opened = cx.open_window(options, move |window, cx| {
-        let solo = cx.new(|cx| SoloWindow::open(cwd, window, cx));
-        cx.new(|cx| Root::new(solo, window, cx).bg(gpui::transparent_black()))
+        let failure = cx.new(|cx| StartupFailure::new(detail, window, cx));
+        cx.new(|cx| Root::new(failure, window, cx).bg(gpui::transparent_black()))
     });
     if let Err(error) = opened {
         log::error!("failed to open window: {error}");
         crate::cleanup_and_quit(cx);
+    }
+}
+
+struct StartupFailure;
+
+impl StartupFailure {
+    fn new(detail: String, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let answer = window.prompt(
+            PromptLevel::Critical,
+            t(L10nKey::ShellCouldNotStartTitle),
+            Some(&detail),
+            &[gpui::PromptButton::ok(t(L10nKey::AppMenuQuit))],
+            cx,
+        );
+        window.on_window_should_close(cx, |_window, cx| {
+            crate::cleanup_and_quit(cx);
+            true
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let _ = answer.await;
+            this.update(cx, |_this, cx| crate::cleanup_and_quit(cx))
+                .ok();
+        })
+        .detach();
+        Self
+    }
+}
+
+impl Render for StartupFailure {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div().size_full()
     }
 }
 
@@ -404,8 +492,13 @@ fn window_options(cx: &mut App) -> WindowOptions {
         });
 
     let bounds = Bounds::centered(None, size(px(800.), px(600.)), cx);
+    let window_bounds = match cx.global::<Config>().startup_mode {
+        StartupMode::Normal => WindowBounds::Windowed(bounds),
+        StartupMode::Maximized => WindowBounds::Maximized(bounds),
+        StartupMode::Fullscreen => WindowBounds::Fullscreen(bounds),
+    };
     WindowOptions {
-        window_bounds: Some(WindowBounds::Windowed(bounds)),
+        window_bounds: Some(window_bounds),
         app_id: Some("ntty7".to_owned()),
         #[cfg(any(target_os = "linux", target_os = "freebsd"))]
         icon: APP_ICON.as_ref().cloned(),

@@ -1,8 +1,8 @@
 #!/bin/bash
 # Usage: bundle-macos.sh <target-triple> <arch-label>
-# Package the release binary into dist/tty7.app, then publish both:
-#   dist/tty7-<version>-macos-<arch>.zip  (in-app updater)
-#   dist/tty7-<version>-macos-<arch>.dmg  (drag-to-Applications install)
+# Package the release binary into dist/ntty7.app, then publish both:
+#   dist/ntty7-<version>-macos-<arch>.zip
+#   dist/ntty7-<version>-macos-<arch>.dmg  (drag-to-Applications install)
 #
 # Signing posture is chosen from the environment:
 #   * Developer ID secrets present (APPLE_SIGNING_IDENTITY + APPLE_CERTIFICATE)
@@ -272,7 +272,7 @@ fi
 # After the signing block, because assert-macho.sh also insists on a code
 # signature, and after both postures so one pass covers Developer ID and adhoc
 # alike. Before the zip and the DMG, so a bundle that fails here never becomes
-# an artifact — and before the `mv` below, after which dist/tty7.app no longer
+# an artifact — and before the `mv` below, after which dist/ntty7.app no longer
 # exists. For a Developer ID build that puts it after notarization, which
 # spends a few minutes of notary time on a bundle that was never going to ship;
 # cheap next to carrying a second copy of this block inside each branch.
@@ -342,26 +342,24 @@ if [[ "${TTY7_BUNDLE_ONLY:-0}" != "0" ]]; then
     exit 0
 fi
 
-# The in-app updater needs the signed, notarized .app itself rather than a disk
-# image that requires Finder interaction. The helper re-reads the full embedded
-# version out of the staged bundle and refuses anything that is not the release
-# it was told to install.
+# The zip is the signed .app itself. Nightly extracts it and checks the
+# embedded version and the signature.
 ZIP=""
 if [[ "$PACKAGE_UPDATE_ZIP" != "0" ]]; then
-    ZIP="$DIST/tty7-${VERSION}-macos-${ARCH}.zip"
+    ZIP="$DIST/ntty7-${VERSION}-macos-${ARCH}.zip"
     ditto -c -k --keepParent "$APP" "$ZIP"
 fi
 
 # Package the (now stapled) bundle as a drag-to-Applications DMG.
-DMG="$DIST/tty7-${VERSION}-macos-${ARCH}.dmg"
+DMG="$DIST/ntty7-${VERSION}-macos-${ARCH}.dmg"
 STAGE="$DIST/dmg-stage"
 rm -rf "$STAGE"
 mkdir "$STAGE"
 # `mv`, not `cp -R`: this is the peak, and a second full copy of the bundle is
 # the most expensive thing on the volume that nobody needs. Nothing reads
-# dist/tty7.app after this point — the zip above is what the updater ships and
-# what nightly.yml verifies (it extracts that, not this), and release.yml only
-# knows about tty7.app as an intermediate to keep out of the upload globs.
+# dist/ntty7.app after this point — the zip above is what nightly.yml verifies
+# (it extracts that, not this), and release.yml only knows about ntty7.app as
+# an intermediate to keep out of the upload globs.
 mv "$APP" "$STAGE/"
 ln -s /Applications "$STAGE/Applications"
 # Size the image explicitly. Left to itself, `-srcfolder` measures the bytes it

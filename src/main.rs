@@ -2,11 +2,6 @@
     all(target_os = "windows", not(debug_assertions)),
     windows_subsystem = "windows"
 )]
-// The unit tests reach helpers the window itself does not. A non-test build
-// still typechecks them; only the test build is required to prove each one
-// is used.
-#![cfg_attr(not(test), allow(dead_code, unused_imports))]
-
 mod core;
 mod daemon;
 mod terminal;
@@ -147,7 +142,6 @@ fn apply_reloaded_config(
     cx.set_global(config);
     reload_themes(cx);
     crate::ui::theme::apply_cursor_hide_mode(cx);
-    crate::ui::theme::set_menus(cx);
     // A hand-edited keybinding shows up in the settings list off the live
     // global immediately; without this it never reaches the keymap gpui
     // actually dispatches against, so the key looks bound and does nothing
@@ -218,16 +212,27 @@ fn apply_config_dir_arg(args: &[std::ffi::OsString]) {
     }
 }
 
+fn nonempty_path(path: std::path::PathBuf) -> Option<std::path::PathBuf> {
+    if path.as_os_str().is_empty() {
+        None
+    } else {
+        Some(path)
+    }
+}
+
 fn open_path_from(
     mut args: impl Iterator<Item = std::ffi::OsString>,
 ) -> Option<std::path::PathBuf> {
     let mut positional = None;
     while let Some(arg) = args.next() {
         if let Some(path) = strip_os_arg_prefix(&arg, "--open-path=") {
-            return Some(path.into());
+            return nonempty_path(path.into());
         }
         if arg == std::ffi::OsStr::new("--open-path") {
-            return args.next().map(Into::into);
+            return args
+                .next()
+                .map(std::path::PathBuf::from)
+                .and_then(nonempty_path);
         }
         // `--config-dir <path>` is a value, not the directory to open.
         if arg == std::ffi::OsStr::new("--config-dir") {
@@ -238,7 +243,7 @@ fn open_path_from(
             continue;
         }
         if positional.is_none() {
-            positional = Some(std::path::PathBuf::from(arg));
+            positional = nonempty_path(std::path::PathBuf::from(arg));
         }
     }
     positional
@@ -292,15 +297,64 @@ fn percent_decode(input: &str) -> String {
 }
 
 /// A dropped file opens its parent directory. A directory opens itself.
+///
+/// Relative paths, including a bare file name whose `parent()` is empty, are
+/// resolved against the process's current directory first. `~` is the user's
+/// home. `.` components are dropped so `ntty7 .` is that directory itself.
 pub(crate) fn directory_for_open(path: &std::path::Path) -> std::path::PathBuf {
-    if path.is_file() {
-        path.parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-            .map(std::path::Path::to_path_buf)
-            .unwrap_or_else(|| path.to_path_buf())
+    let path = expand_home(path);
+    let anchored = if path.is_absolute() {
+        path
     } else {
-        path.to_path_buf()
+        match std::env::current_dir() {
+            Ok(cwd) => cwd.join(&path),
+            Err(_) => path,
+        }
+    };
+    let anchored = normalize_dots(&anchored);
+    if anchored.is_dir() {
+        return anchored;
     }
+    match anchored.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+        _ => anchored,
+    }
+}
+
+fn expand_home(path: &std::path::Path) -> std::path::PathBuf {
+    let Some(text) = path.to_str() else {
+        return path.to_path_buf();
+    };
+    let Some(rest) = text.strip_prefix('~') else {
+        return path.to_path_buf();
+    };
+    if !rest.is_empty() && !rest.starts_with('/') && !rest.starts_with('\\') {
+        return path.to_path_buf();
+    }
+    let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) else {
+        return path.to_path_buf();
+    };
+    let mut out = std::path::PathBuf::from(home);
+    let rest = rest.trim_start_matches(['/', '\\']);
+    if !rest.is_empty() {
+        out.push(rest);
+    }
+    out
+}
+
+fn normalize_dots(path: &std::path::Path) -> std::path::PathBuf {
+    use std::path::Component;
+    let mut out = std::path::PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
 }
 
 static PENDING_OPEN: std::sync::Mutex<Option<std::path::PathBuf>> = std::sync::Mutex::new(None);
@@ -340,7 +394,7 @@ fn window_is_live() -> bool {
 fn opened_here(path: &std::path::Path) -> bool {
     OPENED_PATH
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .as_deref()
         .is_some_and(|opened| opened == path)
 }
@@ -352,19 +406,25 @@ pub(crate) fn mark_window_live(cwd: Option<&std::path::Path>) {
         absorbed: std::sync::atomic::AtomicBool::new(false),
     });
     if let Some(cwd) = cwd {
-        *OPENED_PATH.lock().unwrap() = Some(cwd.to_path_buf());
+        *OPENED_PATH.lock().unwrap_or_else(|e| e.into_inner()) = Some(cwd.to_path_buf());
     }
     WINDOW_LIVE.store(true, std::sync::atomic::Ordering::SeqCst);
 }
 
 pub(crate) fn take_pending_open() -> Option<std::path::PathBuf> {
-    PENDING_OPEN.lock().unwrap().take()
+    PENDING_OPEN
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
 }
 
 /// The directory a path-less launch window should switch to, if a cold-start
 /// open URL arrived. The window polls this; `on_open_urls` has no `App`.
 pub(crate) fn take_launch_retarget() -> Option<std::path::PathBuf> {
-    LAUNCH_RETARGET.lock().unwrap().take()
+    LAUNCH_RETARGET
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
 }
 
 pub(crate) fn within_launch_grace() -> bool {
@@ -405,8 +465,8 @@ fn note_external_opens(urls: Vec<String>) {
             .store(true, std::sync::atomic::Ordering::SeqCst);
         let mut dirs = dirs.into_iter();
         if let Some(first) = dirs.next() {
-            *LAUNCH_RETARGET.lock().unwrap() = Some(first.clone());
-            *OPENED_PATH.lock().unwrap() = Some(first);
+            *LAUNCH_RETARGET.lock().unwrap_or_else(|e| e.into_inner()) = Some(first.clone());
+            *OPENED_PATH.lock().unwrap_or_else(|e| e.into_inner()) = Some(first);
         }
         for extra in dirs {
             spawn_new_instance(Some(&extra));
@@ -419,7 +479,7 @@ fn note_external_opens(urls: Vec<String>) {
         }
         return;
     }
-    let mut pending = PENDING_OPEN.lock().unwrap();
+    let mut pending = PENDING_OPEN.lock().unwrap_or_else(|e| e.into_inner());
     let mut dirs = dirs.into_iter();
     if pending.is_none() {
         *pending = dirs.next();
@@ -482,9 +542,15 @@ fn read_path_from_shell(shell: &str, args: &[&str]) -> Option<String> {
             return None;
         }
     };
-    let mut stdout = child.stdout.take()?;
+    let mut stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            let _ = child.wait();
+            return None;
+        }
+    };
     let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
+    let reader = std::thread::spawn(move || {
         let mut out = Vec::new();
         let mut buf = [0u8; 4096];
         loop {
@@ -506,18 +572,16 @@ fn read_path_from_shell(shell: &str, args: &[&str]) -> Option<String> {
                 "login shell {shell} did not report PATH within {PATH_PROBE_TIMEOUT:?}; \
                  continuing without it"
             );
-            let _ = child.kill();
             None
         }
     };
-    if path.is_none() {
-        let _ = child.kill();
-    }
-    // Reap off the startup path: after the marker the shell may still be
-    // running exit hooks, and none of them is worth a delay here.
-    std::thread::spawn(move || {
-        let _ = child.wait();
-    });
+    // Kill, join, then reap before returning. `set_var` is single-threaded,
+    // and a reader or reaper still alive here would be a second thread in
+    // `setenv`'s critical section. Killing also unblocks a read parked on a
+    // shell whose exit hooks never close the pipe.
+    let _ = child.kill();
+    let _ = reader.join();
+    let _ = child.wait();
     path
 }
 
@@ -602,6 +666,19 @@ fn apply_font_thicken(thicken: bool) {
 /// write into the other app's directory. A user-chosen `$NTTY7_CONFIG_DIR`
 /// stays; one whose directory name is `ntty7-<pid>` is the parent's ephemeral
 /// runtime and is not a config directory.
+/// Nested-pane markers. A blanket `NTTY7_*` wipe would also drop a
+/// user-chosen `NTTY7_CONFIG_DIR` and `NTTY7_TRACE`.
+const NESTED_PANE_ENV: &[&str] = &[
+    "NTTY7",
+    "NTTY7_USER_ZDOTDIR",
+    "NTTY7_RC",
+    "NTTY7_ZDOTDIR",
+    "NTTY7_PANE",
+    "NTTY7_WS",
+    "NTTY7_SHELL_INTEGRATION",
+    "NTTY7_HISTFILE",
+];
+
 fn scrub_inherited_terminal_env() {
     restore_zdotdir_from_outer_tty7();
     let inherited: Vec<std::ffi::OsString> = std::env::vars_os()
@@ -614,12 +691,7 @@ fn scrub_inherited_terminal_env() {
     for key in inherited {
         unsafe { std::env::remove_var(key) };
     }
-    for key in [
-        "NTTY7_PANE",
-        "NTTY7_WS",
-        "NTTY7_SHELL_INTEGRATION",
-        "NTTY7_HISTFILE",
-    ] {
+    for key in NESTED_PANE_ENV {
         unsafe { std::env::remove_var(key) };
     }
     if let Some(value) = std::env::var_os("NTTY7_CONFIG_DIR") {
@@ -632,24 +704,27 @@ fn scrub_inherited_terminal_env() {
     }
 }
 
-/// `tty7` points `ZDOTDIR` at a throwaway directory for the duration of zsh
-/// startup and keeps the user's directory in `TTY7_USER_ZDOTDIR`. Copy that
-/// back, then drop the variable. An empty save means the user had no
-/// `ZDOTDIR`. A save whose last component is `tty7-zdotdir-*` is the
-/// redirector itself, so it is cleared rather than adopted — adopting it
-/// would make this process's zsh source the outer app's startup files.
+/// `tty7` and `ntty7` point `ZDOTDIR` at a throwaway directory for the
+/// duration of zsh startup and keep the user's directory in
+/// `TTY7_USER_ZDOTDIR` / `NTTY7_USER_ZDOTDIR`. Copy that back, then drop both
+/// variables. A `ZDOTDIR` that is not one of those throwaways is the user's
+/// own — `export ZDOTDIR=/custom` inside a nested shell — and is left alone
+/// even when a stale save is still set.
 fn restore_zdotdir_from_outer_tty7() {
-    let saved = std::env::var_os("TTY7_USER_ZDOTDIR");
-    match zdotdir_restore(saved.as_deref()) {
-        ZdotdirRestore::Leave => {
-            if std::env::var_os("ZDOTDIR").is_some_and(|path| zdotdir_is_throwaway(&path)) {
-                unsafe { std::env::remove_var("ZDOTDIR") };
-            }
-        }
+    let current = std::env::var_os("ZDOTDIR");
+    let tty7_saved = std::env::var_os("TTY7_USER_ZDOTDIR");
+    let ntty7_saved = std::env::var_os("NTTY7_USER_ZDOTDIR");
+    match plan_inherited_zdotdir(
+        current.as_deref(),
+        tty7_saved.as_deref(),
+        ntty7_saved.as_deref(),
+    ) {
+        ZdotdirRestore::Leave => {}
         ZdotdirRestore::Clear => unsafe { std::env::remove_var("ZDOTDIR") },
         ZdotdirRestore::Set(path) => unsafe { std::env::set_var("ZDOTDIR", path) },
     }
     unsafe { std::env::remove_var("TTY7_USER_ZDOTDIR") };
+    unsafe { std::env::remove_var("NTTY7_USER_ZDOTDIR") };
 }
 
 enum ZdotdirRestore {
@@ -666,11 +741,50 @@ fn zdotdir_restore(saved: Option<&std::ffi::OsStr>) -> ZdotdirRestore {
     }
 }
 
+/// What to do with the `ZDOTDIR` inherited from an outer terminal.
+///
+/// A current directory that is not a `tty7-zdotdir-*` / `ntty7-zdotdir-*`
+/// throwaway is kept. A throwaway is replaced from the matching save
+/// (`ntty7-zdotdir-*` prefers `NTTY7_USER_ZDOTDIR`, `tty7-zdotdir-*` prefers
+/// `TTY7_USER_ZDOTDIR`). An empty or throwaway save clears `ZDOTDIR`. When
+/// `ZDOTDIR` itself is unset, a real save is put back.
+fn plan_inherited_zdotdir(
+    current: Option<&std::ffi::OsStr>,
+    tty7_saved: Option<&std::ffi::OsStr>,
+    ntty7_saved: Option<&std::ffi::OsStr>,
+) -> ZdotdirRestore {
+    if current.is_some() && !current.is_some_and(zdotdir_is_throwaway) {
+        return ZdotdirRestore::Leave;
+    }
+    let saved = preferred_saved_zdotdir(current, tty7_saved, ntty7_saved);
+    match zdotdir_restore(saved) {
+        ZdotdirRestore::Leave if current.is_some_and(zdotdir_is_throwaway) => ZdotdirRestore::Clear,
+        other => other,
+    }
+}
+
+fn preferred_saved_zdotdir<'a>(
+    current: Option<&std::ffi::OsStr>,
+    tty7_saved: Option<&'a std::ffi::OsStr>,
+    ntty7_saved: Option<&'a std::ffi::OsStr>,
+) -> Option<&'a std::ffi::OsStr> {
+    let name = current
+        .and_then(|path| std::path::Path::new(path).file_name())
+        .and_then(|name| name.to_str());
+    if name.is_some_and(|name| name.starts_with("ntty7-zdotdir-")) {
+        ntty7_saved.or(tty7_saved)
+    } else if name.is_some_and(|name| name.starts_with("tty7-zdotdir-")) {
+        tty7_saved.or(ntty7_saved)
+    } else {
+        ntty7_saved.or(tty7_saved)
+    }
+}
+
 fn zdotdir_is_throwaway(path: &std::ffi::OsStr) -> bool {
     std::path::Path::new(path)
         .file_name()
         .and_then(|name| name.to_str())
-        .is_some_and(|name| name.starts_with("tty7-zdotdir-"))
+        .is_some_and(|name| name.starts_with("tty7-zdotdir-") || name.starts_with("ntty7-zdotdir-"))
 }
 
 fn strip_inherited_terminal_env(cmd: &mut std::process::Command) {
@@ -684,12 +798,7 @@ fn strip_inherited_terminal_env(cmd: &mut std::process::Command) {
     for key in inherited {
         cmd.env_remove(key);
     }
-    for key in [
-        "NTTY7_PANE",
-        "NTTY7_WS",
-        "NTTY7_SHELL_INTEGRATION",
-        "NTTY7_HISTFILE",
-    ] {
+    for key in NESTED_PANE_ENV {
         cmd.env_remove(key);
     }
 }
@@ -795,14 +904,14 @@ fn main() {
     #[cfg(target_os = "windows")]
     crate::core::aumid::init();
 
-    let open_path = open_path_from(args.into_iter());
+    let open_path = open_path_from(args.into_iter()).map(|path| directory_for_open(&path));
     let application = gpui_platform::application()
         .with_assets(Assets)
         .with_quit_mode(QuitMode::Explicit);
     application.on_open_urls(note_external_opens);
     application.on_reopen(|cx| {
         cx.spawn(async move |cx| {
-            let _ = cx.update(|cx| cx.activate(true));
+            cx.update(|cx| cx.activate(true));
         })
         .detach();
     });
@@ -941,7 +1050,7 @@ mod config_reload_tests {
 
             // The app's own `save()` fires this watcher on every sidebar drag.
             let mut unrelated = Config::default();
-            unrelated.dim_inactive_panes = !unrelated.dim_inactive_panes;
+            unrelated.copy_on_select = !unrelated.copy_on_select;
             let mut announced = false;
             assert!(
                 !apply_reloaded_config(
@@ -952,8 +1061,8 @@ mod config_reload_tests {
                 "an unrelated save must not rebuild the keymap"
             );
             assert_eq!(
-                cx.global::<Config>().dim_inactive_panes,
-                unrelated.dim_inactive_panes,
+                cx.global::<Config>().copy_on_select,
+                unrelated.copy_on_select,
                 "the reload still took effect; only the rebind was skipped"
             );
         });
@@ -1252,5 +1361,84 @@ mod argument_tests {
         assert!(!super::absorb_cold_open(true, true, false, young));
         assert!(!super::absorb_cold_open(true, false, true, young));
         assert!(!super::absorb_cold_open(false, false, false, young));
+    }
+
+    #[test]
+    fn empty_open_path_is_absent_and_relative_paths_are_directories() {
+        assert_eq!(
+            open_path_from(["--open-path", ""].into_iter().map(OsString::from)),
+            None
+        );
+        assert_eq!(
+            open_path_from([OsString::from("--open-path=")].into_iter()),
+            None
+        );
+        assert_eq!(open_path_from([OsString::from("")].into_iter()), None);
+
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(super::directory_for_open(std::path::Path::new(".")), cwd);
+        assert_eq!(
+            super::directory_for_open(std::path::Path::new("bar.rs")),
+            cwd
+        );
+        if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
+            assert_eq!(
+                super::directory_for_open(std::path::Path::new("~/ntty7-missing-file.rs")),
+                PathBuf::from(home)
+            );
+        }
+    }
+
+    #[test]
+    fn nested_ntty7_zdotdir_is_restored_and_a_custom_one_is_kept() {
+        let home = std::ffi::OsStr::new("/Users/n");
+        let custom = std::ffi::OsStr::new("/custom");
+        let ntty7_tmp = std::ffi::OsStr::new("/tmp/ntty7-zdotdir-9-1");
+        let tty7_tmp = std::ffi::OsStr::new("/tmp/tty7-zdotdir-4-1");
+        assert!(matches!(
+            super::plan_inherited_zdotdir(Some(ntty7_tmp), None, Some(home)),
+            super::ZdotdirRestore::Set(path) if path == home
+        ));
+        assert!(matches!(
+            super::plan_inherited_zdotdir(Some(custom), None, Some(home)),
+            super::ZdotdirRestore::Leave
+        ));
+        assert!(matches!(
+            super::plan_inherited_zdotdir(
+                Some(ntty7_tmp),
+                Some(home),
+                Some(std::ffi::OsStr::new(""))
+            ),
+            super::ZdotdirRestore::Clear
+        ));
+        assert!(super::zdotdir_is_throwaway(ntty7_tmp));
+        assert!(matches!(
+            super::plan_inherited_zdotdir(Some(tty7_tmp), Some(home), Some(ntty7_tmp)),
+            super::ZdotdirRestore::Set(path) if path == home
+        ));
+        assert!(matches!(
+            super::plan_inherited_zdotdir(None, None, Some(home)),
+            super::ZdotdirRestore::Set(path) if path == home
+        ));
+    }
+
+    #[test]
+    fn strip_drops_nested_ntty7_markers() {
+        let mut cmd = std::process::Command::new("true");
+        super::strip_inherited_terminal_env(&mut cmd);
+        let removed: Vec<String> = cmd
+            .get_envs()
+            .filter(|&(_, value)| value.is_none())
+            .map(|(key, _)| key.to_string_lossy().into_owned())
+            .collect();
+        for key in [
+            "NTTY7",
+            "NTTY7_USER_ZDOTDIR",
+            "NTTY7_RC",
+            "NTTY7_ZDOTDIR",
+            "NTTY7_PANE",
+        ] {
+            assert!(removed.iter().any(|have| have == key), "missing {key}");
+        }
     }
 }

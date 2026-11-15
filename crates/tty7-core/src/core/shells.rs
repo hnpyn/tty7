@@ -56,9 +56,7 @@ pub fn inventory() -> ShellInventory {
         .shell
         .as_ref()
         .map(|s| (s.program.clone(), s.args.clone()));
-    let mut inventory = inventory_from(detect_shells(), configured, &login_shell());
-    append_custom(&mut inventory, &config.custom_shells);
-    inventory
+    inventory_from(detect_shells(), configured, &login_shell())
 }
 
 /// Adds the user's own menu entries after everything that was detected.
@@ -68,6 +66,7 @@ pub fn inventory() -> ShellInventory {
 /// to "what do I get if I just click". A user-authored entry is an extra, not a
 /// candidate for that position — so this runs once the default has already been
 /// settled and cannot move it.
+#[cfg(test)]
 fn append_custom(inventory: &mut ShellInventory, custom: &[crate::core::config::CustomShell]) {
     for (index, entry) in custom.iter().enumerate() {
         let program = entry.program.trim();
@@ -903,8 +902,10 @@ fn list_wsl_distros() -> Option<Vec<String>> {
 #[cfg_attr(unix, allow(dead_code))]
 fn parse_wsl_list(bytes: &[u8]) -> Vec<String> {
     let units: Vec<u16> = bytes
-        .chunks_exact(2)
-        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| u16::from_le_bytes(*c))
         .collect();
     let text = String::from_utf16_lossy(&units);
     text.lines()

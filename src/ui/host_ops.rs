@@ -1,11 +1,14 @@
+#[cfg(test)]
 use std::borrow::Borrow;
+#[cfg(test)]
 use std::collections::{HashMap, HashSet};
+#[cfg(test)]
 use std::hash::Hash;
 
-use gpui::{App, Context, Window};
-use gpui_component::WindowExt as _;
+#[cfg(test)]
+use gpui::App;
+use gpui::Context;
 
-use crate::ui::i18n::L10nKey;
 use gpui_component::notification::Notification;
 
 #[allow(unused_imports)]
@@ -217,6 +220,7 @@ impl HostOps {
         .detach();
     }
 
+    #[cfg(test)]
     pub fn run_detached<T, E, F, L>(host: SharedHost, cx: &mut Context<E>, f: F, land: L)
     where
         E: 'static,
@@ -232,60 +236,6 @@ impl HostOps {
             cx.update(|cx| land(cx, out));
         })
         .detach();
-    }
-
-    pub fn run_in<T, E, F, L>(host: SharedHost, window: &Window, cx: &mut Context<E>, f: F, land: L)
-    where
-        E: 'static,
-        T: Send + 'static,
-        F: FnOnce(&dyn Host) -> T + Send + 'static,
-        L: FnOnce(&mut E, T, &mut Window, &mut Context<E>) + 'static,
-    {
-        tty7_core::host::register_ui_thread();
-        cx.spawn_in(window, async move |this, cx| {
-            let Some(out) = off_thread(move || f(&*host)).await else {
-                return;
-            };
-            let _ = this.update_in(cx, |view, window, cx| land(view, out, window, cx));
-        })
-        .detach();
-    }
-
-    pub fn run_or_notify<T, E, F, L>(
-        host: SharedHost,
-        window: &Window,
-        cx: &mut Context<E>,
-        context: impl Into<String>,
-        f: F,
-        land: L,
-    ) where
-        E: 'static,
-        T: Send + 'static,
-        F: FnOnce(&dyn Host) -> std::io::Result<T> + Send + 'static,
-        L: FnOnce(&mut E, T, &mut Window, &mut Context<E>) + 'static,
-    {
-        let context = context.into();
-        Self::run_in(
-            host,
-            window,
-            cx,
-            f,
-            move |view, result, window, cx| match result {
-                Ok(value) => land(view, value, window, cx),
-                Err(e) => HostOps::notify_err(window, cx, &context, &e),
-            },
-        );
-    }
-
-    /// Every context handed here is already a sentence about what failed —
-    /// "Could not delete a.txt" — so it is the toast's title, and the reason
-    /// sits under it. Run together as `{context}: {error}` on one plain line
-    /// the two read as a log entry, with nothing to mark it as a failure.
-    pub fn notify_err(window: &mut Window, cx: &mut App, context: &str, err: &std::io::Error) {
-        window.push_notification(
-            Notification::error(explain_io(err)).title(context.to_string()),
-            cx,
-        );
     }
 }
 
@@ -313,29 +263,13 @@ fn split_reason<'a>(sentence: &'a str, reason: &str) -> Option<&'a str> {
     Some(head.trim_end_matches(|c: char| c.is_whitespace() || matches!(c, ':' | '：' | '—' | '-')))
 }
 
-/// A sentence for the failures someone can act on, and the raw error for the
-/// rest. `Display` on an `io::Error` answers "what happened" for a developer
-/// reading a log; it does not answer "what now" for the person who just lost
-/// a save, and "Permission denied (os error 13)" is the shape of that gap.
-pub fn explain_io(err: &std::io::Error) -> String {
-    use std::io::ErrorKind;
-    let key = match err.kind() {
-        ErrorKind::PermissionDenied => L10nKey::IoDenied,
-        ErrorKind::NotFound => L10nKey::IoGone,
-        ErrorKind::StorageFull => L10nKey::IoNoSpace,
-        ErrorKind::ReadOnlyFilesystem => L10nKey::IoReadOnly,
-        ErrorKind::ResourceBusy => L10nKey::IoBusy,
-        ErrorKind::TimedOut => L10nKey::IoTimedOut,
-        _ => return err.to_string(),
-    };
-    crate::ui::i18n::t(key).to_string()
-}
-
+#[cfg(test)]
 pub struct InFlight<K: Eq + Hash + Clone> {
     in_flight: HashSet<K>,
     stale: HashSet<K>,
 }
 
+#[cfg(test)]
 impl<K: Eq + Hash + Clone> Default for InFlight<K> {
     fn default() -> Self {
         InFlight {
@@ -345,6 +279,7 @@ impl<K: Eq + Hash + Clone> Default for InFlight<K> {
     }
 }
 
+#[cfg(test)]
 impl<K: Eq + Hash + Clone> InFlight<K> {
     pub fn begin(&mut self, key: K) -> bool {
         self.in_flight.insert(key)
@@ -360,14 +295,6 @@ impl<K: Eq + Hash + Clone> InFlight<K> {
         self.stale.extend(self.in_flight.iter().cloned());
     }
 
-    /// Drop every key the predicate rejects — bookkeeping for work that will
-    /// never land (a host cleared away under an in-flight job). If the job
-    /// does land after all, its `finish` is a no-op rather than a poison.
-    pub fn retain(&mut self, keep: impl Fn(&K) -> bool) {
-        self.in_flight.retain(|k| keep(k));
-        self.stale.retain(|k| keep(k));
-    }
-
     pub fn finish(&mut self, key: &K) -> bool {
         self.in_flight.remove(key);
         !self.stale.remove(key)
@@ -375,10 +302,6 @@ impl<K: Eq + Hash + Clone> InFlight<K> {
 
     pub fn is_pending(&self, key: &K) -> bool {
         self.in_flight.contains(key)
-    }
-
-    pub fn pending_keys(&self) -> impl Iterator<Item = &K> {
-        self.in_flight.iter()
     }
 
     pub fn len(&self) -> usize {
@@ -390,10 +313,12 @@ impl<K: Eq + Hash + Clone> InFlight<K> {
     }
 }
 
+#[cfg(test)]
 pub struct ByHost<K: Eq + Hash, V> {
     map: HashMap<HostId, HashMap<K, V>>,
 }
 
+#[cfg(test)]
 impl<K: Eq + Hash, V> Default for ByHost<K, V> {
     fn default() -> Self {
         ByHost {
@@ -402,6 +327,7 @@ impl<K: Eq + Hash, V> Default for ByHost<K, V> {
     }
 }
 
+#[cfg(test)]
 impl<K: Eq + Hash, V> ByHost<K, V> {
     pub fn get<Q>(&self, host: HostId, key: &Q) -> Option<&V>
     where
@@ -423,18 +349,8 @@ impl<K: Eq + Hash, V> ByHost<K, V> {
         self.map.get_mut(&host)?.remove(key)
     }
 
-    pub fn keys(&self) -> impl Iterator<Item = (HostId, &K)> {
-        self.map
-            .iter()
-            .flat_map(|(host, inner)| inner.keys().map(move |k| (*host, k)))
-    }
-
     pub fn clear_host(&mut self, host: HostId) {
         self.map.remove(&host);
-    }
-
-    pub fn clear(&mut self) {
-        self.map.clear();
     }
 
     pub fn len(&self) -> usize {
@@ -450,30 +366,6 @@ impl<K: Eq + Hash, V> ByHost<K, V> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn the_failures_people_can_act_on_get_a_sentence() {
-        use std::io::{Error, ErrorKind};
-        crate::ui::i18n::set_locale("en");
-
-        // The kinds that change what you would do next.
-        for kind in [
-            ErrorKind::PermissionDenied,
-            ErrorKind::StorageFull,
-            ErrorKind::ReadOnlyFilesystem,
-            ErrorKind::NotFound,
-        ] {
-            let text = explain_io(&Error::new(kind, "os error 13"));
-            assert!(!text.contains("os error"), "{kind:?}: {text}");
-            assert!(text.ends_with('.'), "{kind:?}: {text}");
-        }
-
-        // Anything unclassified keeps its detail rather than losing it to a
-        // vague house sentence.
-        assert_eq!(
-            explain_io(&Error::other("the widget frobnicated")),
-            "the widget frobnicated"
-        );
-    }
     use std::path::{Path, PathBuf};
 
     #[test]

@@ -379,9 +379,9 @@ mod tests {
         let mut answer = vcx.update(|window, cx| {
             window.prompt(
                 gpui::PromptLevel::Warning,
-                t(L10nKey::QuitStopServerTitle),
-                Some(t(L10nKey::QuitStopServerBody)),
-                &crate::ui::confirm_answers(t(L10nKey::QuitAndStop), t(L10nKey::Cancel)),
+                t(L10nKey::Close),
+                Some(t(L10nKey::CloseIdleBody)),
+                &crate::ui::confirm_answers(t(L10nKey::Close), t(L10nKey::Keep)),
                 cx,
             )
         });

@@ -1,7 +1,7 @@
 #!/bin/bash
 # Usage: bundle-appimage.sh <target-triple> <arch-label>
 # Package the release binary into a self-contained AppImage:
-#   dist/tty7-<version>-linux-<arch>.AppImage
+#   dist/ntty7-<version>-linux-<arch>.AppImage
 #
 # Unlike the bare tarball (bundle-linux.sh), this bundles the x11/wayland/xkb/
 # fontconfig/freetype runtime libraries alongside the binary, so it launches on

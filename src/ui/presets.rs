@@ -43,10 +43,8 @@ pub struct Theme {
     pub blur: bool,
     pub image: Option<Image>,
     pub ansi16: [(u8, u8, u8); 16],
-    /// Which file a user theme was loaded from. The editor that wrote it back
-    /// is gone; the path stays so a reload can still tell a file-backed theme
-    /// from a built-in.
-    #[allow(dead_code)]
+    /// Which file a user theme was loaded from. A reload uses it to tell a
+    /// file-backed theme from a built-in.
     pub path: Option<PathBuf>,
 }
 
@@ -122,6 +120,7 @@ pub struct Surface {
     pub base: u32,
     pub hover: u32,
     pub selected: u32,
+    #[cfg_attr(not(test), allow(dead_code))]
     pub pressed: u32,
     /// The top rung. No surface paints it today; the ladder tests hold the
     /// rungs below it apart against it.
@@ -142,6 +141,7 @@ pub struct Surfaces {
     pub window: Surface,
     pub sidebar: Surface,
     /// The left tab rail's ladder, built on `Neutrals::rail`.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub rail: Surface,
     pub popover: Surface,
     pub scrim: Scrim,
@@ -164,20 +164,6 @@ impl Global for ActiveAccent {}
 /// contrast floor while staying apart from each other — and because the graph
 /// caps its visible lanes at the same number, which is what guarantees no two
 /// columns on screen are ever the same colour.
-pub const LANE_SLOTS: usize = 6;
-
-#[derive(Debug, Clone, Copy)]
-pub struct Lanes {
-    pub ink: [u32; LANE_SLOTS],
-    /// Everything past the last slot shares one column, so it gets a neutral:
-    /// a hue there would claim a branch identity the column does not have.
-    pub overflow: u32,
-}
-
-pub struct ActiveLanes(#[allow(dead_code)] pub Lanes);
-
-impl Global for ActiveLanes {}
-
 impl Theme {
     pub fn background_color(&self) -> u32 {
         self.background.color()
@@ -393,38 +379,6 @@ impl Theme {
             warning: build(amber),
             info: build(self.accent),
             link: build(self.accent),
-        }
-    }
-
-    /// Lane colours for the commit graph, derived the same way every other
-    /// colour in this file is: seeded from the theme's own palette, then walked
-    /// to a contrast floor on each surface it can be painted on.
-    ///
-    /// Not a fixed table of hexes. A hard-coded palette would be the one thing
-    /// here that does not follow the theme, and — worse — the contrast tests
-    /// below cannot see it, so the four light builtins would ship a graph whose
-    /// lanes sit at 2:1 against their own background.
-    ///
-    /// The seed order is blue, yellow, magenta, green, cyan, red. Three
-    /// constraints picked it: no two adjacent slots share a hue family; red and
-    /// green are never neighbours, for the readers who cannot tell them apart;
-    /// and red is last because a panel three or four lanes wide never reaches
-    /// it, so the one colour that also means "danger" everywhere else in the UI
-    /// stays out of the common case.
-    pub fn lanes(&self) -> Lanes {
-        const SEEDS: [usize; LANE_SLOTS] = [4, 3, 5, 2, 6, 1];
-        let bg = self.background_color();
-        let fg = legible_foreground(bg, self.foreground);
-        // Through `clear_ink`, the same three surfaces `semantics` clears on:
-        // the graph draws on the window in a floating panel, on the sidebar
-        // when the panel is docked, and on a popover in the detail view.
-        let mut ink = [0u32; LANE_SLOTS];
-        for (slot, seed) in SEEDS.iter().enumerate() {
-            ink[slot] = self.clear_ink(self.ansi_seed(*seed), ACCENT_FLOOR);
-        }
-        Lanes {
-            ink,
-            overflow: dim(fg, bg, state::TEXT_RESTING),
         }
     }
 
@@ -751,12 +705,14 @@ const TITLE_FLOOR: f32 = 7.0;
 /// caption ink they sit next to keeps the hue (green still means added) and
 /// takes the shout out, then the blend is walked back toward the full ink
 /// only when the surface it lands on cannot carry it at `TEXT_FLOOR`.
+#[cfg(test)]
 pub(crate) fn resting_ink(ink: Hsla, beside: Hsla, surface: Hsla) -> Hsla {
     let (ink, beside, surface) = (pack(ink), pack(beside), pack(surface));
     let blend = mix(ink, beside, 0.45);
     gpui::rgb(at_least(blend, ink, surface, TEXT_FLOOR)).into()
 }
 
+#[cfg(test)]
 fn pack(c: Hsla) -> u32 {
     let rgb = crate::terminal::palette::hsla_to_rgb(c);
     (rgb.r as u32) << 16 | (rgb.g as u32) << 8 | rgb.b as u32
@@ -855,6 +811,7 @@ pub fn by_id(cx: &App, id: &str) -> Theme {
         .unwrap_or_else(|| themes.into_iter().next().expect("at least the built-ins"))
 }
 
+#[cfg(test)]
 pub fn to_yaml(t: &Theme) -> String {
     fn hex(c: u32) -> String {
         format!("\"#{:06x}\"", c & 0xff_ffff)
@@ -983,7 +940,7 @@ fn id_and_name(path: &std::path::Path) -> (String, String) {
         .unwrap_or("theme")
         .to_string();
     let name = stem
-        .split(|c| c == '_' || c == '-' || c == ' ')
+        .split(['_', '-', ' '])
         .filter(|w| !w.is_empty())
         .map(|w| {
             let mut cs = w.chars();
@@ -1102,10 +1059,10 @@ impl FillFile {
 
 fn expand_path(p: &str) -> PathBuf {
     let p = p.trim();
-    if let Some(rest) = p.strip_prefix("~/") {
-        if let Some(home) = std::env::var_os("HOME") {
-            return PathBuf::from(home).join(rest);
-        }
+    if let Some(rest) = p.strip_prefix("~/")
+        && let Some(home) = std::env::var_os("HOME")
+    {
+        return PathBuf::from(home).join(rest);
     }
     let path = PathBuf::from(p);
     if path.is_absolute() {
@@ -1138,10 +1095,10 @@ fn load_iterm_theme(path: &std::path::Path) -> Result<Theme, String> {
     };
 
     let mut ansi16 = [(0u8, 0u8, 0u8); 16];
-    for i in 0..16 {
+    for (i, slot) in ansi16.iter_mut().enumerate() {
         let c = color(&format!("Ansi {i} Color"))
             .ok_or_else(|| format!("missing or malformed 'Ansi {i} Color'"))?;
-        ansi16[i] = ((c >> 16) as u8, (c >> 8) as u8, c as u8);
+        *slot = ((c >> 16) as u8, (c >> 8) as u8, c as u8);
     }
 
     let background = color("Background Color").ok_or("missing 'Background Color'")?;
@@ -1829,121 +1786,6 @@ mod tests {
                 "Dracula's {what} selection moved: {now:#08x} vs the tuned {legacy:#08x}"
             );
         }
-    }
-
-    /// CIE L*a*b* for a packed sRGB colour, D65.
-    ///
-    /// Contrast is a luminance ratio and says nothing about hue: two lanes can
-    /// both clear 3:1 against the background and still be the same colour to
-    /// look at. ΔE is the measure that catches that, and it needs Lab.
-    fn lab(c: u32) -> (f32, f32, f32) {
-        fn linear(v: u32) -> f32 {
-            let s = v as f32 / 255.0;
-            if s <= 0.04045 {
-                s / 12.92
-            } else {
-                ((s + 0.055) / 1.055).powf(2.4)
-            }
-        }
-        let (r, g, b) = (
-            linear(c >> 16 & 0xff),
-            linear(c >> 8 & 0xff),
-            linear(c & 0xff),
-        );
-        // sRGB → XYZ, then normalised by the D65 white point.
-        let x = (0.4124 * r + 0.3576 * g + 0.1805 * b) / 0.95047;
-        let y = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-        let z = (0.0193 * r + 0.1192 * g + 0.9505 * b) / 1.08883;
-        let f = |t: f32| {
-            if t > 0.008856 {
-                t.cbrt()
-            } else {
-                7.787 * t + 16.0 / 116.0
-            }
-        };
-        let (fx, fy, fz) = (f(x), f(y), f(z));
-        (116.0 * fy - 16.0, 500.0 * (fx - fy), 200.0 * (fy - fz))
-    }
-
-    fn delta_e76(a: u32, b: u32) -> f32 {
-        let (l1, a1, b1) = lab(a);
-        let (l2, a2, b2) = lab(b);
-        ((l1 - l2).powi(2) + (a1 - a2).powi(2) + (b1 - b2).powi(2)).sqrt()
-    }
-
-    #[test]
-    fn lane_colours_clear_the_floor_on_every_surface() {
-        for t in builtins() {
-            let m = t.neutrals();
-            let lanes = t.lanes();
-            for (name, surface) in [
-                ("background", m.background),
-                ("sidebar", m.sidebar),
-                ("popover", m.popover),
-            ] {
-                for (slot, ink) in lanes.ink.iter().enumerate() {
-                    let ratio = contrast(*ink, surface);
-                    assert!(
-                        ratio >= ACCENT_FLOOR,
-                        "{}/{name}: lane {slot} is only {ratio:.2}:1",
-                        t.id
-                    );
-                }
-                let ratio = contrast(lanes.overflow, surface);
-                assert!(
-                    ratio >= ACCENT_FLOOR,
-                    "{}/{name}: the overflow lane is only {ratio:.2}:1",
-                    t.id
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn adjacent_lanes_are_never_the_same_colour() {
-        // A just-noticeable difference is around 2.3. The floor is set far
-        // above it because these are 1.5px lines a few pixels apart, not
-        // patches side by side, and the eye is much worse at hairlines.
-        const FLOOR: f32 = 12.0;
-        for t in builtins() {
-            let lanes = t.lanes();
-            for slot in 0..LANE_SLOTS - 1 {
-                let d = delta_e76(lanes.ink[slot], lanes.ink[slot + 1]);
-                assert!(
-                    d >= FLOOR,
-                    "{}: lanes {slot} and {} are ΔE {d:.1} apart",
-                    t.id,
-                    slot + 1
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn lane_colours_are_deterministic() {
-        for t in builtins() {
-            assert_eq!(
-                t.lanes().ink,
-                t.lanes().ink,
-                "{}: lane derivation is not a pure function",
-                t.id
-            );
-        }
-    }
-
-    /// The seeds were chosen so that no two neighbours share a hue family and
-    /// red never sits beside green. Both are properties of the *order*, so a
-    /// reshuffle has to fail here rather than only looking slightly worse.
-    #[test]
-    fn the_lane_seed_order_keeps_red_and_green_apart() {
-        let seeds = [4usize, 3, 5, 2, 6, 1];
-        let red = seeds.iter().position(|s| *s == 1).expect("red is a seed");
-        let green = seeds.iter().position(|s| *s == 2).expect("green is a seed");
-        assert!(
-            red.abs_diff(green) > 1,
-            "red and green ended up adjacent at slots {red} and {green}"
-        );
-        assert_eq!(red, LANE_SLOTS - 1, "red should be the last slot reached");
     }
 
     #[test]

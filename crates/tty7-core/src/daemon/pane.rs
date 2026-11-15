@@ -161,9 +161,15 @@ fn build_spawn_config(
     cwd: Option<PathBuf>,
     shell: Option<ShellSpec>,
     workspace: Option<&str>,
+    use_config_shell: bool,
 ) -> anyhow::Result<SpawnConfig> {
     let initial_cwd = initial_working_directory(cwd);
-    let configured = choose_shell(shell, crate::core::config::shell_command());
+    let from_config = if use_config_shell {
+        crate::core::config::shell_command()
+    } else {
+        None
+    };
+    let configured = choose_shell(shell, from_config);
     if let Some(problem) = configured
         .as_ref()
         .and_then(|c| shell_program_problem(&c.program))
@@ -276,13 +282,14 @@ fn initial_working_directory(cwd: Option<PathBuf>) -> Option<PathBuf> {
     // now, but a hand-edited config.json can still hold one — name it, with
     // the reason, at the moment it actually costs something (an explicit cwd
     // that resolves never consults the config, so that case stays quiet).
-    if let Some(dir) = &forced {
-        if !dir.is_dir() && cwd.as_ref().is_none_or(|d| !d.is_dir()) {
-            log::warn!(
-                "configured working directory {} is not a directory; new panes fall back",
-                dir.display()
-            );
-        }
+    if let Some(dir) = &forced
+        && !dir.is_dir()
+        && cwd.as_ref().is_none_or(|d| !d.is_dir())
+    {
+        log::warn!(
+            "configured working directory {} is not a directory; new panes fall back",
+            dir.display()
+        );
     }
     [cwd, forced, fallback]
         .into_iter()
@@ -653,8 +660,6 @@ fn apply_common_command_setup(
     }
 }
 
-const RING_CAP: usize = 8 * 1024 * 1024;
-
 /// One geometry-homogeneous run of pane output. Replaying it means telling the
 /// subscriber the size those bytes were written at, then handing it the bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -663,7 +668,6 @@ pub(crate) struct ReplaySegment {
     bytes: Vec<u8>,
 }
 
-const MAX_RING_SEGMENTS: usize = 64;
 const REMOTE_CONTEXT_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 pub struct OutputGate {
@@ -723,12 +727,11 @@ impl OutputGate {
     }
 }
 
-/// What an observer may have queued and not yet written: the replay it is
-/// charged for on subscribing, which can be a whole ring, and as much again
-/// of live output. Were it only a ring, a full one would leave no room while
-/// its replay is still going out, and the first byte the pane printed in that
-/// time would drop the observer.
-pub(crate) const OBSERVER_BUDGET: i64 = 2 * RING_CAP as i64;
+/// Live output an observer may have queued and not yet written. Past this
+/// the observer is dropped instead of holding the pane's reader. Nothing is
+/// charged up front: the subscriber is attached before the first byte, and a
+/// detached pane is not resumed.
+pub(crate) const OBSERVER_BUDGET: i64 = 16 * 1024 * 1024;
 
 /// What an observer dropped at its budget is told, last on its stream.
 pub(crate) const OBSERVER_BEHIND: &str =
@@ -777,7 +780,8 @@ struct SizeLease {
 
 struct PaneState {
     id: u64,
-    ring: ReplayRing,
+    /// Geometry the pty is at. Output bytes are not retained.
+    size: WinSize,
     subscriber: Option<Sender<DaemonMsg>>,
     subscriber_epoch: u64,
     allow_remote_clipboard_write: bool,
@@ -831,9 +835,6 @@ struct PaneState {
     agent_clock: AgentClock,
     alive: bool,
     exit_code: Option<i32>,
-    /// When a reattach last made the program on this pane repaint; see
-    /// [`redraw_nudge`].
-    last_redraw_nudge: Option<std::time::Instant>,
 }
 
 /// When the agent session last heard from the agent, for the two conclusions
@@ -973,7 +974,7 @@ fn send_to_observer(obs: &Observer, msg: &DaemonMsg, len: usize) -> bool {
 /// is the same ambiguity every ConPTY terminal accepts on a mid-output
 /// resize. The echo exists to close the 16 MiB window, not that one.
 fn resize_state(st: &mut PaneState, size: WinSize) {
-    st.ring.resize(size);
+    st.size = size;
     if let Some(sub) = &st.subscriber {
         let _ = sub.send(DaemonMsg::Size(size));
     }
@@ -1013,7 +1014,7 @@ fn lease_take(st: &mut PaneState, observer: u64, size: WinSize, by: String) -> O
             }
             prev.desk
         }
-        None => st.ring.size(),
+        None => st.size,
     };
     st.lease = Some(SizeLease {
         observer,
@@ -1025,7 +1026,7 @@ fn lease_take(st: &mut PaneState, observer: u64, size: WinSize, by: String) -> O
     // a replay does too. The controller keeps its grid and gets no Size: a
     // client that is told its pane changed size resizes back to fit its
     // window, and the two would take turns.
-    st.ring.resize(size);
+    st.size = size;
     st.observers
         .retain(|obs| obs.tx.send(DaemonMsg::Size(size)).is_ok());
     tell_observer(st, observer, DaemonMsg::Lease(Some(by)));
@@ -1074,10 +1075,10 @@ fn controller_resize(st: &mut PaneState, size: WinSize) -> Option<WinSize> {
 /// each carry their own gate and their own budget: one that has stopped
 /// draining is dropped rather than allowed to hold the pane's output forever.
 fn fan_out_one(st: &mut PaneState, msg: DaemonMsg, len: usize, gate: &OutputGate) {
-    if let Some(sub) = &st.subscriber {
-        if sub.send(msg.clone()).is_ok() {
-            gate.add(len);
-        }
+    if let Some(sub) = &st.subscriber
+        && sub.send(msg.clone()).is_ok()
+    {
+        gate.add(len);
     }
     st.observers.retain(|obs| send_to_observer(obs, &msg, len));
 }
@@ -1178,11 +1179,11 @@ pub struct DaemonPane {
     reader: Mutex<Option<JoinHandle<()>>>,
 }
 
-/// Bytes of PTY input that may sit queued while the child is not reading.
-/// One chunk is still accepted when the queue is empty, so a paste is not
-/// thrown away whole; anything further is dropped until the queue drains.
-/// The caller never waits on the fd.
-const PTY_WRITE_BOUND: usize = 4 << 20;
+/// Logged when queued input crosses this size. Writes are not dropped: a
+/// paste split across `write` calls has to keep its closing `\x1b[201~`, and
+/// one in-flight query reply must not throw the paste away. The queue is
+/// abandoned only when the pane is closing or the pty write fails.
+const PTY_WRITE_BOUND: usize = 64 << 20;
 
 struct PtyQueue {
     chunks: VecDeque<Vec<u8>>,
@@ -1231,7 +1232,8 @@ impl PtyWriter {
         })
     }
 
-    /// Queue `bytes` and return. Never blocks on the PTY.
+    /// Queue `bytes` and return. Never blocks on the PTY, and never drops a
+    /// chunk: the closing bracket of a paste is often its own write.
     fn write(&self, bytes: &[u8]) {
         if bytes.is_empty() {
             return;
@@ -1243,10 +1245,14 @@ impl PtyWriter {
         if q.closing {
             return;
         }
-        if q.bytes > 0 && q.bytes.saturating_add(bytes.len()) > PTY_WRITE_BOUND {
-            return;
-        }
+        let before = q.bytes;
         q.bytes = q.bytes.saturating_add(bytes.len());
+        if before < PTY_WRITE_BOUND && q.bytes >= PTY_WRITE_BOUND {
+            log::warn!(
+                "pty input queue is past {} MiB; the child is not reading",
+                PTY_WRITE_BOUND / (1 << 20)
+            );
+        }
         q.idle = false;
         q.chunks.push_back(bytes.to_vec());
         drop(q);
@@ -1311,16 +1317,21 @@ fn pty_write_loop(queue: &Arc<(Mutex<PtyQueue>, Condvar)>, sink: &mut Box<dyn Wr
                 };
             }
             q.idle = false;
-            let chunks = std::mem::take(&mut q.chunks);
-            let n = chunks.iter().map(Vec::len).sum();
-            q.bytes = q.bytes.saturating_sub(n);
-            chunks
+            std::mem::take(&mut q.chunks)
         };
         for chunk in &chunks {
             if sink.write_all(chunk).is_err() {
                 abandon_pty_queue(queue);
                 return;
             }
+            // Count the chunk only after it is in the pty, so a write that
+            // arrives while this one is blocked is not treated as the whole
+            // queue having already drained.
+            let Ok(mut q) = lock.lock() else {
+                abandon_pty_queue(queue);
+                return;
+            };
+            q.bytes = q.bytes.saturating_sub(chunk.len());
         }
         if sink.flush().is_err() {
             abandon_pty_queue(queue);
@@ -1720,7 +1731,24 @@ pub const INPUT_MODE_RESETS: &[u8] = b"\x1b[?9l\x1b[?1000l\x1b[?1002l\x1b[?1003l
 /// restored screen can simply stay where the user can see it.
 pub const SCROLL_RESTORED_AWAY: &[u8] = b"\x1b[2J\x1b[H";
 
+fn deliver_restore(sub: &Sender<DaemonMsg>, restore: &Restore, size: WinSize) {
+    for seg in &restore.segments {
+        let _ = sub.send(DaemonMsg::Size(seg.size));
+        if !seg.bytes.is_empty() {
+            let _ = sub.send(DaemonMsg::Snapshot(seg.bytes.clone()));
+        }
+    }
+    if let Some(title) = restore.title.as_deref() {
+        let _ = sub.send(DaemonMsg::Output(retitle(title)));
+    }
+    let _ = sub.send(DaemonMsg::Output(restore_preamble(
+        restore.banner.as_deref(),
+    )));
+    let _ = sub.send(DaemonMsg::Size(size));
+}
+
 impl DaemonPane {
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         id: u64,
         cwd: Option<PathBuf>,
@@ -1730,6 +1758,69 @@ impl DaemonPane {
         workspace: Option<String>,
         restore: Option<Restore>,
         allow_remote_clipboard_write: bool,
+        on_dead: impl FnOnce() + Send + 'static,
+    ) -> anyhow::Result<Arc<Self>> {
+        Self::open(
+            id,
+            cwd,
+            size,
+            shell,
+            owner,
+            workspace,
+            restore,
+            allow_remote_clipboard_write,
+            true,
+            None,
+            on_dead,
+        )
+    }
+
+    /// Open a pane whose subscriber is installed before the reader thread
+    /// exists, so the first byte of output is delivered live.
+    ///
+    /// `use_config_shell` is false when a broken `shell.program` has already
+    /// failed and the login shell should be used instead.
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_subscribed(
+        id: u64,
+        cwd: Option<PathBuf>,
+        size: WinSize,
+        shell: Option<ShellSpec>,
+        owner: Option<String>,
+        workspace: Option<String>,
+        restore: Option<Restore>,
+        allow_remote_clipboard_write: bool,
+        use_config_shell: bool,
+        subscriber: Sender<DaemonMsg>,
+        on_dead: impl FnOnce() + Send + 'static,
+    ) -> anyhow::Result<Arc<Self>> {
+        Self::open(
+            id,
+            cwd,
+            size,
+            shell,
+            owner,
+            workspace,
+            restore,
+            allow_remote_clipboard_write,
+            use_config_shell,
+            Some(subscriber),
+            on_dead,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn open(
+        id: u64,
+        cwd: Option<PathBuf>,
+        size: WinSize,
+        shell: Option<ShellSpec>,
+        owner: Option<String>,
+        workspace: Option<String>,
+        restore: Option<Restore>,
+        allow_remote_clipboard_write: bool,
+        use_config_shell: bool,
+        subscriber: Option<Sender<DaemonMsg>>,
         on_dead: impl FnOnce() + Send + 'static,
     ) -> anyhow::Result<Arc<Self>> {
         let pty_size = pty_size(size);
@@ -1742,7 +1833,7 @@ impl DaemonPane {
         crate::daemon::winproc::allow_ctrl_c_in_children();
 
         let pair = native_pty_system().openpty(pty_size)?;
-        let spawn = build_spawn_config(id, cwd, shell, workspace.as_deref())?;
+        let spawn = build_spawn_config(id, cwd, shell, workspace.as_deref(), use_config_shell)?;
 
         let child = pair.slave.spawn_command(spawn.cmd)?;
         let shell_pid = child.process_id();
@@ -1754,17 +1845,43 @@ impl DaemonPane {
         let reader_handle = pair.master.try_clone_reader()?;
         let writer = PtyWriter::spawn(pair.master.take_writer()?);
 
-        let (ring, restored_title) = match restore {
-            Some(restore) => {
-                let mut ring = ReplayRing::seeded(restore.segments, size);
-                if let Some(title) = restore.title.as_deref() {
-                    ring.append(&retitle(title));
-                }
-                ring.append(&restore_preamble(restore.banner.as_deref()));
-                (ring, restore.title)
-            }
-            None => (ReplayRing::new(size), None),
+        let restored_title = restore.as_ref().and_then(|restore| restore.title.clone());
+        let mut state = PaneState {
+            id,
+            size,
+            subscriber: None,
+            subscriber_epoch: 0,
+            allow_remote_clipboard_write,
+            clipboard_write_from_spec: None,
+            observers: Vec::new(),
+            observer_seq: 0,
+            lease: None,
+            lease_watch: false,
+            cwd: spawn.initial_cwd,
+            osc_title: restored_title,
+            shell: ShellState::default(),
+            remote_prompt_seen: false,
+            ssh_phase: None,
+            modes: TerminalModes::default(),
+            shell_spec: spawn.shell.clone(),
+            remote: spawn.remote.clone(),
+            agent: None,
+            agent_session: None,
+            agent_argv: None,
+            agent_clock: AgentClock::default(),
+            alive: true,
+            exit_code: None,
         };
+        if let Some(subscriber) = subscriber {
+            if let Some(restore) = restore.as_ref() {
+                deliver_restore(&subscriber, restore, size);
+            }
+            // Before the reader exists, so the first output byte cannot
+            // overtake the cwd and status the client needs first.
+            let _ = replay_state(&state, &subscriber, false);
+            state.subscriber = Some(subscriber);
+            state.subscriber_epoch = 1;
+        }
 
         Ok(Self::over_pty(
             PtyParts {
@@ -1775,33 +1892,7 @@ impl DaemonPane {
                 reader_handle,
                 writer,
             },
-            PaneState {
-                id,
-                ring,
-                subscriber: None,
-                subscriber_epoch: 0,
-                allow_remote_clipboard_write,
-                clipboard_write_from_spec: None,
-                observers: Vec::new(),
-                observer_seq: 0,
-                lease: None,
-                lease_watch: false,
-                cwd: spawn.initial_cwd,
-                osc_title: restored_title,
-                shell: ShellState::default(),
-                remote_prompt_seen: false,
-                ssh_phase: None,
-                modes: TerminalModes::default(),
-                shell_spec: spawn.shell.clone(),
-                remote: spawn.remote.clone(),
-                agent: None,
-                agent_session: None,
-                agent_argv: None,
-                agent_clock: AgentClock::default(),
-                alive: true,
-                exit_code: None,
-                last_redraw_nudge: None,
-            },
+            state,
             owner,
             on_dead,
         ))
@@ -1912,6 +2003,7 @@ impl DaemonPane {
         pane
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn spawn_reader(
         state: Arc<Mutex<PaneState>>,
         shutting_down: Arc<AtomicBool>,
@@ -1938,7 +2030,7 @@ impl DaemonPane {
                 let mut sniffer = OscSniffer::new();
                 let mut clipboard = ClipboardSniffer::default();
                 // Kitty graphics interception (issue #213): lifts image
-                // sequences out of the stream *before* the ring/subscriber see
+                // sequences out of the stream *before* the subscriber sees
                 // them, so the base64 pixels never enter replay and the client's
                 // VT parser never chews through them. Zero-copy on the common
                 // no-graphics chunk — see [`GraphicsSniffer::sniff`].
@@ -2142,54 +2234,13 @@ impl DaemonPane {
         // this order.
         let foreground_command = self.has_foreground_command();
         let mut st = self.state.lock().unwrap();
-        let epoch = attach_subscriber_with_permissions(
+        attach_subscriber_with_permissions(
             &mut st,
             subscriber,
             &self.gate,
             allow_remote_clipboard_write,
             foreground_command,
-        );
-        let nudge = redraw_nudge(
-            &mut st,
-            self.runs_foreground_program(foreground_command),
-            std::time::Instant::now(),
-        );
-        drop(st);
-        if let Some(transient) = nudge {
-            self.nudge_redraw(transient);
-        }
-        epoch
-    }
-
-    /// Whether a program other than the shell is in the foreground, for
-    /// [`redraw_nudge`]. A native ssh pane has no local pty to ask, and its
-    /// alternate screen can only be the far program's.
-    fn runs_foreground_program(&self, foreground_command: bool) -> bool {
-        foreground_command
-    }
-
-    /// Puts the pty at `transient` now and back at the pane's size a moment
-    /// later, which the program in the foreground hears as two `SIGWINCH`es
-    /// and answers with a full repaint. See [`redraw_nudge`].
-    ///
-    /// Only the pty moves: the ring keeps its segment and no client is told a
-    /// new size, so nothing a client or a lease holds changes. The size put
-    /// back is read when it is put back, so a real resize that lands in
-    /// between is what the pane ends up at.
-    fn nudge_redraw(&self, transient: WinSize) {
-        let master = Arc::clone(&self.backend.master);
-        let resize: Box<dyn Fn(WinSize) + Send> = Box::new(move |size| {
-            if let Ok(master) = master.lock()
-                && let Some(master) = master.as_ref()
-            {
-                let _ = master.resize(pty_size(size));
-            }
-        });
-        let state = Arc::clone(&self.state);
-        let _ = run_redraw_nudge(transient, REDRAW_NUDGE_SETTLE, resize, move || {
-            let st = state.lock().unwrap();
-            st.alive.then(|| st.ring.size())
-        });
+        )
     }
 
     /// Whether something other than the pane's own shell owns the terminal.
@@ -2203,6 +2254,12 @@ impl DaemonPane {
         foreground_command_running(&self.backend.master, self.backend.shell_pid)
     }
 
+    pub fn observe(&self, observer: Sender<DaemonMsg>, gate: Arc<OutputGate>) -> u64 {
+        let foreground_command = self.has_foreground_command();
+        let mut st = self.state.lock().unwrap();
+        observe_subscriber(&mut st, observer, gate, foreground_command)
+    }
+
     pub fn detach(&self, epoch: u64) -> bool {
         let mut st = self.state.lock().unwrap();
         if st.subscriber_epoch == epoch {
@@ -2211,22 +2268,6 @@ impl DaemonPane {
             self.gate.reset();
         }
         !st.alive && st.subscriber.is_none()
-    }
-
-    pub fn observe(&self, observer: Sender<DaemonMsg>, gate: Arc<OutputGate>) -> u64 {
-        let foreground_command = self.has_foreground_command();
-        let mut st = self.state.lock().unwrap();
-        let id = observe_subscriber(&mut st, observer, gate, foreground_command);
-        let nudge = redraw_nudge(
-            &mut st,
-            self.runs_foreground_program(foreground_command),
-            std::time::Instant::now(),
-        );
-        drop(st);
-        if let Some(transient) = nudge {
-            self.nudge_redraw(transient);
-        }
-        id
     }
 
     /// A message for one observer alone, such as a refusal of what it sent.
@@ -2369,13 +2410,14 @@ impl DaemonPane {
     }
 
     pub fn procs(&self) -> crate::daemon::protocol::PaneProcs {
-        let mut out = match self.pty().and_then(|pty| {
-            pty.shell_pid
-                .map(|pid| crate::daemon::procinfo::snapshot(pid, pty_foreground_pgid(&pty.master)))
-        }) {
-            Some(procs) => procs,
-            None => Default::default(),
-        };
+        let mut out = self
+            .pty()
+            .and_then(|pty| {
+                pty.shell_pid.map(|pid| {
+                    crate::daemon::procinfo::snapshot(pid, pty_foreground_pgid(&pty.master))
+                })
+            })
+            .unwrap_or_default();
         out.context = Some(self.context());
         out
     }
@@ -2535,11 +2577,11 @@ impl DaemonPane {
             .lock()
             .ok()
             .and_then(|m| m.as_ref().and_then(|m| m.process_group_leader()));
-        if let Some(fg) = fg {
-            if Some(fg as u32) != pty.shell_pid {
-                unsafe {
-                    libc::killpg(fg, sig);
-                }
+        if let Some(fg) = fg
+            && Some(fg as u32) != pty.shell_pid
+        {
+            unsafe {
+                libc::killpg(fg, sig);
             }
         }
     }
@@ -2636,300 +2678,13 @@ fn pty_size(size: WinSize) -> PtySize {
     }
 }
 
-struct ReplayRing {
-    segments: VecDeque<RingSegment>,
-    len: usize,
-    /// Bytes ever appended, never reset — the mark the scrollback writer uses to
-    /// tell a ring that has moved from one that has not. Comparing lengths would
-    /// not do it: a ring at its cap stays exactly `RING_CAP` long no matter how
-    /// much output flows through it, which is precisely the busy pane whose
-    /// snapshot is most stale.
-    appended: u64,
-    /// Where the front of the ring stands in the escape grammar: every
-    /// evicted byte is folded through it, so it is the state a parser that had
-    /// read the whole stream would be in at the first byte still held.
-    head: HeadCut,
-    /// The terminal state at the same point: every evicted byte is folded
-    /// through this too, so it holds what a client replaying the ring has to
-    /// be put in before the first byte still held. See
-    /// [`TerminalModes::replay_prelude`].
-    head_modes: TerminalModes,
-}
-
-struct RingSegment {
-    size: WinSize,
-    bytes: VecDeque<u8>,
-}
-
-impl RingSegment {
-    fn empty(size: WinSize) -> Self {
-        Self {
-            size,
-            bytes: VecDeque::new(),
-        }
-    }
-
-    fn to_vec(&self) -> Vec<u8> {
-        let (a, b) = self.bytes.as_slices();
-        let mut out = Vec::with_capacity(self.bytes.len());
-        out.extend_from_slice(a);
-        out.extend_from_slice(b);
-        out
-    }
-}
-
-/// Just enough of the VT escape grammar to tell whether a byte stands inside a
-/// sequence — the state transitions `vte` makes, minus everything it
-/// dispatches. A string (OSC, DCS, SOS, PM, APC) ends at an `ESC`, which also
-/// opens whatever follows it (a `\` makes that ST); an OSC also ends at BEL;
-/// CAN and SUB abort anything.
-#[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
-enum HeadCut {
-    #[default]
-    Ground,
-    Esc,
-    EscIntermediate,
-    Csi,
-    Str {
-        osc: bool,
-    },
-}
-
-impl HeadCut {
-    fn step(&mut self, b: u8) {
-        *self = match (*self, b) {
-            (_, 0x18 | 0x1a) => Self::Ground,
-            (_, 0x1b) => Self::Esc,
-            (Self::Ground, _) => Self::Ground,
-            (Self::Esc, b'[') => Self::Csi,
-            (Self::Esc, b']') => Self::Str { osc: true },
-            (Self::Esc, b'P' | b'X' | b'^' | b'_') => Self::Str { osc: false },
-            (Self::Esc | Self::EscIntermediate, 0x20..=0x2f) => Self::EscIntermediate,
-            // C0 controls execute without ending the sequence, as in `vte`.
-            (state @ (Self::Esc | Self::EscIntermediate | Self::Csi), 0x00..=0x1f | 0x7f) => state,
-            (Self::Esc | Self::EscIntermediate, _) => Self::Ground,
-            (Self::Csi, 0x40..=0x7e) => Self::Ground,
-            (Self::Csi, _) => Self::Csi,
-            (Self::Str { osc: true }, 0x07) => Self::Ground,
-            (state @ Self::Str { .. }, _) => state,
-        };
-    }
-
-    fn fold(&mut self, bytes: &[u8]) {
-        for &b in bytes {
-            self.step(b);
-        }
-    }
-
-    /// Whether a replay could start at `next`: outside every sequence, and not
-    /// on a UTF-8 continuation byte, which never begins a character.
-    fn at_boundary(self, next: u8) -> bool {
-        self == Self::Ground && !(0x80..=0xbf).contains(&next)
-    }
-}
-
-impl ReplayRing {
-    fn new(size: WinSize) -> Self {
-        Self {
-            segments: VecDeque::from([RingSegment::empty(size)]),
-            len: 0,
-            appended: 0,
-            head: HeadCut::default(),
-            head_modes: TerminalModes::new(),
-        }
-    }
-
-    /// A ring that starts with output some earlier pane produced.
-    ///
-    /// Used when a pane is restored from disk: the saved segments go in ahead
-    /// of anything the new shell writes, so a client attaching sees the screen
-    /// it lost and then the new prompt below it. The seeded bytes are counted
-    /// into `len` — they are subject to the same cap as live output, and the
-    /// cap is far above what a snapshot can hold — but not into `appended`,
-    /// which exists to answer "has this pane produced anything since the last
-    /// snapshot?" and would otherwise answer yes for a pane that never ran.
-    fn seeded(segments: Vec<ReplaySegment>, size: WinSize) -> Self {
-        let mut ring = Self::new(size);
-        if segments.is_empty() {
-            return ring;
-        }
-        ring.segments.clear();
-        for seg in segments {
-            ring.len += seg.bytes.len();
-            ring.segments.push_back(RingSegment {
-                size: seg.size,
-                bytes: seg.bytes.into(),
-            });
-        }
-        // Whatever the shell writes from here was written at *this* pane's
-        // size, which is not necessarily the size the snapshot was taken at.
-        ring.resize(size);
-        ring
-    }
-
-    /// A ring carried across a handoff, with the pane's modes folded back
-    /// from it: `head` is the carried [`Self::head_modes`], and the pane's
-    /// modes are that plus every byte the ring still holds.
-    #[cfg(test)]
-    fn adopted(
-        segments: Vec<ReplaySegment>,
-        size: WinSize,
-        head: Option<&[u8]>,
-    ) -> (Self, TerminalModes) {
-        let mut ring = Self::seeded(segments, size);
-        if let Some(bytes) = head {
-            ring.head_modes.feed(bytes);
-        }
-        let modes = ring.modes_from(ring.head_modes.clone());
-        (ring, modes)
-    }
-
-    fn tail(&mut self) -> &mut RingSegment {
-        self.segments.back_mut().expect("ring always has a tail")
-    }
-
-    /// The size the pane is at now: the newest segment's.
-    fn size(&self) -> WinSize {
-        self.segments.back().expect("ring always has a tail").size
-    }
-
-    fn resize(&mut self, size: WinSize) {
-        let tail = self.tail();
-        if tail.size == size {
-            return;
-        }
-        if tail.bytes.is_empty() {
-            tail.size = size;
-            return;
-        }
-        if self.segments.len() >= MAX_RING_SEGMENTS {
-            let old = self.segments.pop_front().expect("len >= cap");
-            let head = self.segments.front_mut().expect("cap >= 2");
-            let mut merged = old.bytes;
-            merged.extend(head.bytes.drain(..));
-            head.bytes = merged;
-        }
-        self.segments.push_back(RingSegment::empty(size));
-    }
-
-    fn append(&mut self, bytes: &[u8]) {
-        self.appended = self.appended.saturating_add(bytes.len() as u64);
-        if bytes.len() >= RING_CAP {
-            let size = self.tail().size;
-            // Everything held goes, and so does the front of `bytes`; both
-            // still pass through `head` so it knows where the kept part begins.
-            for seg in self.segments.drain(..) {
-                let (a, b) = seg.bytes.as_slices();
-                self.head.fold(a);
-                self.head.fold(b);
-                self.head_modes.feed(a);
-                self.head_modes.feed(b);
-            }
-            let kept = bytes.len() - RING_CAP;
-            self.head.fold(&bytes[..kept]);
-            self.head_modes.feed(&bytes[..kept]);
-            let mut tail = RingSegment::empty(size);
-            tail.bytes.extend(&bytes[kept..]);
-            self.segments.push_back(tail);
-            self.len = RING_CAP;
-            self.evict(0);
-            return;
-        }
-        self.tail().bytes.extend(bytes);
-        self.len += bytes.len();
-        let overflow = self.len.saturating_sub(RING_CAP);
-        if overflow > 0 {
-            self.evict(overflow);
-        }
-    }
-
-    /// Drop `n` bytes from the front, then keep dropping until the front is a
-    /// place a parser can start from (#857).
-    ///
-    /// The cap alone falls wherever it falls — through an OSC, a CSI, or the
-    /// middle of a three-byte CJK character — and a replay starts the client's
-    /// emulator in its ground state, so the tail of a sequence was painted as
-    /// text (`33;C` out of `ESC ] 133;C BEL`) and half a character as a
-    /// replacement glyph. Moving on to the end of the sequence costs nothing
-    /// visible: the client would not have painted any of it.
-    fn evict(&mut self, mut n: usize) {
-        loop {
-            let head = &mut self.head;
-            let Some(front) = self.segments.front_mut() else {
-                return;
-            };
-            let mut take = 0;
-            for &b in front.bytes.iter() {
-                if n == 0 && head.at_boundary(b) {
-                    break;
-                }
-                head.step(b);
-                n = n.saturating_sub(1);
-                take += 1;
-            }
-            let (a, b) = front.bytes.as_slices();
-            let in_a = take.min(a.len());
-            self.head_modes.feed(&a[..in_a]);
-            self.head_modes.feed(&b[..take - in_a]);
-            // Long since asked; kept, they would pile up for the pane's life.
-            self.head_modes.take_queries();
-            front.bytes.drain(..take);
-            self.len -= take;
-            if !front.bytes.is_empty() || self.segments.len() == 1 {
-                return;
-            }
-            self.segments.pop_front();
-        }
-    }
-
-    fn replay(&self, send: &mut impl FnMut(DaemonMsg)) {
-        for seg in &self.segments {
-            send(DaemonMsg::Size(seg.size));
-            send(DaemonMsg::Snapshot(seg.to_vec()));
-        }
-    }
-
-    /// The modes a replay of this ring switches on by itself — the same fold
-    /// the pane keeps, over the bytes that are actually left.
-    ///
-    /// Folded rather than remembered per mode because the front of the ring
-    /// moves: a `?1049h` the cap fell through is evicted whole (see
-    /// [`Self::evict`]), and the answer here has to be the one the client's
-    /// emulator will reach from what is left.
-    fn modes(&self) -> TerminalModes {
-        self.modes_from(TerminalModes::new())
-    }
-
-    /// `start` with every byte the ring holds folded into it.
-    fn modes_from(&self, mut modes: TerminalModes) -> TerminalModes {
-        for seg in &self.segments {
-            // Both halves of the deque, in order: `feed` carries a sequence
-            // across calls, so the split is invisible to the fold.
-            let (a, b) = seg.bytes.as_slices();
-            modes.feed(a);
-            modes.feed(b);
-        }
-        // Asked long ago: a pane adopting these would answer them again.
-        modes.take_queries();
-        modes
-    }
-
-    #[cfg(test)]
-    fn flatten(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(self.len);
-        for seg in &self.segments {
-            out.extend(seg.to_vec());
-        }
-        out
-    }
-}
-
-/// Everything the pane remembers about a chunk of output: the bytes
-/// themselves, and the modes they switched on. One function so the two can
-/// never drift apart — the modes are only worth anything if they were folded
-/// from exactly the bytes the ring was given.
+/// Fold output into the pane's mode tracker.
+///
+/// The bytes themselves are not stored. The subscriber is attached before the
+/// reader starts, and nothing reattaches to a detached pane, so an 8 MiB ring
+/// would only copy every chunk under the state lock. Modes stay, because a
+/// detached pane still has to answer terminal queries and report bracketed paste.
 fn record_output(st: &mut PaneState, bytes: &[u8]) {
-    st.ring.append(bytes);
     st.modes.feed(bytes);
 }
 
@@ -2992,24 +2747,9 @@ fn replay_state(st: &PaneState, subscriber: &Sender<DaemonMsg>, foreground_comma
             queued += len;
         }
     };
-    // Ahead of the ring, not after it: a client that is put into the alternate
-    // screen first paints the replayed frames into the buffer they belong to.
-    //
-    // Only the modes the ring cannot switch on itself, though. Re-entering an
-    // alternate screen the ring still carries is not a harmless duplicate —
-    // the emulator makes `?1049h` a no-op when the mode is already on, so the
-    // ring's own copy stops clearing the alternate screen, and everything the
-    // ring holds from *before* that sequence (the shell scrollback the user
-    // had behind the program) is painted into the alternate buffer, which has
-    // no history to keep it and is left behind when the program exits. What
-    // the ring carries always wins on its own terms.
-    if let Some(modes) = st
-        .modes
-        .replay_prelude(&st.ring.head_modes, &st.ring.modes())
-    {
-        send(DaemonMsg::Snapshot(modes));
-    }
-    st.ring.replay(&mut send);
+    // Screen bytes are not replayed. The subscriber is attached before the
+    // reader starts, so it already saw them live; a later attach only hears
+    // the standing status (prompt, cwd, agent, exit).
     if st.shell.active {
         send(DaemonMsg::Prompt {
             active: st.shell.active,
@@ -3076,88 +2816,6 @@ fn replay_state(st: &PaneState, subscriber: &Sender<DaemonMsg>, foreground_comma
 /// mid-`vim`) still heals on reattach.
 fn replayed_at_prompt(st: &PaneState, foreground_command: bool) -> bool {
     st.shell.at_prompt && !foreground_command
-}
-
-/// How long the pty stays at the transient size of a [`redraw_nudge`]. Two
-/// size changes in one breath reach a program as one `SIGWINCH` (the kernel
-/// does not queue them), and a program that reads the size only once it gets
-/// around to the signal finds it unchanged and skips the repaint. Long enough
-/// for it to see the first size, short enough that nobody looks at it.
-const REDRAW_NUDGE_SETTLE: Duration = Duration::from_millis(50);
-
-/// A pane reattached again this soon after a nudge is not nudged again: the
-/// repaint the last one asked for is already in the ring, or on its way.
-const REDRAW_NUDGE_COOLDOWN: Duration = Duration::from_secs(2);
-
-/// Whether a client that was just handed the replay needs the program on the
-/// pane to repaint, and if so the size to put the pty at for a moment to make
-/// it (#1122). Records the nudge, so a burst of reattaches makes one.
-///
-/// A full-screen program paints its whole screen once, after `?1049h`, and
-/// from then on only what changed. The ring keeps the last 8 MiB, so a program
-/// that has run long enough has had that first paint, and its `?1049h`, pushed
-/// out of the front. The replay prelude still puts the client into the
-/// alternate screen, but what follows is a stream of differences from a screen
-/// the client never saw, painted onto an empty one. The client has nothing to
-/// rebuild it from, and neither has the daemon, which keeps no screen; only
-/// the program can draw it again, and the one request every full-screen
-/// program answers with a full repaint is a change of size. Asking for the
-/// size it already has does nothing — the kernel sends no `SIGWINCH` for it —
-/// so the pty steps one row away and back.
-///
-/// Only when all of it holds: the pane is in the alternate screen and the ring
-/// no longer carries the switch into it (which is to say the ring has dropped
-/// its front, and with it the first paint), a program owns the pane, and the
-/// pane is alive. Anything else — a shell, a program whose start is still in
-/// the ring — replays whole, and is left alone.
-fn redraw_nudge(
-    st: &mut PaneState,
-    foreground_program: bool,
-    now: std::time::Instant,
-) -> Option<WinSize> {
-    use crate::core::term_modes::ALT_SCREEN;
-    if !st.alive || !foreground_program || !st.modes.is_on(ALT_SCREEN) {
-        return None;
-    }
-    if st
-        .last_redraw_nudge
-        .is_some_and(|at| now.saturating_duration_since(at) < REDRAW_NUDGE_COOLDOWN)
-    {
-        return None;
-    }
-    // Last, for it folds the whole ring.
-    if st.ring.modes().is_on(ALT_SCREEN) {
-        return None;
-    }
-    st.last_redraw_nudge = Some(now);
-    let size = st.ring.size();
-    let rows = if size.rows > 1 {
-        size.rows - 1
-    } else {
-        size.rows + 1
-    };
-    Some(WinSize { rows, ..size })
-}
-
-/// The two steps of a nudge: `transient` now, and after `settle` whatever
-/// `settled` says the pane's size is by then (`None`: leave it, the pane is
-/// gone). The second step runs on its own thread so the attach that asked for
-/// it is not held up.
-fn run_redraw_nudge(
-    transient: WinSize,
-    settle: Duration,
-    resize: Box<dyn Fn(WinSize) + Send>,
-    settled: impl FnOnce() -> Option<WinSize> + Send + 'static,
-) -> std::io::Result<JoinHandle<()>> {
-    resize(transient);
-    std::thread::Builder::new()
-        .name("tty7-redraw-nudge".into())
-        .spawn(move || {
-            std::thread::sleep(settle);
-            if let Some(size) = settled() {
-                resize(size);
-            }
-        })
 }
 
 #[cfg(test)]
@@ -3292,11 +2950,11 @@ fn agent_facts_changed(before: Option<&AgentFacts>, after: Option<&AgentFacts>) 
 }
 
 fn apply_signals(st: &mut PaneState, signals: SniffSignals) {
-    if let Some(cwd) = signals.cwd {
-        if st.cwd.as_ref() != Some(&cwd) {
-            notify(st, DaemonMsg::Cwd(cwd.clone()));
-            st.cwd = Some(cwd);
-        }
+    if let Some(cwd) = signals.cwd
+        && st.cwd.as_ref() != Some(&cwd)
+    {
+        notify(st, DaemonMsg::Cwd(cwd.clone()));
+        st.cwd = Some(cwd);
     }
     if let Some(title) = signals.title {
         // No `notify`: a window renders its own tabs from its own terminal,
@@ -3911,9 +3569,7 @@ fn parse_ssh_invocation(argv: &[String]) -> Option<RemoteContext> {
             && short.len() > 1
         {
             let mut chars = short.chars();
-            let Some(flag) = chars.next() else {
-                return None;
-            };
+            let flag = chars.next()?;
             if ssh_option_takes_value(flag) && chars.as_str().is_empty() {
                 i += 1;
                 if i >= argv.len() {
@@ -4094,10 +3750,10 @@ impl OscSniffer {
                 }
             } else if let Some(event) = crate::core::cli_agent::parse_agent_event(payload) {
                 signals.agent_events.push(event);
-            } else if let Some((title, body)) = notes.parse(payload) {
-                if title.as_deref() != Some(crate::core::cli_agent::AGENT_EVENT_SENTINEL) {
-                    signals.notification = Some(body);
-                }
+            } else if let Some((title, body)) = notes.parse(payload)
+                && title.as_deref() != Some(crate::core::cli_agent::AGENT_EVENT_SENTINEL)
+            {
+                signals.notification = Some(body);
             }
         });
         signals
@@ -4200,12 +3856,13 @@ fn percent_decode(input: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(input.len());
     let mut i = 0;
     while i < input.len() {
-        if input[i] == b'%' && i + 2 < input.len() {
-            if let (Some(h), Some(l)) = (hex_val(input[i + 1]), hex_val(input[i + 2])) {
-                out.push((h << 4) | l);
-                i += 3;
-                continue;
-            }
+        if input[i] == b'%'
+            && i + 2 < input.len()
+            && let (Some(h), Some(l)) = (hex_val(input[i + 1]), hex_val(input[i + 2]))
+        {
+            out.push((h << 4) | l);
+            i += 3;
+            continue;
         }
         out.push(input[i]);
         i += 1;
@@ -4848,57 +4505,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn ring_under_cap_keeps_all() {
-        let mut ring = ReplayRing::new(ws(80, 24));
-        ring.append(b"hello ");
-        ring.append(b"world");
-        assert_eq!(ring.flatten(), b"hello world");
-    }
-
-    #[test]
-    fn ring_over_cap_drops_oldest() {
-        let mut ring = ReplayRing::new(ws(80, 24));
-        ring.append(&vec![b'a'; RING_CAP]);
-        assert_eq!(ring.len, RING_CAP);
-        ring.append(&vec![b'b'; 100]);
-        assert_eq!(ring.len, RING_CAP);
-        let flat = ring.flatten();
-        assert_eq!(&flat[..RING_CAP - 100], &vec![b'a'; RING_CAP - 100][..]);
-        assert_eq!(&flat[RING_CAP - 100..], &vec![b'b'; 100][..]);
-    }
-
-    /// Issue #857's `33;C`: Pi marks every streamed line with
-    /// `ESC ] 133;B BEL ESC ] 133;C BEL`, and a pane that streams long enough
-    /// has the cap fall through one of them sooner or later. A replay begins
-    /// in the client's ground state, so whatever tail the cut left in front
-    /// was painted as text — here `33;C`, next to the line it marked.
-    ///
-    /// Every cut, at every byte of the line: the head has to land where a
-    /// fresh parser can start, which is a sequence's `ESC` or the first byte
-    /// of a whole character.
-    #[test]
-    fn ring_eviction_never_leaves_a_sequence_tail_or_half_a_character_in_front() {
-        let line = "\x1b]133;B\x07\x1b]133;C\x07下一步。\r\n".as_bytes();
-        // The two marks, then each character (the CJK ones three bytes wide),
-        // then the end of the line, where the filler starts.
-        let starts = [0, 8, 16, 19, 22, 25, 28, 29, 30];
-        assert_eq!(*starts.last().unwrap(), line.len());
-        for cut in 0..=line.len() {
-            let mut ring = ReplayRing::new(ws(80, 24));
-            ring.append(line);
-            ring.append(&vec![b'.'; RING_CAP - line.len() + cut]);
-            let head = *starts.iter().find(|&&s| s >= cut).unwrap();
-            let flat = ring.flatten();
-            assert_eq!(
-                &flat[..line.len() - head],
-                &line[head..],
-                "a cut at byte {cut} must move the head on to byte {head}"
-            );
-            assert_eq!(ring.len, flat.len());
-        }
-    }
-
     /// Issue #857: the two sniffers that rewrite the stream before the ring
     /// and the client see it must hand every byte that is not theirs on
     /// unchanged, wherever a read splits it — a Pi frame (synchronized update,
@@ -4945,150 +4551,6 @@ mod tests {
         }
         let bytewise: Vec<&[u8]> = frame.chunks(1).collect();
         assert_eq!(run(&bytewise), (frame.to_vec(), frame.to_vec()));
-    }
-
-    /// A string sequence the cap falls into is evicted up to its terminator
-    /// however far that is — the client would not have shown a byte of it —
-    /// and the state carries across appends, so a later eviction still knows
-    /// it is inside one.
-    #[test]
-    fn ring_eviction_carries_an_open_sequence_across_appends() {
-        let mut ring = ReplayRing::new(ws(80, 24));
-        ring.append(b"\x1b]52;c;");
-        ring.append(&vec![b'Q'; RING_CAP - 7]);
-        // Cuts two bytes into the OSC: the rest of it goes too.
-        ring.append(b"\x07ok");
-        assert!(ring.flatten().starts_with(b"ok"), "the payload is gone");
-        assert_eq!(ring.len, 2);
-    }
-
-    #[test]
-    fn ring_giant_chunk_starts_at_a_sequence_boundary() {
-        let mut ring = ReplayRing::new(ws(80, 24));
-        let mut big = b"\x1b]133;C\x07".to_vec();
-        big.extend(vec![b'x'; RING_CAP - 4]);
-        ring.append(&big);
-        let flat = ring.flatten();
-        assert!(flat.iter().all(|&b| b == b'x'), "no `C BEL` left in front");
-        assert_eq!(ring.len, RING_CAP - 4);
-    }
-
-    #[test]
-    fn ring_giant_chunk_keeps_tail() {
-        let mut ring = ReplayRing::new(ws(100, 24));
-        ring.append(b"seed");
-        ring.resize(ws(80, 24));
-        let mut big = vec![b'x'; RING_CAP];
-        big.extend_from_slice(b"TAIL");
-        ring.append(&big);
-        assert_eq!(ring.len, RING_CAP);
-        assert_eq!(ring.segments.len(), 1);
-        assert_eq!(&ring.flatten()[RING_CAP - 4..], b"TAIL");
-    }
-
-    #[test]
-    fn ring_resize_splits_replay_into_geometry_segments() {
-        let mut ring = ReplayRing::new(ws(100, 24));
-        ring.append(b"wide bytes");
-        ring.resize(ws(80, 24));
-        ring.append(b"narrow bytes");
-
-        let (tx, rx) = mpsc::channel();
-        ring.replay(&mut |m| {
-            let _ = tx.send(m);
-        });
-        assert!(matches!(rx.try_recv(), Ok(DaemonMsg::Size(s)) if s == ws(100, 24)));
-        assert!(matches!(rx.try_recv(), Ok(DaemonMsg::Snapshot(b)) if b == b"wide bytes"));
-        assert!(matches!(rx.try_recv(), Ok(DaemonMsg::Size(s)) if s == ws(80, 24)));
-        assert!(matches!(rx.try_recv(), Ok(DaemonMsg::Snapshot(b)) if b == b"narrow bytes"));
-        assert!(rx.try_recv().is_err());
-    }
-
-    #[test]
-    fn a_seeded_ring_replays_the_old_screen_at_the_size_it_was_written() {
-        use super::ReplaySegment as Segment;
-
-        let mut ring = ReplayRing::seeded(
-            vec![Segment {
-                size: ws(100, 24),
-                bytes: b"what the dead pane had on it".to_vec(),
-            }],
-            ws(80, 30),
-        );
-        ring.append(b"the new shell's prompt");
-
-        let (tx, rx) = mpsc::channel();
-        ring.replay(&mut |m| {
-            let _ = tx.send(m);
-        });
-        assert!(matches!(rx.try_recv(), Ok(DaemonMsg::Size(s)) if s == ws(100, 24)));
-        assert!(
-            matches!(rx.try_recv(), Ok(DaemonMsg::Snapshot(b)) if b == b"what the dead pane had on it"),
-            "restored output has to be replayed at the width it was produced at, or the client \
-             rewraps it to whatever the window happens to be now"
-        );
-        assert!(matches!(rx.try_recv(), Ok(DaemonMsg::Size(s)) if s == ws(80, 30)));
-        assert!(
-            matches!(rx.try_recv(), Ok(DaemonMsg::Snapshot(b)) if b == b"the new shell's prompt")
-        );
-        assert!(rx.try_recv().is_err());
-    }
-
-    #[test]
-    fn seeding_does_not_make_an_untouched_pane_look_like_it_produced_output() {
-        use super::ReplaySegment as Segment;
-
-        let ring = ReplayRing::seeded(
-            vec![Segment {
-                size: ws(80, 24),
-                bytes: b"restored".to_vec(),
-            }],
-            ws(80, 24),
-        );
-        assert_eq!(
-            ring.appended, 0,
-            "the mark answers 'has this pane written anything since the last snapshot', and \
-             bytes it was handed at birth are not an answer of yes"
-        );
-    }
-
-    #[test]
-    fn a_handoff_keeps_the_modes_the_ring_dropped_off_its_front() {
-        use super::ReplaySegment as Segment;
-
-        let mut head = TerminalModes::new();
-        head.feed(b"\x1b[?1049h\x1b[?2031h\x1b[>1u");
-        let (ring, modes) = ReplayRing::adopted(
-            vec![Segment {
-                size: ws(80, 24),
-                bytes: b"long after startup".to_vec(),
-            }],
-            ws(80, 24),
-            head.restore_bytes().as_deref(),
-        );
-
-        assert!(modes.is_on(crate::core::term_modes::COLOR_SCHEME_UPDATES));
-        let prelude = modes
-            .replay_prelude(&ring.head_modes, &ring.modes())
-            .expect("a prelude");
-        let has = |needle: &[u8]| prelude.windows(needle.len()).any(|w| w == needle);
-        assert!(has(b"\x1b[?2031h"));
-        assert!(
-            has(b"\x1b[>1u"),
-            "the keyboard flags come back from the head fold, so it has to cross the exec too"
-        );
-    }
-
-    #[test]
-    fn an_empty_seed_leaves_an_ordinary_ring() {
-        let mut ring = ReplayRing::seeded(Vec::new(), ws(80, 24));
-        ring.append(b"output");
-        assert_eq!(
-            ring.segments.len(),
-            1,
-            "the ring always has exactly one tail"
-        );
-        assert_eq!(ring.flatten(), b"output");
     }
 
     #[test]
@@ -5139,59 +4601,6 @@ mod tests {
             !text.contains("\x1b[?1007l"),
             "?1007 defaults to on; resetting it walks away from the default"
         );
-    }
-
-    /// Whether the stream's last word on a private mode is `h`, `l`, or
-    /// nothing — which is all a client's emulator ends up remembering of it.
-    fn last_mode_switch(stream: &[u8], mode: &str) -> Option<u8> {
-        let last = |needle: Vec<u8>| {
-            stream
-                .windows(needle.len())
-                .rposition(|w| w == needle.as_slice())
-        };
-        let on = last(format!("\x1b[?{mode}h").into_bytes());
-        let off = last(format!("\x1b[?{mode}l").into_bytes());
-        match (on, off) {
-            (Some(h), Some(l)) => Some(if h > l { b'h' } else { b'l' }),
-            (Some(_), None) => Some(b'h'),
-            (None, Some(_)) => Some(b'l'),
-            (None, None) => None,
-        }
-    }
-
-    /// Issue #850, along the whole chain rather than at the preamble alone: a
-    /// snapshot is a raw byte stream, it seeds the restored pane's ring
-    /// verbatim, and the client feeds it straight to its parser. So a snapshot
-    /// whose last word on mouse reporting is `h` puts the *client* into mouse
-    /// reporting, against a shell that never asked, and every pointer move
-    /// over the pane is typed into its line as an SGR report.
-    #[test]
-    fn a_ring_restored_from_a_full_screen_snapshot_ends_with_reporting_off() {
-        let size = ws(80, 24);
-        // What the photograph of a pane running `claude`, `vim` or `btop`
-        // actually holds. There is no epilogue: `DaemonPane::kill` is a hangup
-        // with no grace period, so the program never sent its own `?1002l`,
-        // and the snapshot was taken before it could have anyway.
-        let snapshot = super::ReplaySegment {
-            size,
-            bytes: b"\x1b[?1049h\x1b[?1002h\x1b[?1003h\x1b[?1006h\x1b[?1004h\
-\x1b[?2004hframe one\x1b[Hframe two"
-                .to_vec(),
-        };
-        let mut ring = ReplayRing::seeded(vec![snapshot], size);
-        ring.append(&restore_preamble(Some("the shell below is new")));
-        let replayed = ring.flatten();
-
-        for mode in [
-            "1000", "1002", "1003", "1005", "1006", "1004", "2004", "1049",
-        ] {
-            assert_eq!(
-                last_mode_switch(&replayed, mode),
-                Some(b'l'),
-                "a client replaying this ring ends with ?{mode} still on, which is \
-                 what types SGR reports into the restored shell (#850)"
-            );
-        }
     }
 
     /// The ConPTY constraint, from the daemon's side. A pane whose shell runs
@@ -5268,68 +4677,6 @@ mod tests {
                 "with no words there is no rule to draw, so no line is spent on one"
             );
         }
-    }
-
-    #[test]
-    fn ring_idle_resizes_collapse_and_replay_ends_at_current_size() {
-        let mut ring = ReplayRing::new(ws(100, 24));
-        ring.append(b"bytes");
-        ring.resize(ws(100, 24));
-        assert_eq!(ring.segments.len(), 1);
-        ring.resize(ws(90, 24));
-        ring.resize(ws(80, 30));
-        assert_eq!(ring.segments.len(), 2);
-
-        let (tx, rx) = mpsc::channel();
-        ring.replay(&mut |m| {
-            let _ = tx.send(m);
-        });
-        assert!(matches!(rx.try_recv(), Ok(DaemonMsg::Size(s)) if s == ws(100, 24)));
-        assert!(matches!(rx.try_recv(), Ok(DaemonMsg::Snapshot(b)) if b == b"bytes"));
-        assert!(matches!(rx.try_recv(), Ok(DaemonMsg::Size(s)) if s == ws(80, 30)));
-        assert!(matches!(rx.try_recv(), Ok(DaemonMsg::Snapshot(b)) if b.is_empty()));
-        assert!(rx.try_recv().is_err());
-    }
-
-    #[test]
-    fn ring_eviction_drops_emptied_segments() {
-        let mut ring = ReplayRing::new(ws(100, 24));
-        ring.append(b"old");
-        ring.resize(ws(80, 24));
-        ring.append(&vec![b'n'; RING_CAP - 2]);
-        assert_eq!(ring.segments.len(), 2, "two bytes of the old segment left");
-        ring.append(b"nn");
-        assert_eq!(ring.segments.len(), 1, "the emptied old segment is gone");
-        assert_eq!(ring.len, RING_CAP);
-
-        let (tx, rx) = mpsc::channel();
-        ring.replay(&mut |m| {
-            let _ = tx.send(m);
-        });
-        assert!(matches!(rx.try_recv(), Ok(DaemonMsg::Size(s)) if s == ws(80, 24)));
-    }
-
-    #[test]
-    fn ring_caps_segment_count_by_merging_oldest() {
-        let mut ring = ReplayRing::new(ws(100, 24));
-        let rounds = MAX_RING_SEGMENTS + 10;
-        for i in 0..rounds {
-            ring.append(format!("seg{i:02} ").as_bytes());
-            ring.resize(ws(101 + i as u16, 24));
-        }
-        assert_eq!(ring.segments.len(), MAX_RING_SEGMENTS);
-
-        let flat = String::from_utf8(ring.flatten()).unwrap();
-        let expect: String = (0..rounds).map(|i| format!("seg{i:02} ")).collect();
-        assert_eq!(flat, expect);
-
-        let head = ring.segments.front().unwrap();
-        assert_eq!(head.size, ws(111, 24));
-        assert!(
-            String::from_utf8(head.to_vec())
-                .unwrap()
-                .ends_with("seg11 ")
-        );
     }
 
     #[test]
@@ -6054,10 +5401,61 @@ mod tests {
         assert_eq!(written.lock().unwrap().as_slice(), b"stallmore");
     }
 
+    /// A query reply sitting in `write_all` must not make a later paste, or
+    /// the paste's closing bracket written as its own chunk, disappear.
+    #[test]
+    fn a_paste_is_not_dropped_while_a_reply_is_in_flight() {
+        struct Gate {
+            started: Option<std::sync::mpsc::Sender<()>>,
+            release: std::sync::mpsc::Receiver<()>,
+            written: Arc<Mutex<Vec<u8>>>,
+        }
+        impl std::io::Write for Gate {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                if let Some(started) = self.started.take() {
+                    let _ = started.send(());
+                    let _ = self.release.recv();
+                }
+                self.written.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let writer = PtyWriter::spawn(Box::new(Gate {
+            started: Some(started_tx),
+            release: release_rx,
+            written: written.clone(),
+        }));
+        let _release = release_tx;
+
+        let paste = vec![b'x'; 5 * 1024 * 1024];
+        writer.write(b"q");
+        started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("the writer thread reaches the stalled pty");
+        writer.write(&paste);
+        writer.write(b"\x1b[201~");
+        drop(_release);
+        assert!(
+            writer.wait_idle(Duration::from_secs(2)),
+            "the queued paste has to be written, not dropped"
+        );
+        let got = written.lock().unwrap();
+        assert_eq!(&got[..1], b"q");
+        assert_eq!(&got[1..paste.len() + 1], paste.as_slice());
+        assert_eq!(&got[paste.len() + 1..], b"\x1b[201~");
+    }
+
     fn test_state(alive: bool) -> PaneState {
         PaneState {
             id: 0,
-            ring: ReplayRing::new(ws(80, 24)),
+            size: ws(80, 24),
             subscriber: None,
             subscriber_epoch: 0,
             allow_remote_clipboard_write: false,
@@ -6080,7 +5478,6 @@ mod tests {
             agent_clock: AgentClock::default(),
             alive,
             exit_code: None,
-            last_redraw_nudge: None,
         }
     }
 
@@ -6387,8 +5784,8 @@ mod tests {
             "split across an attach, the client's"
         );
         assert!(
-            st.ring.modes().take_queries().is_empty(),
-            "a handoff refolding the ring does not ask again"
+            st.modes.take_queries().is_empty(),
+            "queries already answered are not asked again"
         );
     }
 
@@ -6556,7 +5953,7 @@ mod tests {
 
         assert_eq!(st.cwd.as_deref(), Some(Path::new("/Users/alice/dev/tty7")));
         assert!(
-            matches!(rx.try_recv(), Ok(DaemonMsg::Cwd(p)) if p == PathBuf::from("/Users/alice/dev/tty7"))
+            matches!(rx.try_recv(), Ok(DaemonMsg::Cwd(p)) if p.as_path() == Path::new("/Users/alice/dev/tty7"))
         );
     }
 
@@ -6630,17 +6027,14 @@ mod tests {
     #[test]
     fn attach_replays_state_in_order_and_installs_subscriber() {
         let mut st = test_state(true);
-        st.ring.append(b"screen");
         st.cwd = Some(PathBuf::from("/work"));
 
         let (tx, rx) = mpsc::channel();
         let epoch = attach_subscriber(&mut st, tx);
         assert_eq!(epoch, 1);
         assert!(st.subscriber.is_some());
-        assert!(matches!(rx.try_recv(), Ok(DaemonMsg::Size(_))));
-        assert!(matches!(rx.try_recv(), Ok(DaemonMsg::Snapshot(b)) if b == b"screen"));
         assert!(
-            matches!(rx.try_recv(), Ok(DaemonMsg::Cwd(p)) if p.as_path() == std::path::Path::new("/work"))
+            matches!(rx.try_recv(), Ok(DaemonMsg::Cwd(p)) if p.as_path() == Path::new("/work"))
         );
         assert!(rx.try_recv().is_err());
     }
@@ -6673,7 +6067,6 @@ mod tests {
             last_exit_code: Some(0),
             command: None,
         };
-        st.ring.append(b"\x1b[?1049h\x1b[2Jthe agent's screen");
 
         let (tx, rx) = mpsc::channel();
         attach_subscriber_with_permissions(&mut st, tx, &OutputGate::new(), false, true);
@@ -6714,7 +6107,6 @@ mod tests {
             last_exit_code: Some(0),
             command: None,
         };
-        st.ring.append(b"\x1b[?1049hstranded alt screen");
 
         let (tx, rx) = mpsc::channel();
         attach_subscriber_with_permissions(&mut st, tx, &OutputGate::new(), false, false);
@@ -6741,164 +6133,17 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         attach_subscriber(&mut st, tx);
 
-        assert!(matches!(rx.try_recv(), Ok(DaemonMsg::Size(_))));
-        assert!(matches!(rx.try_recv(), Ok(DaemonMsg::Snapshot(_))));
         assert!(
-            matches!(rx.try_recv(), Ok(DaemonMsg::Cwd(p)) if p == PathBuf::from("/Users/alice/clone/tty7"))
+            matches!(rx.try_recv(), Ok(DaemonMsg::Cwd(p)) if p.as_path() == Path::new("/Users/alice/clone/tty7"))
         );
-    }
-
-    /// Issue #774: `btop` sends its alternate-screen and mouse-reporting
-    /// prefix once, when it starts, and then refreshes for hours. The ring
-    /// holds the last few megabytes of those refreshes and nothing of the
-    /// prefix, so a client that rebuilt its terminal from replayed bytes alone
-    /// came back on the primary screen with reporting off — and its wheel,
-    /// reading those modes, scrolled the scrollback of a screen that has none.
-    #[test]
-    fn attach_restores_modes_whose_bytes_the_ring_has_dropped() {
-        let mut st = test_state(true);
-        record_output(&mut st, b"\x1b[?1049h\x1b[?1002h\x1b[?1006h");
-        // A long enough run of refreshes to push the prefix out of the front.
-        record_output(&mut st, &vec![b'.'; RING_CAP]);
-        assert!(
-            !st.ring.flatten().windows(8).any(|w| w == b"\x1b[?1049h"),
-            "the point of the test is that the prefix is gone from the ring"
-        );
-
-        let (tx, rx) = mpsc::channel();
-        attach_subscriber(&mut st, tx);
-
-        // Ahead of the replayed screen, so the frames land in the buffer the
-        // modes put the client on.
-        assert!(
-            matches!(rx.try_recv(), Ok(DaemonMsg::Snapshot(b)) if b == b"\x1b[?1049h\x1b[?1002h\x1b[?1006h"),
-            "the modes the ring lost must be re-sent, in the order they were set"
-        );
-        assert!(matches!(rx.try_recv(), Ok(DaemonMsg::Size(_))));
-        assert!(matches!(rx.try_recv(), Ok(DaemonMsg::Snapshot(_))));
-    }
-
-    /// #1074: an agent CLI pushes its kitty keyboard flags once at startup,
-    /// and a long session pushes that push out of the ring. A client that
-    /// reattached without it sent Escape as a bare `ESC`.
-    ///
-    /// The stack goes back as it stood at the front of the ring, not as it
-    /// ends: the pop and push the ring still holds act on it from there, and
-    /// stacking them on the final state would leave the client a level deeper
-    /// than the program.
-    #[test]
-    fn attach_restores_kitty_keyboard_flags_the_ring_has_dropped() {
-        let mut st = test_state(true);
-        record_output(&mut st, b"\x1b[>1u");
-        record_output(&mut st, &vec![b'.'; RING_CAP]);
-        record_output(&mut st, b"\x1b[<u\x1b[>1u");
-
-        let (tx, rx) = mpsc::channel();
-        attach_subscriber(&mut st, tx);
-
-        assert!(
-            matches!(rx.try_recv(), Ok(DaemonMsg::Snapshot(b)) if b == b"\x1b[>1u"),
-            "the push the ring lost must be re-sent ahead of it"
-        );
-        assert!(matches!(rx.try_recv(), Ok(DaemonMsg::Size(_))));
-        assert!(matches!(rx.try_recv(), Ok(DaemonMsg::Snapshot(_))));
-    }
-
-    #[test]
-    fn kitty_keyboard_flags_the_ring_still_holds_are_left_to_it() {
-        let mut st = test_state(true);
-        record_output(&mut st, b"\x1b[>1u");
-
-        let (tx, rx) = mpsc::channel();
-        attach_subscriber(&mut st, tx);
-
-        assert!(
-            matches!(rx.try_recv(), Ok(DaemonMsg::Size(_))),
-            "nothing goes ahead of a ring that carries the push itself"
-        );
-    }
-
-    #[test]
-    fn a_pane_that_left_the_alternate_screen_restores_no_modes() {
-        let mut st = test_state(true);
-        record_output(&mut st, b"\x1b[?1049h\x1b[?1002hvim\x1b[?1002l\x1b[?1049l");
-        record_output(&mut st, b"$ ");
-
-        let (tx, rx) = mpsc::channel();
-        attach_subscriber(&mut st, tx);
-
-        // Straight to the ring: a shell prompt is not owed a mode frame, and
-        // sending one would put the pane on a screen it had left.
-        assert!(matches!(rx.try_recv(), Ok(DaemonMsg::Size(_))));
-        assert!(matches!(rx.try_recv(), Ok(DaemonMsg::Snapshot(_))));
-        assert!(rx.try_recv().is_err());
-    }
-
-    /// The other side of the same coin, and the common case: reconnect a minute
-    /// after opening `vim` and the ring still holds the whole session, prefix
-    /// included. Re-sending the prefix then would turn the ring's own `?1049h`
-    /// into a no-op, so the shell scrollback the ring holds ahead of it would be
-    /// painted into the alternate screen — which keeps no history and is thrown
-    /// away when the program exits, leaving the user back on a blank primary
-    /// buffer instead of the prompt they left behind.
-    #[test]
-    fn a_prefix_the_ring_still_carries_is_left_to_the_ring() {
-        let mut st = test_state(true);
-        record_output(&mut st, b"$ vim notes.md\r\n");
-        record_output(&mut st, b"\x1b[?1049h\x1b[?1002h\x1b[?1006hthe file\r\n");
-
-        let (tx, rx) = mpsc::channel();
-        attach_subscriber(&mut st, tx);
-
-        assert!(
-            matches!(rx.try_recv(), Ok(DaemonMsg::Size(_))),
-            "the ring speaks for its own modes; nothing goes ahead of it"
-        );
-        assert!(matches!(rx.try_recv(), Ok(DaemonMsg::Snapshot(_))));
-        assert!(rx.try_recv().is_err());
-    }
-
-    /// A mode the cap falls through is a mode the ring cannot set: the front
-    /// evicts the rest of the sequence too rather than replay its tail as
-    /// text, so the mode has to come from the fold.
-    #[test]
-    fn a_prefix_the_ring_cut_in_half_is_restored() {
-        let mut st = test_state(true);
-        record_output(&mut st, b"\x1b[?1049h");
-        // Four bytes over the cap, so the cap falls just after the `ESC [ ? 1`
-        // the sequence opens with, and the `049h` after it goes as well.
-        record_output(&mut st, &vec![b'.'; RING_CAP - 4]);
-        assert!(st.ring.flatten().iter().all(|&b| b == b'.'));
-
-        let (tx, rx) = mpsc::channel();
-        attach_subscriber(&mut st, tx);
-        assert!(
-            matches!(rx.try_recv(), Ok(DaemonMsg::Snapshot(b)) if b == b"\x1b[?1049h"),
-            "the bytes left in the ring put no client on the alternate screen"
-        );
-    }
-
-    /// An observer joins mid-session too, and reads the same pane state.
-    #[test]
-    fn observers_are_told_the_pane_modes_as_well() {
-        let mut st = test_state(true);
-        record_output(&mut st, b"\x1b[?1049h");
-        record_output(&mut st, &vec![b'.'; RING_CAP]);
-
-        let (tx, rx) = mpsc::channel();
-        observe_subscriber(&mut st, tx, Arc::new(OutputGate::new()), false);
-        assert!(matches!(rx.try_recv(), Ok(DaemonMsg::Snapshot(b)) if b == b"\x1b[?1049h"));
     }
 
     #[test]
     fn attach_to_a_dead_pane_replays_exited() {
         let mut st = test_state(false);
-        st.ring.append(b"final screen");
 
         let (tx, rx) = mpsc::channel();
         attach_subscriber(&mut st, tx);
-        assert!(matches!(rx.try_recv(), Ok(DaemonMsg::Size(_))));
-        assert!(matches!(rx.try_recv(), Ok(DaemonMsg::Snapshot(_))));
         assert!(matches!(
             rx.try_recv(),
             Ok(DaemonMsg::Exited { code: None })
@@ -6937,7 +6182,7 @@ mod tests {
 
         let pty = lease_take(&mut st, phone, ws(40, 30), "phone".into());
         assert_eq!(pty, Some(ws(40, 30)));
-        assert_eq!(st.ring.size(), ws(40, 30), "a replay shows the leased size");
+        assert_eq!(st.size, ws(40, 30), "a replay shows the leased size");
         assert_eq!(
             drain(&observer_rx),
             vec![
@@ -6964,13 +6209,13 @@ mod tests {
             None,
             "the pty stays put"
         );
-        assert_eq!(st.ring.size(), ws(40, 30));
+        assert_eq!(st.size, ws(40, 30));
         assert_eq!(drain(&controller_rx), vec![DaemonMsg::Size(ws(120, 40))]);
         assert!(drain(&observer_rx).is_empty());
 
         // Letting go restores what the desk asked for last, not what it had.
         assert_eq!(lease_release(&mut st, phone), Some(ws(120, 40)));
-        assert_eq!(st.ring.size(), ws(120, 40));
+        assert_eq!(st.size, ws(120, 40));
         assert_eq!(
             drain(&observer_rx),
             vec![DaemonMsg::Lease(None), DaemonMsg::Size(ws(120, 40))]
@@ -6990,7 +6235,7 @@ mod tests {
         drain(&observer_rx);
 
         assert_eq!(lease_end(&mut st), Some(ws(80, 24)));
-        assert_eq!(st.ring.size(), ws(80, 24));
+        assert_eq!(st.size, ws(80, 24));
         assert_eq!(
             drain(&observer_rx),
             vec![DaemonMsg::Lease(None), DaemonMsg::Size(ws(80, 24))]
@@ -7049,7 +6294,6 @@ mod tests {
     #[test]
     fn observe_replays_state_without_displacing_the_controller() {
         let mut st = test_state(true);
-        st.ring.append(b"screen");
         st.cwd = Some(PathBuf::from("/work"));
 
         let (controller_tx, controller_rx) = mpsc::channel();
@@ -7064,10 +6308,8 @@ mod tests {
         );
         assert!(st.subscriber.is_some(), "the controller keeps its seat");
 
-        assert!(matches!(observer_rx.try_recv(), Ok(DaemonMsg::Size(_))));
-        assert!(matches!(observer_rx.try_recv(), Ok(DaemonMsg::Snapshot(b)) if b == b"screen"));
         assert!(
-            matches!(observer_rx.try_recv(), Ok(DaemonMsg::Cwd(p)) if p == PathBuf::from("/work"))
+            matches!(observer_rx.try_recv(), Ok(DaemonMsg::Cwd(p)) if p.as_path() == Path::new("/work"))
         );
         assert!(
             controller_rx.try_recv().is_err(),
@@ -7180,27 +6422,6 @@ mod tests {
         );
     }
 
-    /// A phone opening a pane with a long history: the replay is a full ring,
-    /// which is the whole observer budget. Once the writer has put it on the
-    /// wire, live output must still reach the observer.
-    /// The pane keeps printing while a full ring's replay is still going out
-    /// to the phone; that output is the observer's too.
-    #[test]
-    fn an_observer_still_reading_a_full_ring_replay_gets_live_output() {
-        let mut st = test_state(true);
-        st.ring.append(&vec![b'h'; RING_CAP]);
-        let (observer_tx, observer_rx) = mpsc::channel();
-        observe_subscriber(&mut st, observer_tx, Arc::new(OutputGate::new()), false);
-
-        fan_out_output(&mut st, b"tick", Vec::new(), &OutputGate::new());
-        assert_eq!(st.observers.len(), 1, "the observer is still subscribed");
-        assert!(
-            observer_rx
-                .try_iter()
-                .any(|m| matches!(m, DaemonMsg::Output(b) if b == b"tick"))
-        );
-    }
-
     /// One dropped at its budget hears why, and then its channel closes, so
     /// its stream ends rather than going quiet for good.
     #[test]
@@ -7222,64 +6443,18 @@ mod tests {
         ));
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn an_observer_that_drained_a_full_ring_replay_keeps_getting_output() {
-        use std::os::unix::net::UnixStream;
-        let mut st = test_state(true);
-        st.ring.append(&vec![b'h'; RING_CAP]);
-        let (observer_tx, observer_rx) = mpsc::channel();
-        let observer_gate = Arc::new(OutputGate::new());
-        observe_subscriber(&mut st, observer_tx, observer_gate.clone(), false);
-
-        // The daemon's own writer puts the replay on the wire, as for a phone.
-        let (mut client, mut server) = UnixStream::pair().unwrap();
-        let writer_gate = Arc::clone(&observer_gate);
-        let writer = std::thread::spawn(move || {
-            while let Ok(msg) = observer_rx.recv() {
-                let n = gated_len(&msg);
-                if msg.encode(&mut server).is_err() {
-                    break;
-                }
-                if n > 0 {
-                    writer_gate.sub(n);
-                }
-            }
-        });
-        let mut replayed = 0;
-        while replayed < RING_CAP {
-            if let DaemonMsg::Snapshot(b) = DaemonMsg::read(&mut client).unwrap() {
-                replayed += b.len();
-            }
-        }
-        let paid = std::time::Instant::now() + Duration::from_secs(5);
-        while observer_gate.queued_bytes() > 0 && std::time::Instant::now() < paid {
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        assert_eq!(observer_gate.queued_bytes(), 0, "the replay is paid off");
-
-        let pane_gate = OutputGate::new();
-        fan_out_output(&mut st, b"live", Vec::new(), &pane_gate);
-        assert_eq!(st.observers.len(), 1, "the observer is still subscribed");
-        assert_eq!(
-            DaemonMsg::read(&mut client).unwrap(),
-            DaemonMsg::Output(b"live".to_vec())
-        );
-        st.observers.clear();
-        writer.join().unwrap();
-    }
-
     /// A controller's gate starts at its replay, so crediting that replay as
     /// it is written brings the gate back to zero rather than below it.
     #[test]
     fn a_controller_gate_is_charged_for_its_replay() {
         let mut st = test_state(true);
-        st.ring.append(b"screen");
         let gate = OutputGate::new();
         gate.add(123);
         let (tx, rx) = mpsc::channel();
         attach_subscriber_with_permissions(&mut st, tx, &gate, false, false);
-        assert_eq!(gate.queued_bytes(), b"screen".len() as i64);
+        // Status frames are not gated. Attaching resets whatever was charged
+        // and leaves the gate at the (empty) replay.
+        assert_eq!(gate.queued_bytes(), 0);
         while let Ok(msg) = rx.try_recv() {
             gate.sub(gated_len(&msg));
         }
@@ -7531,7 +6706,6 @@ mod tests {
         handle.join().unwrap();
 
         assert!(!state.lock().unwrap().alive);
-        assert_eq!(state.lock().unwrap().ring.flatten(), b"tail");
         assert!(matches!(sub_rx.try_recv(), Ok(DaemonMsg::Output(b)) if b == b"tail"));
         assert!(matches!(
             sub_rx.try_recv(),
@@ -7843,9 +7017,7 @@ mod tests {
             "the query reply is written on the pty thread"
         );
 
-        // (1) The ring holds the text, none of the graphics bytes.
-        assert_eq!(state.lock().unwrap().ring.flatten(), b"beforemidafter");
-        // (2) The query reply went to the PTY writer.
+        // (1) The query reply went to the PTY writer.
         assert_eq!(sink.lock().unwrap().as_slice(), b"\x1b_Gi=1;OK\x1b\\");
         // (3) The subscriber sees the passthrough and the image *in stream order*:
         // the text before the image, then the image at its cursor cell, then the
@@ -7944,7 +7116,6 @@ mod tests {
         .join()
         .unwrap();
 
-        assert_eq!(state.lock().unwrap().ring.flatten(), b"beforeafter");
         assert!(matches!(
             controller_rx.try_recv(),
             Ok(DaemonMsg::Output(bytes)) if bytes == b"before"
@@ -8029,10 +7200,14 @@ mod tests {
             "the clipboard rejection is written on the pty thread"
         );
 
-        assert!(state.lock().unwrap().ring.flatten().is_empty());
+        let msgs: Vec<_> = controller_rx.try_iter().collect();
         assert!(
-            !controller_rx
-                .try_iter()
+            !msgs.iter().any(|msg| matches!(msg, DaemonMsg::Output(_))),
+            "a rejected clipboard write leaves no text on screen"
+        );
+        assert!(
+            !msgs
+                .iter()
                 .any(|msg| matches!(msg, DaemonMsg::ClipboardWrite(_)))
         );
         assert_eq!(
@@ -8042,7 +7217,7 @@ mod tests {
     }
 
     /// A kitty delete (`a=d`) is lifted out and forwarded as a `DeleteImage`
-    /// selector, leaving the surrounding text intact in the ring.
+    /// selector, leaving the surrounding text intact for the subscriber.
     #[test]
     fn reader_forwards_graphics_deletes() {
         let state = Arc::new(Mutex::new(test_state(true)));
@@ -8066,7 +7241,6 @@ mod tests {
         );
         handle.join().unwrap();
 
-        assert_eq!(state.lock().unwrap().ring.flatten(), b"xy");
         // In stream order: text before the delete, the delete, then text after.
         assert!(matches!(sub_rx.try_recv(), Ok(DaemonMsg::Output(b)) if b == b"x"));
         match sub_rx.try_recv() {
@@ -8124,7 +7298,7 @@ mod tests {
         );
         assert!(matches!(sub_rx.try_recv(), Ok(DaemonMsg::Output(_))));
         assert!(
-            matches!(sub_rx.try_recv(), Ok(DaemonMsg::Cwd(p)) if p == PathBuf::from("/Users/alice/dev/tty7"))
+            matches!(sub_rx.try_recv(), Ok(DaemonMsg::Cwd(p)) if p.as_path() == Path::new("/Users/alice/dev/tty7"))
         );
     }
 
@@ -8774,135 +7948,6 @@ mod tests {
             probes_for(vec![10, 11]),
             2,
             "a new program is probed at once"
-        );
-    }
-
-    /// A full-screen program that has run long enough to push its `?1049h`
-    /// and its first full paint out of the ring: what is left is differences.
-    fn state_running_a_long_lived_program() -> PaneState {
-        let mut st = test_state(true);
-        record_output(&mut st, b"\x1b[?1049h\x1b[2Jthe first full paint");
-        record_output(&mut st, &vec![b'x'; RING_CAP]);
-        st
-    }
-
-    /// The resizes a nudge makes, in order.
-    fn run_recorded_nudge(
-        transient: WinSize,
-        settled: impl FnOnce() -> Option<WinSize> + Send + 'static,
-    ) -> Vec<WinSize> {
-        let calls = Arc::new(Mutex::new(Vec::new()));
-        let record = Arc::clone(&calls);
-        run_redraw_nudge(
-            transient,
-            Duration::from_millis(1),
-            Box::new(move |size| record.lock().unwrap().push(size)),
-            settled,
-        )
-        .expect("spawn the nudge thread")
-        .join()
-        .unwrap();
-        calls.lock().unwrap().clone()
-    }
-
-    /// #1122: a client reattaching to such a program gets the alternate screen
-    /// and a stream of differences from a screen it never saw. The pty steps
-    /// a row away and back, so the program hears a size change and repaints.
-    #[test]
-    fn a_reattach_after_the_first_paint_left_the_ring_makes_the_program_repaint() {
-        let mut st = state_running_a_long_lived_program();
-        let (tx, _rx) = mpsc::channel();
-        attach_subscriber_with_permissions(&mut st, tx, &OutputGate::new(), false, true);
-
-        let transient = redraw_nudge(&mut st, true, std::time::Instant::now())
-            .expect("the screen the program painted is gone from the ring");
-        assert_eq!(transient, ws(80, 23), "one row off the pane's own size");
-
-        let st = Arc::new(Mutex::new(st));
-        let settled = Arc::clone(&st);
-        let calls = run_recorded_nudge(transient, move || {
-            let st = settled.lock().unwrap();
-            st.alive.then(|| st.ring.size())
-        });
-        assert_eq!(
-            calls,
-            vec![ws(80, 23), ws(80, 24)],
-            "away and back to where the pane was"
-        );
-        // Only the pty moved: the ring is still at the pane's size, so no
-        // client and no lease saw a change.
-        assert_eq!(st.lock().unwrap().ring.size(), ws(80, 24));
-    }
-
-    #[test]
-    fn a_reattach_that_replays_whole_leaves_the_program_alone() {
-        let now = std::time::Instant::now();
-
-        // The program's start is still in the ring: the replay rebuilds it.
-        let mut st = test_state(true);
-        record_output(&mut st, b"\x1b[?1049h\x1b[2Jthe first full paint");
-        record_output(&mut st, &vec![b'x'; 4096]);
-        assert_eq!(redraw_nudge(&mut st, true, now), None, "nothing was lost");
-
-        // The ring dropped its front, but nothing is in the alternate screen:
-        // a shell's scrollback replays as what it is.
-        let mut st = test_state(true);
-        record_output(&mut st, b"$ cat big.log\r\n");
-        record_output(&mut st, &vec![b'x'; RING_CAP]);
-        assert_eq!(redraw_nudge(&mut st, true, now), None, "primary screen");
-
-        // Left the alternate screen, and the ring cut through both switches.
-        let mut st = state_running_a_long_lived_program();
-        record_output(&mut st, b"\x1b[?1049l$ ");
-        record_output(&mut st, &vec![b'x'; RING_CAP]);
-        assert_eq!(redraw_nudge(&mut st, true, now), None, "program left");
-
-        let mut st = state_running_a_long_lived_program();
-        assert_eq!(
-            redraw_nudge(&mut st, false, now),
-            None,
-            "no program owns the pane to repaint"
-        );
-
-        let mut st = state_running_a_long_lived_program();
-        st.alive = false;
-        assert_eq!(redraw_nudge(&mut st, true, now), None, "pane is dead");
-    }
-
-    #[test]
-    fn a_burst_of_reattaches_makes_one_nudge() {
-        let mut st = state_running_a_long_lived_program();
-        let now = std::time::Instant::now();
-        assert!(redraw_nudge(&mut st, true, now).is_some());
-        assert_eq!(
-            redraw_nudge(&mut st, true, now + Duration::from_millis(500)),
-            None,
-            "the repaint the first one asked for is on its way"
-        );
-        assert!(
-            redraw_nudge(&mut st, true, now + REDRAW_NUDGE_COOLDOWN).is_some(),
-            "a reattach well after it is nudged again"
-        );
-    }
-
-    /// The size put back is the pane's size when it is put back: a resize that
-    /// landed in between, or a lease taken meanwhile, is what the pty ends at.
-    #[test]
-    fn a_nudge_puts_back_the_size_the_pane_has_by_then() {
-        let calls = run_recorded_nudge(ws(80, 23), || Some(ws(100, 30)));
-        assert_eq!(calls, vec![ws(80, 23), ws(100, 30)]);
-
-        let calls = run_recorded_nudge(ws(80, 23), || None);
-        assert_eq!(calls, vec![ws(80, 23)], "a pane that died is left alone");
-    }
-
-    #[test]
-    fn a_one_row_pane_is_nudged_a_row_taller() {
-        let mut st = state_running_a_long_lived_program();
-        st.ring.resize(ws(80, 1));
-        assert_eq!(
-            redraw_nudge(&mut st, true, std::time::Instant::now()),
-            Some(ws(80, 2))
         );
     }
 }

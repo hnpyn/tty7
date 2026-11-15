@@ -120,7 +120,9 @@ impl gpui::EventEmitter<AgentSessionChanged> for TerminalView {}
 
 /// A coding agent started running in this pane: its foreground went from no
 /// agent to this one. What quick launch counts as the agent being used.
-pub struct AgentDetected(pub crate::core::cli_agent::CLIAgent);
+pub struct AgentDetected(
+    #[cfg_attr(not(test), allow(dead_code))] pub crate::core::cli_agent::CLIAgent,
+);
 
 impl gpui::EventEmitter<AgentDetected> for TerminalView {}
 
@@ -137,6 +139,7 @@ pub(crate) const DEFAULT_TITLE: &str = "ntty7";
 /// deliberately (#438) rather than the absence of one. The literal string
 /// `ntty7` is the only title that says nothing, because it is the app's own
 /// name standing in for a pane that has never introduced itself.
+#[cfg(test)]
 pub(crate) fn stated_title(title: &str) -> Option<&str> {
     match title.trim() {
         "" => None,
@@ -152,6 +155,8 @@ pub struct ShellParts {
     pub(crate) workspace: Option<crate::terminal::PaneWorkspace>,
     pub(crate) restored: bool,
     pub(crate) owner: Option<crate::core::session::WorkspaceId>,
+    /// Set when a configured shell failed and the login shell was used instead.
+    pub(crate) shell_notice: Option<String>,
 }
 
 /// What the reader was last shown of each pane's finished agent turn, kept for
@@ -317,6 +322,7 @@ pub struct TerminalView {
     /// refused — the pane is gone at the far end, and asking again can only
     /// repeat the answer. Cleared when a relink is adopted anyway (the manual
     /// reconnect path), which is the one thing that changes the question.
+    #[cfg_attr(not(test), allow(dead_code))]
     relink_abandoned: bool,
     /// A relink for this pane is already on the wire. Both askers set it —
     /// the machine-level reconnect and the pump's own sweep — because the
@@ -324,6 +330,7 @@ pub struct TerminalView {
     /// kicks the first. Without this the pump would join a dial still in
     /// flight every 250 ms, and a dial can sit for fifteen seconds waiting
     /// for the far end's verdict.
+    #[cfg_attr(not(test), allow(dead_code))]
     relink_inflight: bool,
     pub marked_text: String,
     last_mouse_cell: Option<(usize, usize)>,
@@ -531,6 +538,7 @@ enum LinkAt {
 
 /// What it takes to open one of a pane's loopback ports from this machine.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg(test)]
 pub(crate) enum PortRoute {
     /// The port is already reachable here under its own number.
     Direct,
@@ -556,6 +564,7 @@ pub(super) enum LoopbackPlan {
 /// reachable once a forward exists, and building that forward is something
 /// this app already knows how to do. Answering only "local or not" is what
 /// left the Ports list showing a port it then refused to open.
+#[cfg(test)]
 fn port_route_of(plan: &LoopbackPlan, local: bool) -> PortRoute {
     match plan {
         // WSL shares this machine's loopback, so its ports are already here
@@ -1397,6 +1406,52 @@ impl TerminalView {
         shell: Option<ShellSpec>,
         owner: Option<crate::core::session::WorkspaceId>,
     ) -> anyhow::Result<ShellParts> {
+        // `shell: None` still reads `config.json`. A broken `shell.program`
+        // has to fall back to the login shell, or a Dock launch dies before
+        // the window exists and the user cannot open Settings to fix it.
+        let customized = shell.is_none() && crate::core::config::shell_command().is_some();
+        match Self::open_shell_terminal(
+            workspace.clone(),
+            working_directory.clone(),
+            restore_pane,
+            shell.clone(),
+            owner,
+            true,
+        ) {
+            Ok(parts) => Ok(parts),
+            Err(error) if customized => {
+                let program = crate::core::config::shell_command()
+                    .map(|(program, _)| program)
+                    .unwrap_or_default();
+                log::warn!(
+                    "configured shell {program} failed to start ({error:#}); using the login shell"
+                );
+                let mut parts = Self::open_shell_terminal(
+                    workspace,
+                    working_directory,
+                    restore_pane,
+                    None,
+                    owner,
+                    false,
+                )?;
+                parts.shell_notice = Some(crate::ui::i18n::t_fmt(
+                    crate::ui::i18n::L10nKey::ShellFellBack,
+                    &[("shell", program.as_str())],
+                ));
+                Ok(parts)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn open_shell_terminal(
+        workspace: Option<crate::terminal::PaneWorkspace>,
+        working_directory: Option<std::path::PathBuf>,
+        restore_pane: Option<u64>,
+        shell: Option<ShellSpec>,
+        owner: Option<crate::core::session::WorkspaceId>,
+        use_config_shell: bool,
+    ) -> anyhow::Result<ShellParts> {
         let route = crate::terminal::PaneRoute::for_workspace(workspace.as_ref());
         let attached = match restore_pane {
             Some(id) => match RemoteTerminal::attach_on(&route, TermSize::new(80, 24), 8, 17, id) {
@@ -1456,6 +1511,7 @@ impl TerminalView {
                     shell.clone(),
                     owner.map(|id| id.to_string()),
                     restore,
+                    use_config_shell,
                 )?;
                 (terminal, id, shell)
             }
@@ -1467,6 +1523,7 @@ impl TerminalView {
             workspace,
             restored,
             owner,
+            shell_notice: None,
         })
     }
 
@@ -1824,6 +1881,7 @@ impl TerminalView {
     /// [`PaneRecord::osc_title`](tty7_core::core::machine::PaneRecord::osc_title),
     /// which is what lets the tab strip and the switcher name a tab the same
     /// way.
+    #[cfg(test)]
     pub(crate) fn stated_title(&self) -> Option<&str> {
         stated_title(&self.title)
     }
@@ -1906,6 +1964,8 @@ impl TerminalView {
         })
     }
 
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
     pub fn adopt_relink(
         &mut self,
         stream: crate::terminal::remote::Stream,
@@ -1985,6 +2045,7 @@ impl TerminalView {
         }))
     }
 
+    #[cfg(test)]
     pub fn agent_result_unread(&self) -> bool {
         self.agent_result_unread
     }
@@ -2036,6 +2097,7 @@ impl TerminalView {
     /// `git_status_cwd` is only ever set for a pane whose paths belong to its
     /// host, so the fallback here is what decides that: this one takes any
     /// cwd, [`Self::effective_host_cwd`] takes only one the host can resolve.
+    #[cfg(test)]
     pub fn effective_cwd(&self) -> Option<std::path::PathBuf> {
         self.git_status_cwd.clone().or_else(|| self.cwd())
     }
@@ -2079,6 +2141,7 @@ impl TerminalView {
     /// far-end session should still be alive, so the link supervisor keeps
     /// asking for it back. A child that exited is over, not disconnected, and
     /// a pane whose machine already refused the relink is past asking.
+    #[cfg(test)]
     pub fn wants_relink(&self) -> bool {
         self.workspace.is_some()
             && self.terminal.exited
@@ -2090,6 +2153,7 @@ impl TerminalView {
     /// Claims this pane for one relink attempt. Every path that dials for a
     /// pane calls this first, so the other paths leave it alone until the
     /// attempt reports back through `relink_settled` or `adopt_relink`.
+    #[cfg(test)]
     pub fn mark_relinking(&mut self) {
         self.relink_inflight = true;
     }
@@ -2097,6 +2161,7 @@ impl TerminalView {
     /// Releases the claim `mark_relinking` took, for the attempts that end
     /// without a stream to adopt. A pane freed this way is up for asking
     /// again on the next sweep.
+    #[cfg(test)]
     pub fn relink_settled(&mut self) {
         self.relink_inflight = false;
     }
@@ -2104,6 +2169,7 @@ impl TerminalView {
     /// Records that this pane's machine refused to give the pane back — it is
     /// gone at the far end — so the link supervisor stops asking. The pane
     /// keeps its disconnected face; only the retrying stops.
+    #[cfg(test)]
     pub fn abandon_relink(&mut self) {
         self.relink_abandoned = true;
         self.relink_inflight = false;
@@ -2620,11 +2686,12 @@ impl TerminalView {
         // prompt. So it takes the same route an unknown Ctrl chord takes:
         // hand the line over first, then send the key, with every modifier
         // combination going the same way (Alt+F7 is ClearHistory).
-        if super::input::is_function_key(key) && !m.platform {
-            if let Some(bytes) = super::input::keystroke_to_bytes(ks, self.key_flags()) {
-                self.handoff_line_to_shell(&bytes, cx);
-                return;
-            }
+        if super::input::is_function_key(key)
+            && !m.platform
+            && let Some(bytes) = super::input::keystroke_to_bytes(ks, self.key_flags())
+        {
+            self.handoff_line_to_shell(&bytes, cx);
+            return;
         }
 
         if m.control && !m.platform && !m.alt {
@@ -2737,12 +2804,13 @@ impl TerminalView {
             }
             "left" => self.editor_move_h(false, m.shift, m.alt),
             "right" => {
-                if !m.shift && self.cmd.selection().is_none() {
-                    if let Some(full) = self.ghost_suggestion() {
-                        self.cmd.set(&full);
-                        cx.notify();
-                        return;
-                    }
+                if !m.shift
+                    && self.cmd.selection().is_none()
+                    && let Some(full) = self.ghost_suggestion()
+                {
+                    self.cmd.set(&full);
+                    cx.notify();
+                    return;
                 }
                 self.editor_move_h(true, m.shift, m.alt);
             }
@@ -2771,13 +2839,15 @@ impl TerminalView {
                 return;
             }
             _ => {
-                if !m.control && !m.platform && !m.alt {
-                    if let Some(ch) = ks.key_char.as_deref() {
-                        if !ch.is_empty() && ch.chars().all(|c| c >= '\u{20}' && c != '\u{7f}') {
-                            self.commit_text(ch, cx);
-                            return;
-                        }
-                    }
+                if !m.control
+                    && !m.platform
+                    && !m.alt
+                    && let Some(ch) = ks.key_char.as_deref()
+                    && !ch.is_empty()
+                    && ch.chars().all(|c| c >= '\u{20}' && c != '\u{7f}')
+                {
+                    self.commit_text(ch, cx);
+                    return;
                 }
                 if m.alt && !m.control && !m.platform && key.chars().count() == 1 {
                     let bytes = super::input::keystroke_to_bytes(ks, self.key_flags())
@@ -3321,15 +3391,15 @@ impl TerminalView {
         raw: bool,
         cx: &mut Context<Self>,
     ) -> bool {
-        if self.input_active() {
-            if let Some(text) = self.cmd.selected_text() {
-                cx.write_to_clipboard(ClipboardItem::new_string(text));
-                if clear_on_copy {
-                    self.cmd.clear_selection();
-                    cx.notify();
-                }
-                return true;
+        if self.input_active()
+            && let Some(text) = self.cmd.selected_text()
+        {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+            if clear_on_copy {
+                self.cmd.clear_selection();
+                cx.notify();
             }
+            return true;
         }
         if self.has_selection() {
             self.copy_selection(raw, cx);
@@ -4841,16 +4911,18 @@ impl TerminalView {
 
     fn handle_reverse_search_key(&mut self, ks: &gpui::Keystroke, cx: &mut Context<Self>) {
         let m = &ks.modifiers;
-        if !m.control && !m.platform && !m.alt {
-            if let Some(ch) = ks.key_char.as_deref() {
-                if !ch.is_empty() && ch.chars().all(|c| c >= '\u{20}' && c != '\u{7f}') {
-                    if let Some(rs) = self.reverse_search.as_mut() {
-                        rs.push_query(ch, &self.history, &self.history_frecency);
-                    }
-                    cx.notify();
-                    return;
-                }
+        if !m.control
+            && !m.platform
+            && !m.alt
+            && let Some(ch) = ks.key_char.as_deref()
+            && !ch.is_empty()
+            && ch.chars().all(|c| c >= '\u{20}' && c != '\u{7f}')
+        {
+            if let Some(rs) = self.reverse_search.as_mut() {
+                rs.push_query(ch, &self.history, &self.history_frecency);
             }
+            cx.notify();
+            return;
         }
         let Some(rs) = self.reverse_search.as_mut() else {
             return;
@@ -5772,7 +5844,7 @@ impl TerminalView {
         if !cx.global::<Config>().link_url {
             return false;
         }
-        let include_loopback = self.can_forward_loopback(cx);
+        let include_loopback = self.can_forward_loopback();
         match self.resolve_link_at(col, row, true, include_loopback, cx) {
             LinkAt::Found(LinkTarget::Url(url), ..) => self.open_url(&url, window, cx),
             LinkAt::Found(
@@ -5806,7 +5878,7 @@ impl TerminalView {
             self.menu_link = None;
             return;
         }
-        let include_loopback = self.can_forward_loopback(cx);
+        let include_loopback = self.can_forward_loopback();
         self.menu_link = match self.resolve_link_at(col, row, true, include_loopback, cx) {
             LinkAt::Found(target @ LinkTarget::File { .. }, ..) => Some(target),
             _ => None,
@@ -5874,10 +5946,9 @@ impl TerminalView {
 
     /// Hands a resolved file link to whatever the user wants opening files.
     ///
-    /// The built-in editor is the default because it is the one place that can
-    /// honour `line` and `column`, and the only one that can open a file that
-    /// lives on another machine at all — an external command would be handed a
-    /// path that means nothing here.
+    /// A local path opens with the program the OS has it associated with,
+    /// unless `link_file_command` names one. A path on another machine has
+    /// nothing here that can show it.
     fn open_file_link(
         &mut self,
         path: std::path::PathBuf,
@@ -5893,10 +5964,11 @@ impl TerminalView {
         // A path that was just resolved on another machine means nothing to a
         // local opener: `open` and a user's `code --goto` would both be handed
         // a path this filesystem never had.
-        let mode = match self.host_id.is_local() {
-            true => mode,
-            false => LinkFileOpen::Internal,
-        };
+        if !self.host_id.is_local() {
+            let shown = path.display().to_string();
+            window.push_notification(t_fmt(L10nKey::LinkFileMissing, &[("path", &shown)]), cx);
+            return;
+        }
         // Both external arms have to answer for a failed spawn (#542): a
         // misspelled `link_file_command` or a missing opener used to hit only
         // the log, and the link read as dead — while the path was only ever
@@ -5905,17 +5977,7 @@ impl TerminalView {
             (LinkFileOpen::Command, Some(template)) => {
                 run_file_command(&template, &path, line, column)
             }
-            (LinkFileOpen::System, _) => open_file_path(&path),
-            // No in-window editor. A local path opens with the system; a path
-            // on another machine has nothing here that can show it.
-            (LinkFileOpen::Internal | LinkFileOpen::Command, _) if self.host_id.is_local() => {
-                open_file_path(&path)
-            }
-            (LinkFileOpen::Internal | LinkFileOpen::Command, _) => {
-                let shown = path.display().to_string();
-                window.push_notification(t_fmt(L10nKey::LinkFileMissing, &[("path", &shown)]), cx);
-                return;
-            }
+            _ => open_file_path(&path),
         };
         if let Err(e) = outcome {
             self.warn_file_open_failed(&path, &e, window, cx);
@@ -5973,17 +6035,17 @@ impl TerminalView {
         cx.open_url(url);
     }
 
-    fn loopback_plan(&self, cx: &gpui::App) -> LoopbackPlan {
+    fn loopback_plan(&self) -> LoopbackPlan {
         loopback_plan(
-            cx.global::<Config>().ssh_loopback_forward,
+            true,
             self.workspace.as_ref(),
             self.terminal.remote_context().map(|r| r.kind),
             self.pane_id,
         )
     }
 
-    fn can_forward_loopback(&self, cx: &gpui::App) -> bool {
-        !matches!(self.loopback_plan(cx), LoopbackPlan::Direct)
+    fn can_forward_loopback(&self) -> bool {
+        !matches!(self.loopback_plan(), LoopbackPlan::Direct)
     }
 
     pub fn hover_link_at(
@@ -6023,7 +6085,7 @@ impl TerminalView {
             }
             return false;
         }
-        let include_loopback = self.can_forward_loopback(cx);
+        let include_loopback = self.can_forward_loopback();
         let next = self.link_span_at(col, row, armed, include_loopback, cx);
         if next != self.hovered_link {
             self.hovered_link = next;
@@ -6057,6 +6119,7 @@ impl TerminalView {
         cell.c.is_whitespace()
     }
 
+    #[cfg(test)]
     pub fn refresh_link_hover(&mut self, armed: bool, cx: &mut Context<Self>) -> bool {
         let Some((col, row)) = self.last_hover_cell else {
             self.link_modifier_down = armed;
@@ -7876,15 +7939,15 @@ fn wrapped_click_index(
             return Some(i);
         }
     }
-    if let Some(fi) = positions.iter().position(|&(pr, _, _)| pr == target) {
-        if col < positions[fi].1 {
-            return Some(fi);
-        }
+    if let Some(fi) = positions.iter().position(|&(pr, _, _)| pr == target)
+        && col < positions[fi].1
+    {
+        return Some(fi);
     }
-    if let Some(last) = positions.iter().rposition(|&(pr, _, _)| pr == target) {
-        if chars[last] == '\n' {
-            return Some(last);
-        }
+    if let Some(last) = positions.iter().rposition(|&(pr, _, _)| pr == target)
+        && chars[last] == '\n'
+    {
+        return Some(last);
     }
     match positions.iter().position(|&(pr, _, _)| pr > target) {
         Some(ni) => Some(ni),
@@ -9614,8 +9677,13 @@ mod tests {
                     cell.width
                 };
                 assert_eq!(positions[cell.start].2, drawn, "{text:?} at {}", cell.start);
-                for i in cell.start + 1..cell.end {
-                    assert_eq!(positions[i].2, 0, "{text:?} at {i}");
+                for (i, pos) in positions
+                    .iter()
+                    .enumerate()
+                    .take(cell.end)
+                    .skip(cell.start + 1)
+                {
+                    assert_eq!(pos.2, 0, "{text:?} at {i}");
                 }
             }
         }
@@ -10005,17 +10073,12 @@ mod tests {
     #[test]
     fn the_default_app_row_is_offered_only_where_it_differs_from_open() {
         use super::{LinkFileOpen, offers_default_app_open};
-        assert!(offers_default_app_open(true, LinkFileOpen::Internal));
         assert!(offers_default_app_open(true, LinkFileOpen::Command));
         assert!(
             !offers_default_app_open(true, LinkFileOpen::System),
             "it would repeat Open"
         );
-        for mode in [
-            LinkFileOpen::Internal,
-            LinkFileOpen::System,
-            LinkFileOpen::Command,
-        ] {
+        for mode in [LinkFileOpen::System, LinkFileOpen::Command] {
             assert!(
                 !offers_default_app_open(false, mode),
                 "a remote file has nothing here for the OS to open ({mode:?})"
@@ -13006,7 +13069,7 @@ mod gpui_tests {
     fn shift_enter_reaches_a_foreground_tui_with_kitty_encoding(cx: &mut TestAppContext) {
         crate::core::config::pin_test_config_dir();
         let (window, mut daemon) = harness_on(cx, PtySource::LocalConpty);
-        cx.update(|cx| crate::ui::keymap::init(cx));
+        cx.update(crate::ui::keymap::init);
         DaemonMsg::Output(b"\x1b[>1u".to_vec())
             .encode(&mut daemon)
             .unwrap();
@@ -13047,7 +13110,7 @@ mod gpui_tests {
     fn shift_enter_reaches_a_foreground_tui_as_lf_without_kitty(cx: &mut TestAppContext) {
         crate::core::config::pin_test_config_dir();
         let (window, mut daemon) = harness_on(cx, PtySource::Raw);
-        cx.update(|cx| crate::ui::keymap::init(cx));
+        cx.update(crate::ui::keymap::init);
         window
             .update(cx, |view, window, cx| {
                 assert!(!view.input_active(), "the foreground TUI owns input");
@@ -13068,7 +13131,7 @@ mod gpui_tests {
     #[gpui::test]
     fn newline_chords_reach_conpty_as_ctrl_j_without_kitty(cx: &mut TestAppContext) {
         let (window, mut daemon) = harness_on(cx, PtySource::LocalConpty);
-        cx.update(|cx| crate::ui::keymap::init(cx));
+        cx.update(crate::ui::keymap::init);
         window
             .update(cx, |view, window, cx| {
                 assert!(!view.input_active());
@@ -13092,7 +13155,7 @@ mod gpui_tests {
     fn alt_enter_keeps_its_legacy_encoding_in_a_foreground_tui(cx: &mut TestAppContext) {
         crate::core::config::pin_test_config_dir();
         let (window, mut daemon) = harness(cx);
-        cx.update(|cx| crate::ui::keymap::init(cx));
+        cx.update(crate::ui::keymap::init);
         window
             .update(cx, |view, window, cx| {
                 assert!(!view.input_active(), "the foreground TUI owns input");
@@ -13127,7 +13190,7 @@ mod gpui_tests {
     #[gpui::test]
     fn the_keymap_routes_both_newline_chords_to_the_action(cx: &mut TestAppContext) {
         let (window, mut daemon) = harness(cx);
-        cx.update(|cx| crate::ui::keymap::init(cx));
+        cx.update(crate::ui::keymap::init);
         prompt_ready(&window, cx, &mut daemon);
         window
             .update(cx, |view, window, cx| {
@@ -13150,7 +13213,7 @@ mod gpui_tests {
             })
             .unwrap();
 
-        cx.update(|cx| crate::ui::keymap::rebind(cx));
+        cx.update(crate::ui::keymap::rebind);
         vcx.simulate_keystrokes("shift-enter");
         window
             .update(cx, |view, _, _| {
@@ -14483,7 +14546,7 @@ mod gpui_tests {
     ) {
         crate::core::config::pin_test_config_dir();
         let (window, mut daemon) = harness(cx);
-        cx.update(|cx| crate::ui::keymap::init(cx));
+        cx.update(crate::ui::keymap::init);
         DaemonMsg::Prompt {
             active: true,
             at_prompt: true,
@@ -15962,7 +16025,7 @@ mod gpui_tests {
     fn ctrl_6_reaches_the_pty_as_rs(cx: &mut TestAppContext) {
         crate::core::config::pin_test_config_dir();
         let (window, mut daemon) = harness(cx);
-        cx.update(|cx| crate::ui::keymap::init(cx));
+        cx.update(crate::ui::keymap::init);
         window
             .update(cx, |view, window, cx| {
                 window.activate_window();

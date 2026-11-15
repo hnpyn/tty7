@@ -22,7 +22,7 @@ pub fn init(cx: &mut App) {
     // A focused confirmation, or a minimized window, never sees this chord.
     // The live window asks; only a process with no window left quits here.
     cx.on_action(|_: &Quit, cx: &mut App| crate::ui::solo::route_quit(cx));
-    cx.on_action(|_: &NewWindow, _cx: &mut App| crate::spawn_new_instance(None));
+    cx.on_action(|_: &NewWindow, cx: &mut App| crate::ui::solo::route_new_window(cx));
     cx.on_action(crate::ui::theme::toggle_theme_follow_system);
     cx.on_action(crate::ui::theme::select_theme);
     cx.on_action(crate::ui::theme::open_config_file);
@@ -136,14 +136,6 @@ fn extra_keystrokes(effective: &[(String, String)]) -> Vec<(&'static str, &'stat
 
 fn is_default_insert_newline_binding(action: &str, key: &str) -> bool {
     action == "InsertNewline" && key == INSERT_NEWLINE_DEFAULT
-}
-
-#[allow(dead_code)]
-pub(crate) fn extra_bindings(cx: &App) -> Vec<(String, String)> {
-    extra_keystrokes(&effective_bindings(cx))
-        .into_iter()
-        .map(|(a, k)| (a.to_string(), k.to_string()))
-        .collect()
 }
 
 /// Installs `key` for `action`, and alongside it the chord the platform will
@@ -467,6 +459,7 @@ fn tmux_preset(prefix: &str) -> Vec<(String, String)> {
         .collect()
 }
 
+#[cfg(test)]
 pub(crate) fn effective_key(action: &str, cx: &App) -> Option<String> {
     effective_bindings(cx)
         .into_iter()
@@ -640,22 +633,12 @@ pub(crate) fn same_chord(a: &str, b: &str) -> bool {
         || (folded_a.is_some() && folded_a == folded_b)
 }
 
+#[cfg(test)]
 pub(crate) fn key_chords(spec: &str) -> Vec<Vec<String>> {
     spec.split_whitespace().map(key_tokens).collect()
 }
 
-/// How to write the "secondary" modifier for this platform — ⌘ on macOS, Ctrl
-/// everywhere else. Anything spelling a shortcut out in the UI needs this
-/// rather than a literal ⌘.
-#[allow(dead_code)]
-pub(crate) fn secondary_glyph() -> &'static str {
-    if cfg!(target_os = "macos") {
-        "⌘"
-    } else {
-        "Ctrl"
-    }
-}
-
+#[cfg(test)]
 pub(crate) fn key_tokens(spec: &str) -> Vec<String> {
     #[cfg(target_os = "macos")]
     const MODS: [(&str, &str); 6] = [
@@ -680,12 +663,12 @@ pub(crate) fn key_tokens(spec: &str) -> Vec<String> {
     'outer: loop {
         for (name, glyph) in MODS {
             let prefix = format!("{name}-");
-            if let Some(stripped) = rest.strip_prefix(&prefix) {
-                if !stripped.is_empty() {
-                    tokens.push(glyph.to_string());
-                    rest = stripped;
-                    continue 'outer;
-                }
+            if let Some(stripped) = rest.strip_prefix(&prefix)
+                && !stripped.is_empty()
+            {
+                tokens.push(glyph.to_string());
+                rest = stripped;
+                continue 'outer;
             }
         }
         break;
@@ -704,6 +687,7 @@ pub(crate) fn key_tokens(spec: &str) -> Vec<String> {
     tokens
 }
 
+#[cfg(test)]
 fn key_glyph(key: &str) -> String {
     match key {
         // The glyph every hint in the app already draws for Return; this one
@@ -1551,12 +1535,12 @@ mod gpui_tests {
 
             // An unrelated edit leaves the triple alone — this is the gate the
             // watcher compares, and a sidebar drag must not rebind.
-            cx.global_mut::<Config>().dim_inactive_panes = false;
+            cx.global_mut::<Config>().copy_on_select = true;
             assert_eq!(keybinding_config(cx), before);
 
             // A real binding edit moves it.
             cx.global_mut::<Config>().keybindings.insert(
-                "RenameTab".to_string(),
+                "NewWindow".to_string(),
                 KeybindingOverride::Add("ctrl-shift-r".to_string()),
             );
             assert_ne!(keybinding_config(cx), before);

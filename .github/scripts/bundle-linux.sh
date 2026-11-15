@@ -1,7 +1,7 @@
 #!/bin/bash
 # Usage: bundle-linux.sh <target-triple> <arch-label>
 # Package the release binary into a tarball:
-#   dist/tty7-<version>-linux-<arch>.tar.gz
+#   dist/ntty7-<version>-linux-<arch>.tar.gz
 #
 # Fonts and the app icon are embedded via include_bytes!, so the archive is the
 # stripped executable plus a sibling completions/ dir (loaded at runtime — see

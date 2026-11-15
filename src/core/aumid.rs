@@ -43,10 +43,11 @@ pub(crate) const AUMID: &str = "com.github.ntty7";
 
 /// The toast activator class (`core::toast_activator`). Keep in sync with the
 /// `AppUserModelToastActivatorCLSID` on the installer shortcuts and the key
-/// its uninstaller removes — a unit test checks both. Never change it: older
-/// shortcuts and registrations in the field name this exact class.
+/// its uninstaller removes — a unit test checks both. This id belongs to
+/// ntty7 and must not match tty7's, or the two apps overwrite and uninstall
+/// each other's COM registration.
 pub(crate) const TOAST_ACTIVATOR_CLSID: windows::core::GUID =
-    windows::core::GUID::from_u128(0x4E1F6381_E90B_4BED_9156_A9013F718FE6);
+    windows::core::GUID::from_u128(0x7B4A9D2E_5C18_4F63_9A41_2E8D6B0C9F77);
 
 /// The argument the COM registration launches us with. COM appends
 /// `-Embedding` after it; neither changes how the launch is handled — it is a
@@ -55,7 +56,7 @@ pub(crate) const TOAST_ACTIVATOR_CLSID: windows::core::GUID =
 const TOAST_ACTIVATED_ARG: &str = "--toast-activated";
 
 /// The CLSID as the registry and the installer spell it, without braces:
-/// `4E1F6381-E90B-4BED-9156-A9013F718FE6`.
+/// `7B4A9D2E-5C18-4F63-9A41-2E8D6B0C9F77`.
 fn clsid_text(clsid: &windows::core::GUID) -> String {
     let hex = format!("{:032X}", clsid.to_u128());
     format!(
@@ -554,11 +555,11 @@ mod tests {
     fn the_clsid_is_spelled_the_registry_way() {
         assert_eq!(
             super::clsid_text(&super::TOAST_ACTIVATOR_CLSID),
-            "4E1F6381-E90B-4BED-9156-A9013F718FE6"
+            "7B4A9D2E-5C18-4F63-9A41-2E8D6B0C9F77"
         );
         assert_eq!(
             super::local_server_key(),
-            r"Software\Classes\CLSID\{4E1F6381-E90B-4BED-9156-A9013F718FE6}\LocalServer32"
+            r"Software\Classes\CLSID\{7B4A9D2E-5C18-4F63-9A41-2E8D6B0C9F77}\LocalServer32"
         );
     }
 
@@ -700,7 +701,7 @@ mod tests {
         };
         println!("decision: {decision}");
         println!("toast_app_id: {:?}", super::toast_app_id());
-        crate::terminal::notify_desktop(Some("ntty7"), "AUMID toast test");
+        crate::terminal::notify_desktop_for_pane(Some("ntty7"), "AUMID toast test", None);
         std::thread::sleep(std::time::Duration::from_secs(3));
     }
 }

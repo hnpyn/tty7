@@ -68,10 +68,11 @@ fn probe_log_due(
     now: std::time::Instant,
     gap: std::time::Duration,
 ) -> bool {
-    if let Some((said, at)) = last.as_ref() {
-        if said == line && now.duration_since(*at) < gap {
-            return false;
-        }
+    if let Some((said, at)) = last.as_ref()
+        && said == line
+        && now.duration_since(*at) < gap
+    {
+        return false;
     }
     *last = Some((line.to_string(), now));
     true
@@ -551,13 +552,13 @@ fn listening_ports(procs: &[ProcEntry]) -> (Vec<PortEntry>, PortProbe) {
                 // put a doubt on screen every time a `ls` finished. What the
                 // status is worth is a log line when the run both complained
                 // and came back with nothing.
-                if ports.is_empty() && !out.status.success() {
-                    if let Some(line) = String::from_utf8_lossy(&out.stderr)
+                if ports.is_empty()
+                    && !out.status.success()
+                    && let Some(line) = String::from_utf8_lossy(&out.stderr)
                         .lines()
                         .find(|l| !l.trim().is_empty())
-                    {
-                        log::debug!("{tool} found no listeners and said: {line}");
-                    }
+                {
+                    log::debug!("{tool} found no listeners and said: {line}");
                 }
                 return (ports, PortProbe::Ok);
             }

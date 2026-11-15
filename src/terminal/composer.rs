@@ -5805,7 +5805,6 @@ mod tests {
                 PathBuf::from("/repo/app/src/main.rs"),
                 PathBuf::from("/repo/README.md"),
             ],
-            false,
         );
         let items = file_items(&index, "main", Some(Path::new("/repo/app")), None, None);
         assert_eq!(items[0].insert, "@src/main.rs");

@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
@@ -148,15 +148,6 @@ pub struct Config {
     pub font_thicken: bool,
     pub font_size: f32,
     pub line_height: f32,
-    /// The interface's root font size, in pixels — everything outside the
-    /// terminal grid is sized against it.
-    ///
-    /// It is the CSS-style `rem` the whole chrome is laid out in, not one
-    /// label's size: raising it scales panel text, section headings and the
-    /// spacing derived from them together. Its own default matches the size
-    /// the chrome was drawn at, so an existing config renders unchanged.
-    #[serde(default = "default_ui_font_size")]
-    pub ui_font_size: f32,
     /// The face the chrome is drawn in; `None` is the system UI font.
     ///
     /// Only the chrome — the terminal grid keeps `font_family`. The
@@ -165,7 +156,6 @@ pub struct Config {
     /// out as `null` rather than dropped, so the file still lists what can be
     /// set by hand.
     pub ui_font_family: Option<String>,
-    pub theme: String,
     pub theme_preset: String,
     /// When set, the live theme is `theme_preset_dark` or `theme_preset_light`
     /// according to the OS appearance. On for a new config: a missing key used
@@ -180,16 +170,6 @@ pub struct Config {
     pub window_blur: Option<bool>,
     #[serde(default, deserialize_with = "de_lenient")]
     pub window_backdrop: WindowBackdrop,
-    #[serde(default = "default_true")]
-    pub dim_inactive_panes: bool,
-    /// Paint the title bar's buttons — new tab and the two panel toggles —
-    /// only while the pointer is over the bar they sit in. Off by default: a
-    /// button that is not on screen is a button nobody finds, and the switch
-    /// is for those who already know where it is and would rather rest their
-    /// eyes on a bare bar. The struct-level `serde(default)` reads a file
-    /// written before the key existed as off, which is how every window drew
-    /// then.
-    pub auto_hide_titlebar_buttons: bool,
     /// Lenient one entry at a time, for the same reason the nested keys below
     /// are: this is hand-edited, and it used to be all-or-nothing. A single
     /// value serde could not read — `"ActivateTab1": null`, a number, an object
@@ -206,12 +186,6 @@ pub struct Config {
     pub prefix: String,
     #[serde(default, deserialize_with = "de_shell")]
     pub shell: Option<ShellConfig>,
-    /// Lenient on purpose: this is a hand-edited key with a nested shape, and a
-    /// typo in one entry must not fail the whole `Config` and hand the user
-    /// back defaults that the next settings write would then persist over what
-    /// they wrote.
-    #[serde(default, deserialize_with = "de_lenient")]
-    pub custom_shells: Vec<CustomShell>,
 
     pub link_url: bool,
     /// What a clicked file link opens in. `None` means the key predates this
@@ -220,123 +194,19 @@ pub struct Config {
     #[serde(default, deserialize_with = "de_lenient")]
     pub link_file_open: Option<LinkFileOpen>,
     pub link_file_command: Option<String>,
-    pub ssh_loopback_forward: bool,
     pub cursor_blink: bool,
     pub scrollback_limit: usize,
     #[serde(default, deserialize_with = "de_lenient")]
-    pub new_tab_position: NewTabPosition,
-    #[serde(default, deserialize_with = "de_lenient")]
-    pub tab_bar_position: TabBarPosition,
-    #[serde(default = "default_sidebar_width")]
-    pub sidebar_width: f32,
-    #[serde(default)]
-    pub sidebar_collapsed: bool,
-    #[serde(default)]
-    pub right_panel_visible: bool,
-    #[serde(default = "default_right_panel_width")]
-    pub right_panel_width: f32,
-    #[serde(default, deserialize_with = "de_lenient")]
-    pub right_panel_tab: RightPanelTab,
-    /// Global, not per-overlay — the same call VS Code's
-    /// `diffEditor.renderSideBySide` makes.
-    #[serde(default, deserialize_with = "de_lenient")]
-    pub diff_view: DiffViewMode,
-    /// How the code / diff surface shares the window with the terminal — for a
-    /// tab that has not been told otherwise. The choice itself is per tab, made
-    /// on the document header's context menu; this is the value a fresh tab
-    /// starts from, and therefore the one every untold tab is still reading,
-    /// which is why the menu never writes it.
-    #[serde(default, deserialize_with = "de_lenient")]
-    pub document_layout: DocumentLayout,
-    /// The share of the terminal column — the flex area between the sidebar and
-    /// the right panel — the document column takes when docked. The named
-    /// widths land on a third, a half and two thirds; a drag leaves whatever it
-    /// leaves, held to [`DOCUMENT_RATIO_MIN`]..=[`DOCUMENT_RATIO_MAX`]. Live
-    /// layout narrows it further when the terminal's floor needs the width.
-    #[serde(default = "default_document_ratio")]
-    pub document_ratio: f32,
-    /// The source control panel's history section starts collapsed: a graph
-    /// unfurling the first time someone opens the panel is a worse first
-    /// impression than one they asked for.
-    #[serde(default)]
-    pub scm_graph_expanded: bool,
-    /// Whether the source control panel lists changed files as a directory
-    /// tree rather than one flat run per group. Off by default: the flat list
-    /// is what a handful of changes reads best as, and the tree is for the
-    /// agent run that touched sixty files across a dozen modules.
-    #[serde(default)]
-    pub scm_changes_tree: bool,
-    /// Whether a file opens in the code panel with soft wrap on. Not a
-    /// setting anyone picks up front: it is whatever the status bar's Wrap
-    /// toggle (or `ToggleDocumentWrap`) was last left at, so the next file
-    /// opens the way the last one was being read.
-    #[serde(default)]
-    pub editor_soft_wrap: bool,
-    /// Whether a Markdown file opens rendered rather than as source — the last
-    /// state of the Preview / Edit toggle, remembered the same way as
-    /// [`Self::editor_soft_wrap`]. Files that are not Markdown ignore it.
-    #[serde(default)]
-    pub editor_markdown_preview: bool,
-    /// Whether the code editor starts language servers (rust-analyzer,
-    /// typescript-language-server, …) for the files it opens, for
-    /// diagnostics, completion, hover and go to definition. On by default;
-    /// a language whose server is not installed simply goes without.
-    #[serde(default = "default_true")]
-    pub editor_lsp: bool,
-    /// Whether the code editor marks lines that differ from the file's
-    /// staged (index) version in its gutter. On by default; flipped by the
-    /// `ToggleEditorGitGutter` command and remembered like
-    /// [`Self::editor_soft_wrap`].
-    #[serde(default = "default_true")]
-    pub editor_git_gutter: bool,
-    /// Whether the sidebar files tabs nobody pinned into groups of its own —
-    /// by repository, and by host for an SSH pane. Off, those tabs sit in one
-    /// flat list below the pinned groups, which are the user's and show
-    /// either way.
-    #[serde(default = "default_true")]
-    pub sidebar_auto_grouping: bool,
-    #[serde(default, deserialize_with = "de_lenient")]
     pub notify_on_command_finish: NotifyMode,
-    pub check_for_updates: bool,
-    /// Which release feed update checks follow. Stable by default, so an
-    /// installation only ever ends up on Nightly by asking for it.
-    #[serde(default, deserialize_with = "de_lenient")]
-    pub update_channel: UpdateChannel,
-    /// Whether a found update is fetched and verified before the user asks for
-    /// it. On by default: it turns "spend five minutes downloading" into "press
-    /// restart", which is the whole difference between an update people apply
-    /// and one they postpone forever. Nothing is ever *installed* without an
-    /// explicit choice — the staged package waits in Settings.
-    ///
-    /// Worth turning off on a metered connection: the packages run 25–30 MB and
-    /// a check happens every six hours.
-    #[serde(default)]
-    pub auto_download_updates: bool,
-    /// Whether the local daemon runs the mobile gateway, so phones paired in
-    /// Settings → Mobile can reach this machine's panes. Off by default: it
-    /// opens a UDP port, and a paired phone can type into any pane.
-    #[serde(default)]
-    pub mobile_access: bool,
-    /// Whether the GUI puts the bundled `tty7` CLI on PATH at launch (see
-    /// `core::cli_install`). On by default: the CLI is the agent-facing half of
-    /// this product and is worth nothing sitting unreachable inside the bundle.
-    /// Off is for people who keep their own `tty7` — a `cargo install` build, a
-    /// package manager's copy — and do not want it shadowed.
-    #[serde(default)]
-    pub install_cli_on_path: bool,
     /// GUI-only locale selection. See `SUPPORTED_GUI_LANGUAGES`.
     /// CLI output stays English so agent/script integrations are stable.
     #[serde(default = "default_gui_language")]
     pub gui_language: String,
     #[serde(default = "default_notify_threshold_secs")]
     pub notify_threshold_secs: u64,
-    #[serde(default)]
-    pub restore_session: bool,
     /// When closing a tab or a pane asks first — see [`ConfirmClose`].
     #[serde(default, deserialize_with = "de_lenient")]
     pub confirm_close: ConfirmClose,
-    #[serde(default)]
-    pub show_tray_icon: bool,
     #[serde(default, deserialize_with = "de_lenient")]
     pub bell: BellMode,
     /// Whether tty7 edits the shell prompt itself. On by default: the inline
@@ -391,42 +261,17 @@ pub struct Config {
     #[serde(default)]
     pub copy_join_wrapped: bool,
     pub copy_on_select: bool,
-    /// Optional HTTP/SOCKS proxy for tty7's *own* update checks and release
-    /// downloads, and (HTTP only) the mobile gateway's relay; when set it is
-    /// tried before the system proxy and the environment.
-    /// Programs running in a pane are unaffected — they inherit their proxy
-    /// from their own environment, as in any other terminal.
-    ///
-    /// Normalised by [`Config::sanitize`], so `Some` always means a non-blank
-    /// value. Examples: `http://127.0.0.1:7890`, `socks5://127.0.0.1:1080`.
-    #[serde(default)]
-    pub http_proxy: Option<String>,
     #[serde(default = "default_true")]
     pub smart_select: bool,
     #[serde(default = "default_word_separators")]
     pub word_separators: String,
     #[serde(default, deserialize_with = "de_lenient")]
     pub startup_mode: StartupMode,
-    #[serde(default = "default_true")]
-    pub remember_window_size: bool,
 
     #[serde(default)]
     pub working_directory: WorkingDirectory,
     #[serde(default)]
     pub env: HashMap<String, String>,
-
-    #[serde(default = "default_true")]
-    pub verify_host_keys: bool,
-    #[serde(default)]
-    pub ssh_warn_on_close: bool,
-    /// How often and how lately each shell was opened from the New Tab menu
-    /// or its palette command, keyed by the label the inventory shows it
-    /// under. Orders the menu's short list of shells.
-    #[serde(default)]
-    pub shell_frecency: HashMap<String, ProfileUsage>,
-
-    #[serde(default)]
-    pub command_frecency: HashMap<String, ProfileUsage>,
 
     #[serde(default)]
     pub agent_commands: HashMap<String, String>,
@@ -436,22 +281,6 @@ pub struct Config {
     /// as that agent without an `agent_commands` entry of its own.
     #[serde(default)]
     pub agent_launch: HashMap<String, String>,
-    /// How often and how recently each agent (by slug) was launched or seen
-    /// running — what orders the quick-launch commands and picks the agent
-    /// "New Agent Tab" opens.
-    #[serde(default)]
-    pub agent_frecency: HashMap<String, ProfileUsage>,
-    /// Approved `.tty7/setup` scripts: repo (`worktree::setup::trust_key`) to
-    /// the sha256 of the content approved. A changed script asks again.
-    #[serde(default)]
-    pub worktree_setup_trust: HashMap<String, String>,
-    /// Past agent sessions taken out of the search's Sessions tab, as
-    /// `<agent slug>:<session id>`. Only the listing forgets them; the
-    /// agent's own history is not touched.
-    #[serde(default)]
-    pub hidden_agent_sessions: BTreeSet<String>,
-    #[serde(default = "default_true")]
-    pub restore_agent_sessions: bool,
     /// Give each pane its own shell history instead of one file every pane
     /// appends to and reads back.
     ///
@@ -471,30 +300,6 @@ pub struct Config {
     /// permanent data loss (#537). Cleared only by a load that parses.
     #[serde(skip)]
     pub quarantined: bool,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(default)]
-pub struct ProfileUsage {
-    pub count: u32,
-    pub last_used: u64,
-}
-
-impl ProfileUsage {
-    pub fn score(&self, now: u64) -> f64 {
-        if self.count == 0 {
-            return 0.0;
-        }
-        let age_days = now.saturating_sub(self.last_used) as f64 / 86_400.0;
-        self.count as f64 / (1.0 + age_days / 7.0)
-    }
-}
-
-pub fn unix_now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -554,22 +359,6 @@ impl PromptCursorStyle {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum NewTabPosition {
-    #[default]
-    AfterCurrent,
-    End,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum TabBarPosition {
-    Top,
-    #[default]
-    Left,
-}
-
 /// Native window backdrop material for the Windows GUI. Other platforms retain
 /// the value for config synchronization but do not use it for rendering.
 /// `Auto` keeps the legacy behavior where theme blur decides between blurred
@@ -607,22 +396,6 @@ impl NotifyMode {
             NotifyMode::Always => true,
         }
     }
-}
-
-/// Which release feed this installation follows.
-///
-/// The channel is a property of the installation, not something derived from
-/// the version number. Without it the only thing separating a Nightly from a
-/// Stable is how their versions happen to sort, which is how a Nightly ends up
-/// being walked back onto Stable by an update it never asked for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum UpdateChannel {
-    #[default]
-    Stable,
-    /// Follows the rolling `nightly` prerelease, which is rebuilt from `main`
-    /// every night.
-    Nightly,
 }
 
 /// The modifier that makes the mouse wheel resize the font.
@@ -745,9 +518,7 @@ impl Default for Config {
             font_thicken: true,
             font_size: 15.0,
             line_height: 1.4,
-            ui_font_size: default_ui_font_size(),
             ui_font_family: None,
-            theme: "light".to_string(),
             theme_preset: "light".to_string(),
             theme_follow_system: true,
             theme_preset_light: "light".to_string(),
@@ -756,47 +527,19 @@ impl Default for Config {
             window_opacity: None,
             window_blur: None,
             window_backdrop: WindowBackdrop::default(),
-            dim_inactive_panes: true,
-            auto_hide_titlebar_buttons: false,
             keybindings: HashMap::new(),
             keybinding_preset: default_preset(),
             prefix: default_prefix(),
             shell: None,
-            custom_shells: Vec::new(),
             link_url: true,
-            link_file_open: Some(LinkFileOpen::Internal),
+            link_file_open: Some(LinkFileOpen::System),
             link_file_command: None,
-            ssh_loopback_forward: true,
             cursor_blink: true,
             scrollback_limit: 10_000,
-            new_tab_position: NewTabPosition::AfterCurrent,
-            tab_bar_position: TabBarPosition::Left,
-            sidebar_width: default_sidebar_width(),
-            sidebar_collapsed: false,
-            right_panel_visible: false,
-            right_panel_width: default_right_panel_width(),
-            right_panel_tab: RightPanelTab::Info,
-            diff_view: DiffViewMode::Split,
-            document_layout: DocumentLayout::default(),
-            document_ratio: default_document_ratio(),
-            scm_graph_expanded: false,
-            scm_changes_tree: false,
-            editor_soft_wrap: false,
-            editor_markdown_preview: false,
-            editor_lsp: true,
-            editor_git_gutter: true,
-            sidebar_auto_grouping: true,
             notify_on_command_finish: NotifyMode::Unfocused,
-            check_for_updates: false,
-            mobile_access: false,
-            update_channel: UpdateChannel::default(),
-            auto_download_updates: false,
-            install_cli_on_path: false,
             gui_language: default_gui_language(),
             notify_threshold_secs: default_notify_threshold_secs(),
-            restore_session: false,
             confirm_close: ConfirmClose::WhenBusy,
-            show_tray_icon: false,
             bell: BellMode::Visual,
             prompt_editor: true,
             tab_completion: true,
@@ -813,23 +556,13 @@ impl Default for Config {
             clipboard_trim_trailing_spaces: false,
             copy_join_wrapped: false,
             copy_on_select: false,
-            http_proxy: None,
             smart_select: true,
             word_separators: default_word_separators(),
             startup_mode: StartupMode::Normal,
-            remember_window_size: true,
             working_directory: WorkingDirectory::default(),
             env: HashMap::new(),
-            verify_host_keys: true,
-            ssh_warn_on_close: false,
-            shell_frecency: HashMap::new(),
-            command_frecency: HashMap::new(),
             agent_commands: HashMap::new(),
             agent_launch: HashMap::new(),
-            agent_frecency: HashMap::new(),
-            worktree_setup_trust: HashMap::new(),
-            hidden_agent_sessions: BTreeSet::new(),
-            restore_agent_sessions: true,
             per_pane_history: false,
             quarantined: false,
         }
@@ -905,8 +638,10 @@ impl Config {
                     "failed to read config at {}: {e}; using defaults, writes suppressed",
                     path.display()
                 );
-                let mut cfg = Config::default();
-                cfg.quarantined = true;
+                let cfg = Config {
+                    quarantined: true,
+                    ..Config::default()
+                };
                 return (cfg, LoadOutcome::Unreadable, None);
             }
         };
@@ -926,8 +661,10 @@ impl Config {
                     path.display()
                 );
                 quarantine(path);
-                let mut cfg = Config::default();
-                cfg.quarantined = true;
+                let cfg = Config {
+                    quarantined: true,
+                    ..Config::default()
+                };
                 (cfg, LoadOutcome::Quarantined, None)
             }
         }
@@ -948,13 +685,6 @@ impl Config {
             self.line_height = Config::default().line_height;
         }
         self.line_height = self.line_height.clamp(LINE_HEIGHT_MIN, LINE_HEIGHT_MAX);
-        if !self.ui_font_size.is_finite() || self.ui_font_size <= 0.0 {
-            self.ui_font_size = default_ui_font_size();
-        }
-        // The whole chrome is a multiple of this, so a wild value does not
-        // shrink one label — it makes the window unusable. Keep the range to
-        // sizes the layout still holds together at.
-        self.ui_font_size = self.ui_font_size.clamp(UI_FONT_SIZE_MIN, UI_FONT_SIZE_MAX);
         if let Some(family) = &self.ui_font_family
             && family.trim().is_empty()
         {
@@ -970,43 +700,19 @@ impl Config {
             .window_opacity
             .filter(|o| o.is_finite())
             .map(|o| o.clamp(0.2, 1.0));
-        if !self.sidebar_width.is_finite() || self.sidebar_width <= 0.0 {
-            self.sidebar_width = default_sidebar_width();
-        }
-        self.sidebar_width = self.sidebar_width.clamp(100.0, 2000.0);
-        if !self.right_panel_width.is_finite() || self.right_panel_width <= 0.0 {
-            self.right_panel_width = default_right_panel_width();
-        }
-        self.right_panel_width = self.right_panel_width.clamp(100.0, 2000.0);
-        if !self.document_ratio.is_finite() || self.document_ratio <= 0.0 {
-            self.document_ratio = default_document_ratio();
-        }
-        self.document_ratio = self
-            .document_ratio
-            .clamp(DOCUMENT_RATIO_MIN, DOCUMENT_RATIO_MAX);
         if let Some(command) = &self.link_file_command
             && command.trim().is_empty()
         {
             self.link_file_command = None;
         }
-        // Absent means a config written before file links could open in the
-        // built-in editor. Anyone who had already pointed `link_file_command`
-        // at their own editor asked for that and keeps it; everyone else, who
-        // was silently getting the OS file association, gets the editor. A
-        // fresh `link_file_open` in a `Default` config would have taken the
-        // first group's editor away on upgrade.
+        // Absent means a config written before this key. A command the user
+        // already named keeps that opener; otherwise the file opens with
+        // whatever the OS has it associated with.
         self.link_file_open
             .get_or_insert(match self.link_file_command {
                 Some(_) => LinkFileOpen::Command,
-                None => LinkFileOpen::Internal,
+                None => LinkFileOpen::System,
             });
-        // Normalise here so every reader can take the field as-is instead of
-        // repeating a trim-and-drop-if-blank dance.
-        self.http_proxy = self
-            .http_proxy
-            .take()
-            .map(|proxy| proxy.trim().to_string())
-            .filter(|proxy| !proxy.is_empty());
         if !SUPPORTED_GUI_LANGUAGES.contains(&self.gui_language.as_str()) {
             self.gui_language = default_gui_language();
         }
@@ -1437,125 +1143,30 @@ fn default_prefix() -> String {
     "ctrl-b".to_string()
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RightPanelTab {
-    #[default]
-    Info,
-    /// The source control panel. Renamed from `Changes` in place rather than
-    /// added alongside it: `rename` works in both directions, so a config
-    /// written by this version still says `"changes"` and an older build reads
-    /// it back unchanged.
-    #[serde(rename = "changes", alias = "scm", alias = "git")]
-    Scm,
-    Files,
-    /// Project-wide content search. Added as a tab of its own, which costs a
-    /// rolled-back build one thing: it does not know `"search"`, falls through
-    /// `de_lenient` to `Info`, and opens there. Nothing else is lost.
-    Search,
-    /// The bound GitHub repository's issues and pull requests. Same rollback
-    /// cost as `Search`.
-    #[serde(rename = "github")]
-    GitHub,
-}
-
 /// What opens when a file link in the grid is clicked.
+///
+/// `"internal"` was the built-in editor. That opener is gone, so the name no
+/// longer deserializes: [`de_lenient`] reads it as [`LinkFileOpen::System`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LinkFileOpen {
-    /// tty7's own editor. The default, and the only one of the three that can
-    /// honour a `:line:column` suffix or open a file on a remote host.
-    #[default]
-    Internal,
     /// Whatever the OS has the file associated with.
+    #[default]
     System,
     /// [`Config::link_file_command`], for people who want their own editor.
     Command,
 }
-
-/// How the diff overlay lays a file out. Side-by-side is the default because
-/// that is what everyone already sees.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DiffViewMode {
-    #[default]
-    Split,
-    Unified,
-}
-
-/// The detail panel's resting width: the v4 design's 280px column, which is
-/// what its insets (12px lists, 20px text) and the tab row were drawn against.
-fn default_right_panel_width() -> f32 {
-    280.
-}
-
-/// Where the code / diff surface is drawn.
-///
-/// It used to be one thing — a full-workspace overlay — so there was nothing to
-/// name. Docking it beside the terminal is the default now: opening a file to
-/// read it while an agent talks underneath was the reason the built-in editor
-/// exists, and an overlay covers the agent. `Fill` is that overlay, kept for
-/// anyone who wants the whole window for the file.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DocumentLayout {
-    #[default]
-    Dock,
-    Fill,
-}
-
-fn default_document_ratio() -> f32 {
-    0.5
-}
-
-/// The band `document_ratio` is held to — in the file *and* at the divider.
-///
-/// One shared pair rather than two, for the reason `FONT_SIZE_MIN` and its
-/// stepper are one pair (#550): a GUI that clamps somewhere the file does not
-/// writes a value `sanitize` then moves, and the user finds the thing they
-/// dropped somewhere else on the next launch. The divider clamps in *pixels*
-/// against the terminal's floor as well, which is the tighter limit on a narrow
-/// window; on a wide one this band is, and both ends of it have to be reachable
-/// and keepable.
-pub const DOCUMENT_RATIO_MIN: f32 = 0.2;
-pub const DOCUMENT_RATIO_MAX: f32 = 0.8;
-
-/// The named shares of the terminal column a document column can be snapped to,
-/// in the order the segmented control and the divider's double-click cycle use.
-pub const DOCUMENT_RATIO_THIRD: f32 = 1. / 3.;
-pub const DOCUMENT_RATIO_HALF: f32 = 0.5;
-pub const DOCUMENT_RATIO_TWO_THIRDS: f32 = 2. / 3.;
-pub const DOCUMENT_RATIO_STOPS: [f32; 3] = [
-    DOCUMENT_RATIO_THIRD,
-    DOCUMENT_RATIO_HALF,
-    DOCUMENT_RATIO_TWO_THIRDS,
-];
-
-/// The rem the chrome has always been laid out against — gpui's own default,
-/// which is what `text_sm()` and `text_xs()` resolve 14px and 12px from. Left
-/// alone, the interface looks exactly as it did before the size was settable.
-pub const UI_FONT_SIZE_DEFAULT: f32 = 16.0;
-pub const UI_FONT_SIZE_MIN: f32 = 12.0;
-pub const UI_FONT_SIZE_MAX: f32 = 24.0;
 
 /// The terminal's font-size and line-height bounds, shared by `sanitize` and
 /// the GUI's steppers. The GUI used to keep its own, narrower pair (6–48,
 /// 1.0–2.0), so a value inside the config range but outside the GUI's got
 /// pushed the *wrong way* by a single step — `font_size: 50` shrank to 48 on
 /// "+" — and written back to the file, permanently (#550). One range, defined
-/// where the value is validated, is the `ui_font_size` precedent.
+/// where the value is validated, is what the steppers and the file agree on.
 pub const FONT_SIZE_MIN: f32 = 4.0;
 pub const FONT_SIZE_MAX: f32 = 256.0;
 pub const LINE_HEIGHT_MIN: f32 = 0.5;
 pub const LINE_HEIGHT_MAX: f32 = 4.0;
-
-fn default_ui_font_size() -> f32 {
-    UI_FONT_SIZE_DEFAULT
-}
-
-fn default_sidebar_width() -> f32 {
-    260.0
-}
 
 pub const MAX_SCROLLBACK: usize = 100_000;
 
@@ -1660,32 +1271,6 @@ mod tests {
             })
         );
     }
-
-    #[test]
-    fn profile_usage_score_ranks_frequency_and_recency() {
-        let now = 100_000_000u64;
-        let day = 86_400u64;
-        assert_eq!(ProfileUsage::default().score(now), 0.0);
-        let a = ProfileUsage {
-            count: 10,
-            last_used: now,
-        };
-        let b = ProfileUsage {
-            count: 2,
-            last_used: now,
-        };
-        assert!(a.score(now) > b.score(now));
-        let recent = ProfileUsage {
-            count: 3,
-            last_used: now,
-        };
-        let stale = ProfileUsage {
-            count: 3,
-            last_used: now - 30 * day,
-        };
-        assert!(recent.score(now) > stale.score(now));
-    }
-
     /// A config from before the setting keeps asking exactly what it asked
     /// before, and a value this build does not know falls back to that too
     /// rather than failing the file.
@@ -1715,16 +1300,6 @@ mod tests {
             assert_eq!(back.confirm_close, mode);
         }
     }
-
-    #[test]
-    fn ssh_warn_on_close_round_trips() {
-        let mut cfg = Config::default();
-        assert!(!cfg.ssh_warn_on_close);
-        cfg.ssh_warn_on_close = true;
-        let back: Config = serde_json::from_str(&serde_json::to_string(&cfg).unwrap()).unwrap();
-        assert!(back.ssh_warn_on_close);
-    }
-
     /// The upgrade path, which is the whole reason `link_file_open` is an
     /// `Option`: whichever way a config written before this key existed is
     /// read, it has to keep doing what it did yesterday.
@@ -1747,8 +1322,8 @@ mod tests {
         had_none.sanitize();
         assert_eq!(
             had_none.file_open_mode(),
-            LinkFileOpen::Internal,
-            "everyone else was silently getting the OS file association"
+            LinkFileOpen::System,
+            "a file link opens with the program the OS has it associated with"
         );
 
         // A command that only ever held whitespace is no command at all —
@@ -1756,7 +1331,7 @@ mod tests {
         let mut blank: Config = serde_json::from_str(r#"{"link_file_command":"   "}"#).unwrap();
         blank.sanitize();
         assert_eq!(blank.link_file_command, None);
-        assert_eq!(blank.file_open_mode(), LinkFileOpen::Internal);
+        assert_eq!(blank.file_open_mode(), LinkFileOpen::System);
 
         let mut chosen: Config =
             serde_json::from_str(r#"{"link_file_open":"system","link_file_command":"code"}"#)
@@ -1773,50 +1348,13 @@ mod tests {
         let back: Config = serde_json::from_str(&json).unwrap();
         assert_eq!(back.file_open_mode(), LinkFileOpen::System);
 
-        // Unknown values fall back rather than refusing the whole file.
+        // Unknown values, including the retired built-in editor, fall back
+        // rather than refusing the whole file.
         let garbage: Config = serde_json::from_str(r#"{"link_file_open":"emacs"}"#).unwrap();
-        assert_eq!(garbage.file_open_mode(), LinkFileOpen::Internal);
+        assert_eq!(garbage.file_open_mode(), LinkFileOpen::System);
+        let retired: Config = serde_json::from_str(r#"{"link_file_open":"internal"}"#).unwrap();
+        assert_eq!(retired.file_open_mode(), LinkFileOpen::System);
     }
-
-    #[test]
-    fn sidebar_auto_grouping_defaults_on_and_round_trips() {
-        assert!(Config::default().sidebar_auto_grouping);
-        let off: Config = serde_json::from_str(r#"{"sidebar_auto_grouping":false}"#).unwrap();
-        assert!(!off.sidebar_auto_grouping);
-        let json = serde_json::to_string(&off).unwrap();
-        let back: Config = serde_json::from_str(&json).unwrap();
-        assert!(!back.sidebar_auto_grouping, "persisted");
-    }
-
-    #[test]
-    fn dim_inactive_panes_defaults_on_and_round_trips() {
-        assert!(Config::default().dim_inactive_panes);
-
-        let old: Config = serde_json::from_str(r#"{"font_size": 15.0}"#).unwrap();
-        assert!(old.dim_inactive_panes);
-
-        let off: Config = serde_json::from_str(r#"{"dim_inactive_panes": false}"#).unwrap();
-        assert!(!off.dim_inactive_panes);
-        let json = serde_json::to_string(&off).unwrap();
-        let back: Config = serde_json::from_str(&json).unwrap();
-        assert!(!back.dim_inactive_panes);
-    }
-
-    #[test]
-    fn auto_hide_titlebar_buttons_defaults_off_and_round_trips() {
-        assert!(!Config::default().auto_hide_titlebar_buttons);
-
-        // A file from before the key existed keeps its buttons on screen.
-        let old: Config = serde_json::from_str(r#"{"font_size": 15.0}"#).unwrap();
-        assert!(!old.auto_hide_titlebar_buttons);
-
-        let on: Config = serde_json::from_str(r#"{"auto_hide_titlebar_buttons": true}"#).unwrap();
-        assert!(on.auto_hide_titlebar_buttons);
-        let json = serde_json::to_string(&on).unwrap();
-        let back: Config = serde_json::from_str(&json).unwrap();
-        assert!(back.auto_hide_titlebar_buttons, "persisted");
-    }
-
     #[test]
     fn theme_follow_system_defaults_and_round_trips() {
         assert!(Config::default().theme_follow_system);
@@ -1837,9 +1375,11 @@ mod tests {
         let back: Config = serde_json::from_str(&json).unwrap();
         assert!(!back.theme_follow_system);
 
-        let mut cfg = Config::default();
-        cfg.theme_preset_light = "one_light".to_string();
-        cfg.theme_preset_dark = "dracula".to_string();
+        let cfg = Config {
+            theme_preset_light: "one_light".to_string(),
+            theme_preset_dark: "dracula".to_string(),
+            ..Config::default()
+        };
         let json = serde_json::to_string(&cfg).unwrap();
         let back: Config = serde_json::from_str(&json).unwrap();
         assert!(back.theme_follow_system);
@@ -1928,9 +1468,9 @@ mod tests {
     #[test]
     fn stale_override_keys_are_ignored() {
         let cfg: Config = serde_json::from_str(
-            r##"{"font_size": 20.0, "colors": {"border": "#fff"}, "ansi_colors": {"color1": "#f00"}}"##,
+            r##"{"font_size": 20.0, "colors": {"border": "#fff"}, "ansi_colors": {"color1": "#f00"}, "sidebar_width": 400, "mobile_access": true, "editor_lsp": false, "update_channel": "nightly", "show_tray_icon": true}"##,
         )
-        .expect("stale override keys must be ignored");
+        .expect("retired workbench keys must be ignored");
         assert_eq!(cfg.font_size, 20.0);
         assert_eq!(cfg.theme_preset, "light");
     }
@@ -1967,9 +1507,8 @@ mod tests {
         // makes the steppers and the Ctrl+=/Ctrl+- keys agree with the file
         // (#550).
         //
-        // The numbers themselves are the support surface
-        // `docs/reference/configuration.mdx` publishes, so pin them: narrowing
-        // either side is a documented behaviour change, not a refactor.
+        // The numbers themselves are the supported range, so pin them: narrowing
+        // either side is a behaviour change, not a refactor.
         assert_eq!((FONT_SIZE_MIN, FONT_SIZE_MAX), (4.0, 256.0));
         assert_eq!((LINE_HEIGHT_MIN, LINE_HEIGHT_MAX), (0.5, 4.0));
 
@@ -2010,7 +1549,7 @@ mod tests {
         // Both are inside the range the steppers clamp to, which is the whole
         // point: `50 + 1` and `3.0 - 0.05` are legal, so neither click can be
         // turned around by a clamp.
-        assert!(50.0 + 1.0 <= FONT_SIZE_MAX && 3.0 - 0.05 >= LINE_HEIGHT_MIN);
+        const { assert!(50.0 + 1.0 <= FONT_SIZE_MAX && 3.0 - 0.05 >= LINE_HEIGHT_MIN) };
     }
 
     #[test]
@@ -2025,35 +1564,6 @@ mod tests {
         let mut cfg: Config = serde_json::from_str(r#"{"ui_font_family": "Inter"}"#).unwrap();
         cfg.sanitize();
         assert_eq!(cfg.ui_font_family, Some("Inter".to_string()));
-    }
-
-    #[test]
-    fn a_config_written_before_ui_font_size_existed_keeps_the_chrome_it_had() {
-        // The whole interface is laid out against this, so a missing field
-        // must not resolve to serde's 0.0 — that collapses every window the
-        // user already has, on upgrade, without them touching a setting.
-        let cfg: Config = serde_json::from_str(r#"{"font_size": 15.0}"#).unwrap();
-        assert_eq!(cfg.ui_font_size, UI_FONT_SIZE_DEFAULT);
-    }
-
-    #[test]
-    fn sanitize_holds_ui_font_size_to_sizes_the_layout_survives() {
-        let sanitized = |ui_font_size: f32| {
-            let mut cfg = Config {
-                ui_font_size,
-                ..Config::default()
-            };
-            cfg.sanitize();
-            cfg.ui_font_size
-        };
-
-        assert_eq!(sanitized(0.0), UI_FONT_SIZE_DEFAULT);
-        assert_eq!(sanitized(f32::NAN), UI_FONT_SIZE_DEFAULT);
-        assert_eq!(sanitized(-3.0), UI_FONT_SIZE_DEFAULT);
-        assert_eq!(sanitized(1000.0), UI_FONT_SIZE_MAX);
-        assert_eq!(sanitized(2.0), UI_FONT_SIZE_MIN);
-        // A size the user actually picked comes back untouched.
-        assert_eq!(sanitized(18.0), 18.0);
     }
 
     struct TestDir(std::path::PathBuf);
@@ -2139,25 +1649,24 @@ mod tests {
             .collect();
         assert!(leftover.is_empty(), "temp file should be renamed away");
     }
-
     #[test]
     fn behavior_enums_fall_back_leniently_on_bad_values() {
         let cfg: Config = serde_json::from_str(
-            r#"{"font_size": 20.0, "new_tab_position": "middle", "notify_on_command_finish": "sometimes", "tab_bar_position": "diagonal"}"#,
+            r#"{"font_size": 20.0, "startup_mode": "middle", "notify_on_command_finish": "sometimes", "bell": "loud"}"#,
         )
         .expect("a bad enum value must not fail the whole parse");
         assert_eq!(cfg.font_size, 20.0);
-        assert_eq!(cfg.new_tab_position, NewTabPosition::AfterCurrent);
+        assert_eq!(cfg.startup_mode, StartupMode::Normal);
         assert_eq!(cfg.notify_on_command_finish, NotifyMode::Unfocused);
-        assert_eq!(cfg.tab_bar_position, TabBarPosition::Left);
+        assert_eq!(cfg.bell, BellMode::Visual);
 
         let cfg: Config = serde_json::from_str(
-            r#"{"new_tab_position": "end", "notify_on_command_finish": "always", "tab_bar_position": "top"}"#,
+            r#"{"startup_mode": "fullscreen", "notify_on_command_finish": "always", "bell": "audible"}"#,
         )
         .unwrap();
-        assert_eq!(cfg.new_tab_position, NewTabPosition::End);
+        assert_eq!(cfg.startup_mode, StartupMode::Fullscreen);
         assert_eq!(cfg.notify_on_command_finish, NotifyMode::Always);
-        assert_eq!(cfg.tab_bar_position, TabBarPosition::Top);
+        assert_eq!(cfg.bell, BellMode::Audible);
     }
 
     #[test]
@@ -2194,38 +1703,6 @@ mod tests {
         assert_eq!(clamp(100.0), 10.0);
         assert_eq!(clamp(0.01), 0.1);
     }
-
-    /// A width the user dropped the divider at has to come back where they left
-    /// it. `sanitize` holds `document_ratio` to a band; the divider clamps to
-    /// the same one, through these constants, so nothing it can write is
-    /// something the next launch moves. The regression this pins: the drag used
-    /// to clamp in pixels alone, so a column pushed against either edge of a
-    /// wide window was saved outside the band and reopened hundreds of points
-    /// from where it was dropped.
-    #[test]
-    fn sanitize_holds_document_ratio_to_the_band_the_divider_clamps_to() {
-        let clamp = |r: f32| {
-            let mut cfg = Config {
-                document_ratio: r,
-                ..Config::default()
-            };
-            cfg.sanitize();
-            cfg.document_ratio
-        };
-        // Both edges are legal, so a divider dropped on one has somewhere to
-        // stop rather than a value that keeps being rewritten.
-        assert_eq!(clamp(DOCUMENT_RATIO_MIN), DOCUMENT_RATIO_MIN);
-        assert_eq!(clamp(DOCUMENT_RATIO_MAX), DOCUMENT_RATIO_MAX);
-        for stop in DOCUMENT_RATIO_STOPS {
-            assert_eq!(clamp(stop), stop, "a named width must survive the file");
-        }
-        assert_eq!(clamp(0.05), DOCUMENT_RATIO_MIN);
-        assert_eq!(clamp(0.95), DOCUMENT_RATIO_MAX);
-        assert_eq!(clamp(0.0), default_document_ratio());
-        assert_eq!(clamp(-1.0), default_document_ratio());
-        assert_eq!(clamp(f32::NAN), default_document_ratio());
-    }
-
     #[test]
     fn sanitize_clamps_window_opacity_override() {
         let clamp = |o: Option<f32>| {
@@ -2280,24 +1757,18 @@ mod tests {
         assert_eq!(clamp(10_000), 10_000);
         assert_eq!(clamp(usize::MAX), MAX_SCROLLBACK);
     }
-
     #[test]
     fn new_terminal_prefs_default_and_parse_leniently() {
         let cfg = Config::default();
-        assert!(!cfg.restore_session);
-        assert!(!cfg.show_tray_icon);
-        assert!(!cfg.install_cli_on_path);
-        assert!(!cfg.auto_download_updates);
-        assert!(!cfg.check_for_updates);
         assert!(cfg.mouse_reporting);
         assert!(cfg.prompt_editor);
         assert!(cfg.tab_completion);
         assert!(cfg.history_search);
         assert_eq!(cfg.notify_threshold_secs, 10);
         assert_eq!(cfg.bell, BellMode::Visual);
+        assert_eq!(cfg.startup_mode, StartupMode::Normal);
 
         let cfg: Config = serde_json::from_str(r#"{"font_size": 15.0}"#).unwrap();
-        assert!(!cfg.restore_session);
         assert!(cfg.mouse_reporting);
         assert!(cfg.prompt_editor);
         assert!(cfg.tab_completion);
@@ -2312,11 +1783,8 @@ mod tests {
         let cfg: Config = serde_json::from_str(r#"{"prompt_editor": false}"#).unwrap();
         assert!(!cfg.prompt_editor);
 
-        let cfg: Config = serde_json::from_str(
-            r#"{"restore_session": false, "mouse_reporting": false, "bell": "audible"}"#,
-        )
-        .unwrap();
-        assert!(!cfg.restore_session);
+        let cfg: Config =
+            serde_json::from_str(r#"{"mouse_reporting": false, "bell": "audible"}"#).unwrap();
         assert!(!cfg.mouse_reporting);
         assert_eq!(cfg.bell, BellMode::Audible);
 
@@ -2369,26 +1837,6 @@ mod tests {
         assert_eq!(clamp(10), 10);
         assert_eq!(clamp(100_000), 3600);
     }
-
-    #[test]
-    fn sanitize_normalizes_blank_http_proxy_to_none() {
-        let normalize = |proxy: Option<&str>| {
-            let mut cfg = Config {
-                http_proxy: proxy.map(String::from),
-                ..Config::default()
-            };
-            cfg.sanitize();
-            cfg.http_proxy
-        };
-        assert_eq!(normalize(None), None);
-        assert_eq!(normalize(Some("")), None);
-        assert_eq!(normalize(Some("   ")), None);
-        assert_eq!(
-            normalize(Some("  http://127.0.0.1:7890 ")),
-            Some("http://127.0.0.1:7890".to_string())
-        );
-    }
-
     #[test]
     fn gui_language_defaults_to_english_and_rejects_unsupported_values() {
         let cfg = Config::default();
@@ -2588,7 +2036,10 @@ mod tests {
 
         let loaded = Config::load();
         assert_eq!(loaded.font_size, 21.0);
-        assert!(!loaded.restore_session);
+        assert!(
+            loaded.prompt_editor,
+            "a retired key beside the marker must not disturb the rest"
+        );
 
         let _ = std::fs::remove_file(&path);
     }
@@ -2761,26 +2212,12 @@ mod tests {
     }
 
     #[test]
-    fn a_mistyped_custom_shell_does_not_cost_the_user_the_rest_of_the_config() {
-        let cfg = Config::default();
-        assert!(cfg.custom_shells.is_empty());
-
-        let cfg: Config =
-            serde_json::from_str(r#"{"font_size": 15.0, "custom_shells": {"Ubuntu": "wsl.exe"}}"#)
-                .expect("a bad custom_shells must not fail the whole config parse");
-        assert!(cfg.custom_shells.is_empty());
-        // The point of the leniency: `Config::load` hands back defaults for a
-        // config that fails to parse, and the next settings write persists them
-        // over the file. Everything the user wrote beside the typo survives.
-        assert_eq!(cfg.font_size, 15.0);
-
+    fn a_retired_custom_shells_key_does_not_fail_the_rest_of_the_config() {
         let cfg: Config = serde_json::from_str(
-            r#"{"custom_shells":[{"label":"Ubuntu","program":"wsl.exe","args":["-d","Ubuntu"]}]}"#,
+            r#"{"font_size": 15.0, "custom_shells":[{"label":"Ubuntu","program":"wsl.exe"}]}"#,
         )
-        .expect("a well-formed list parses");
-        assert_eq!(cfg.custom_shells.len(), 1);
-        assert_eq!(cfg.custom_shells[0].program, "wsl.exe");
-        assert_eq!(cfg.custom_shells[0].args, ["-d", "Ubuntu"]);
+        .expect("an unknown key must not fail the whole config parse");
+        assert_eq!(cfg.font_size, 15.0);
     }
 
     #[test]

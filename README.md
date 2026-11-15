@@ -1,154 +1,72 @@
-<div align="center">
+# ntty7
 
-<img src="assets/app-icon.svg" alt="tty7" width="88" height="88" />
+[中文](README.zh-CN.md)
 
-### tty7
-
-**A terminal workbench: persistent sessions, remote work, agents.**
-
-<sub>Pure Rust · GPU rendering on Zed's gpui · VT core from Alacritty</sub>
-
-<br />
-
-[![CI](https://github.com/l0ng-ai/tty7/actions/workflows/ci.yml/badge.svg)](https://github.com/l0ng-ai/tty7/actions/workflows/ci.yml)
-[![Version](https://img.shields.io/github/v/release/l0ng-ai/tty7?label=version&color=3FDD8C)](https://github.com/l0ng-ai/tty7/releases)
-[![Platforms](https://img.shields.io/badge/platforms-macOS%20%C2%B7%20Windows%20%C2%B7%20Linux-blue)](https://github.com/l0ng-ai/tty7/releases)
-[![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
-[![Discord](https://img.shields.io/badge/Discord-join%20chat-5865F2?logo=discord&logoColor=white)](https://discord.gg/s3dethqz2V)
-
-<sub>English · [简体中文](README.zh-CN.md)</sub>
-
-<br />
-
-<a href="assets/tour.mp4"><img src="assets/tour.webp" alt="One-minute tour of tty7: agents across repos, one agent driving another through the CLI, the prompt editor, diffs, dragging panes, and sessions that survive quitting the app" width="900" /></a>
-
-<sub>▶ <a href="assets/tour.mp4">Watch in full quality</a></sub>
-
-</div>
-
-## Why
-
-A background server owns your shells and panes — not the window. Everything
-below follows from that.
-
-- **Performance** — ~2× the throughput of Alacritty, Ghostty, or Kitty ([benchmarks](#benchmarks))
-- **Persistent sessions** — quit the app and your shells keep running; after a reboot, layout, screen, and supported agent conversations come back. No tmux
-- **Agent-aware** — Claude Code, Codex & co.: status, notifications, and git context for every repo at once
-- **Scriptable by agents** — one agent opens a pane for another, hands off a task, waits, and reads the result, with or without the GUI running
-- **Editor-grade input** — suggestions, completion, highlighting, history search, with no plugin to install
-- **Remote development** — files, repos, panes, and git data stay on the remote machine, over a native SSH stack
-
-## Install
-
-Native builds for macOS, Windows, and Linux on [**Releases**](https://github.com/l0ng-ai/tty7/releases):
-
-| | | |
-|---|---|---|
-| **macOS** | `…-macos-arm64.dmg` · `…-x86_64.dmg` | drag into Applications |
-| **Windows** | `…-setup.exe` · portable `….zip` | |
-| **Linux** | `…-x86_64.AppImage` | `chmod +x` and run — X11/Wayland libraries bundled |
+**ntty7** — minimal cross-platform GPU terminal (macOS · Windows · Linux). One process, one window. No tabs, no splits, no daemon.
 
 ## What's inside
 
-| | |
-|---|---|
-| **Agent-aware** | per-pane detection (28 CLIs) · status dot · notifications · branch + diff · tray icon when input is needed · resume after reboot · reopen any past session from Search Everywhere · one-key launch · tab sidebar grouped by repository, with pinned groups |
-| **CLI + Skills** | bundled `tty7` CLI · [agent skill](skills/tty7/SKILL.md) · `run` streams a command and exits with its code · `split` · `send` · `wait --until free` · `capture` |
-| **Editor-grade input** | ghost suggestions from history · explained tab completion · syntax highlighting · multi-line editing · click places the caret · <kbd>⌃ R</kbd> fuzzy history |
-| **Window** | tabs & splits · <kbd>⌘ P</kbd> Search Everywhere · <kbd>⌘ F</kbd> scrollback search · hibernate a tab to free its memory · IME |
-| **Side panel** | <kbd>⌘ J</kbd> · process tree and listening ports · file tree · changes and diffs · find in files · GitHub issues and pull requests, read-only, signed in through `gh` |
-| **Shell integration** | injected when a pane starts, nothing to install · prompt marks · working directory · exit codes · command-finished notifications · zsh, bash, fish, PowerShell, WSL, remote panes |
-| **Remote workspaces** | remote files, repos, changes, diffs, worktrees, tabs, and panes · reconnect from any client and continue where you left off |
-| **SSH** | native russh stack: profiles with keychain secrets · SFTP panel · port forwarding · jump hosts · one-time, unprivileged `tty7-server` install |
+- GPU rendering on [gpui](https://github.com/zed-industries/zed)
+- VT core from [`alacritty_terminal`](https://github.com/alacritty/alacritty)
+- The shell runs in-process through [portable-pty](https://github.com/wezterm/wezterm), with the Windows ConPTY helper bundled in
+- An inline prompt editor, tab completion, and fuzzy history search that step aside for vi-mode
+- Kitty graphics
+- Themes, transparency, and window blur
+- Light and dark presets that follow the system appearance
 
-## Supported agents
+Deliberately absent: tabs, splits, sidebars, session restore, and a background server.
 
-**Detection** is free: brand avatar, branch + diff, tab title.
-**Status** takes one click under Settings → Integrations to install that agent's hook,
-and brings the status dot, notifications, the tray icon, `tty7 wait`, and resume
-after a reboot. **Fork** needs both — the agent's own fork command, and the hook
-that tells tty7 which session to fork. **Past sessions** are read from the agent's
-own history files and listed in Search Everywhere, where <kbd>⏎</kbd> resumes one.
+## Build
 
-<details>
-<summary>The full support matrix, all twenty-eight</summary>
+macOS and Windows:
 
-| Agent | Detected | Status · resume | Fork | Past sessions |
-|---|:-:|:-:|:-:|:-:|
-| **Claude Code** | ✓ | ✓ | ✓ | ✓ |
-| **Codex** | ✓ | ✓ | ✓ | ✓ |
-| **TraeCode** | ✓ | ✓ | ✓ |  |
-| **Grok** | ✓ | ✓ | ✓ |  |
-| **OpenCode** | ✓ | ✓ | ✓ | ✓ |
-| **Oh My Pi** | ✓ | ✓ | ✓ | ✓ |
-| **Prime Agent** | ✓ | ✓ | ✓ |  |
-| **Droid** | ✓ | ✓ | ✓ | ✓ |
-| **Qwen Code** | ✓ | ✓ | ✓ | ✓ |
-| **Goose** | ✓ | ✓ | ✓ |  |
-| **Qoder CLI** | ✓ | ✓ | ✓ | ✓ |
-| **Qoder CN CLI** | ✓ | ✓ | ✓ | ✓ |
-| **CodeBuddy** | ✓ | ✓ | ✓ | ✓ |
-| **Gemini** | ✓ | ✓ | | ✓ |
-| **Copilot** | ✓ | ✓ | | ✓ |
-| **Kimi Code** | ✓ | ✓ | | ✓ |
-| **Pi** | ✓ | ✓ | | ✓ |
-| **Crush** | ✓ | ✓ | |  |
-| **Antigravity** | ✓ | ✓ | |  |
-| **Cursor** | ✓ | ✓ | | ✓ |
-| **Empryo** | ✓ | ✓ | |  |
-| **Muse Code** | ✓ | ✓ | |  |
-| **jcode** | ✓ | ✓ | |  |
-| Aider | ✓ | | |  |
-| Amp | ✓ | | |  |
-| Auggie | ✓ | | |  |
-| Hermes | ✓ | | |  |
-| Vibe | ✓ | | |  |
-
-</details>
-
-None of them are wrapped or proxied — the agent you start is the agent you get,
-in a normal PTY, with its own interface. An agent launched through a wrapper
-script can be mapped to one by name with `agent_commands` in `config.json`.
-Every agent on your `PATH` is also a row in Search Everywhere (**Agent: Claude Code**, …)
-that opens it in a new tab, and the New Tab menu names the ones you have actually
-run. `agent_launch` sets the command line it starts with.
-
-## Documentation
-
-Full documentation lives in [**`docs/`**](docs/) —
-[keyboard shortcuts](docs/reference/keyboard-shortcuts.mdx) ·
-[config.json](docs/reference/configuration.mdx) ·
-[CLI reference](docs/cli/reference.mdx). The agent-facing CLI interface is also
-documented in [skills/tty7/SKILL.md](skills/tty7/SKILL.md).
-
-Install the skill with:
-
-```sh
-npx skills add l0ng-ai/tty7    # install
-npx skills update tty7         # update later
+```bash
+cargo build --release
 ```
 
-## Benchmarks
+The binary is `target/release/ntty7` (`ntty7.exe` on Windows).
 
-Same machine, same day, same 155×40 grid — Apple M1 Pro, macOS 26.3.1,
-five-run averages (2026-07-04):
+Linux needs the GPU toolkit first:
 
-| | **tty7** | Alacritty | Ghostty | Kitty |
-|---|---:|---:|---:|---:|
-| Plaintext I/O — 11 MB `cat` <sub>(lower = better)</sub> | **95 ms** | 239 ms | 179 ms | 185 ms |
-| [DOOM-fire](https://github.com/const-void/DOOM-fire-zig) frame rate <sub>(higher = better)</sub> | **888 fps** | 485 fps | 552 fps | 617 fps |
-| Cold-launch memory | 116 MB¹ | 105 MB | 128 MB | 130 MB |
+```bash
+sudo apt-get update
+sudo apt-get install -y pkg-config cmake clang libxkbcommon-dev \
+  libxkbcommon-x11-dev libfontconfig1-dev libfreetype6-dev \
+  libwayland-dev libx11-dev libxcb1-dev libzstd-dev
+cargo build --release
+```
 
-<sub>¹ GUI 105 MB + the persistent server 11 MB.</sub>
+## Configuration
 
-Methodology and one-command reproduction: [`scripts/bench/`](scripts/bench/README.md).
+Settings live in `~/.config/ntty7/config.json` (`%APPDATA%\ntty7\config.json` on Windows). `⌘,` / `Ctrl+,` opens that file. `NTTY7_CONFIG_DIR` overrides the directory.
 
----
+Keys the app does not know are ignored, so a copied tty7 `config.json` still loads.
 
-<div align="center">
-<sub>
+Custom themes are `themes/*.yaml` or `themes/*.itermcolors` next to `config.json`.
 
-Built on [gpui](https://github.com/zed-industries/zed) and [`alacritty_terminal`](https://github.com/zed-industries/alacritty) · [Apache-2.0](LICENSE) · [Discord](https://discord.gg/s3dethqz2V) · [Changelog](CHANGELOG.md)
+## Keyboard
 
-</sub>
-</div>
+`secondary` is `⌘` on macOS and `Ctrl` elsewhere.
+
+| Action | macOS | Windows / Linux |
+| --- | --- | --- |
+| New window | ⌘N | Ctrl+Shift+N |
+| Close window | ⌘W | Ctrl+Shift+W |
+| Copy | ⌘C | Ctrl+Shift+C |
+| Paste | ⌘V | Ctrl+Shift+V |
+| Find | ⌘F | Ctrl+Shift+F |
+| Find next / previous | ⌘G / ⌘⇧G | F3 / Shift+F3 |
+| Clear scrollback | ⌘K | Ctrl+Shift+K |
+| Larger / smaller font | ⌘= / ⌘- | Ctrl+= / Ctrl+- |
+| Reset font | ⌘0 | Ctrl+0 |
+| Newline in the prompt editor | Shift+Enter | Shift+Enter |
+| Toggle the composer | ⌘I | Ctrl+Shift+I |
+| Full screen | ⌘⌃F | F11 |
+| Open config | ⌘, | Ctrl+, |
+| Quit | ⌘Q | Ctrl+Shift+Q |
+
+On macOS, copy and paste are the system menu actions. On Windows and Linux, Ctrl+V pastes when the terminal is not on the alternate screen.
+
+## License
+
+[Apache-2.0](LICENSE). ntty7 descends from [tty7](https://github.com/l0ng-ai/tty7). The window is Zed's gpui; the VT parser is `alacritty_terminal`.

@@ -24,10 +24,12 @@ impl LoopbackUrl {
         )
     }
 
+    #[cfg(test)]
     pub fn forwarded_url(&self, local_port: u16) -> String {
         format!("{}://127.0.0.1:{}{}", self.scheme, local_port, self.suffix)
     }
 
+    #[cfg(test)]
     pub fn forward_host(&self) -> &'static str {
         self.host.forward_host()
     }
@@ -42,6 +44,7 @@ impl LoopbackHost {
         }
     }
 
+    #[cfg(test)]
     fn forward_host(self) -> &'static str {
         match self {
             LoopbackHost::Localhost => "localhost",
@@ -68,10 +71,9 @@ pub(super) fn parse_loopback_url(input: &str) -> Option<LoopbackUrl> {
         (LoopbackHost::Ipv6, rest)
     } else if let Some(rest) = strip_prefix_ignore_ascii_case(rest, "localhost") {
         (LoopbackHost::Localhost, rest)
-    } else if let Some(rest) = rest.strip_prefix("127.0.0.1") {
-        (LoopbackHost::Ipv4, rest)
     } else {
-        return None;
+        let rest = rest.strip_prefix("127.0.0.1")?;
+        (LoopbackHost::Ipv4, rest)
     };
 
     let after_colon = after_host.strip_prefix(':')?;

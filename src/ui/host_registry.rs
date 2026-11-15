@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use gpui::{App, Global};
 use tty7_core::host::local::LocalHost;
 
-pub use tty7_core::host::{Host, HostId, SharedHost};
+pub use tty7_core::host::{HostId, SharedHost};
 
 pub struct HostRegistry {
     hosts: HashMap<HostId, SharedHost>,
@@ -20,46 +20,11 @@ impl Default for HostRegistry {
 }
 
 impl HostRegistry {
-    pub fn get(cx: &mut App, id: HostId) -> Option<SharedHost> {
-        cx.default_global::<HostRegistry>().hosts.get(&id).cloned()
-    }
-
     pub fn lookup(cx: &App, id: HostId) -> Option<SharedHost> {
         match cx.try_global::<HostRegistry>() {
             Some(reg) => reg.hosts.get(&id).cloned(),
             None => id.is_local().then(LocalHost::shared),
         }
-    }
-
-    pub fn local(cx: &mut App) -> SharedHost {
-        HostRegistry::get(cx, HostId::LOCAL).expect("the local host is always registered")
-    }
-
-    pub fn insert(cx: &mut App, host: SharedHost) -> Option<SharedHost> {
-        let id = host.id();
-        cx.default_global::<HostRegistry>().hosts.insert(id, host)
-    }
-
-    pub fn remove(cx: &mut App, id: HostId) -> Option<SharedHost> {
-        if id.is_local() {
-            return None;
-        }
-        cx.default_global::<HostRegistry>().hosts.remove(&id)
-    }
-
-    pub fn ids(cx: &mut App) -> Vec<HostId> {
-        let mut ids: Vec<HostId> = cx
-            .default_global::<HostRegistry>()
-            .hosts
-            .keys()
-            .copied()
-            .collect();
-        ids.sort_unstable();
-        ids
-    }
-
-    pub fn len(cx: &mut App) -> usize {
-        cx.default_global::<HostRegistry>().hosts.len()
     }
 }
 
@@ -84,6 +49,6 @@ mod tests {
 
         assert!(reg.hosts.remove(&id).is_some());
         assert!(reg.hosts.contains_key(&HostId::LOCAL));
-        assert!(reg.hosts.get(&id).is_none());
+        assert!(!reg.hosts.contains_key(&id));
     }
 }

@@ -1,8 +1,6 @@
 pub mod assets;
 pub mod dialog;
-#[allow(dead_code)]
 pub mod host_ops;
-#[allow(dead_code)]
 pub mod host_registry;
 pub mod i18n;
 pub mod keymap;

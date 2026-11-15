@@ -1443,10 +1443,10 @@ mod tests {
             // the A mark) are separate writes: breaking the moment the mark
             // arrives can sample the transcript before the report does. Hold
             // the pty open briefly so the cycle's tail lands.
-            if let Some(at) = seen_fail {
-                if at.elapsed() >= std::time::Duration::from_millis(500) {
-                    break;
-                }
+            if let Some(at) = seen_fail
+                && at.elapsed() >= std::time::Duration::from_millis(500)
+            {
+                break;
             }
         }
         // Reap before asserting: a panic here would otherwise leave the shell
@@ -2452,8 +2452,10 @@ mod tests {
             }
         }
         let units: Vec<u16> = bytes
-            .chunks_exact(2)
-            .map(|p| u16::from_le_bytes([p[0], p[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|p| u16::from_le_bytes(*p))
             .collect();
         String::from_utf16(&units).expect("valid UTF-16LE")
     }

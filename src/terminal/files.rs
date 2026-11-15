@@ -37,16 +37,12 @@ impl IndexedFile {
 #[derive(Debug, Default)]
 pub(crate) struct FileIndex {
     pub files: Vec<IndexedFile>,
-    #[allow(dead_code)]
-    pub capped: bool,
 }
 
 #[derive(Clone, Debug, Default)]
 pub(crate) enum FileList {
     #[default]
     NoRoots,
-    #[allow(dead_code)]
-    Indexing,
     Failed,
     Ready(Arc<FileIndex>),
 }
@@ -66,7 +62,7 @@ pub(crate) fn project_roots(resolved: Vec<PathBuf>, home: Option<&Path>) -> Vec<
     roots
 }
 
-pub(crate) fn build_index(roots: &[PathBuf], files: Vec<PathBuf>, capped: bool) -> FileIndex {
+pub(crate) fn build_index(roots: &[PathBuf], files: Vec<PathBuf>) -> FileIndex {
     let many = roots.len() > 1;
     let files = files
         .into_iter()
@@ -106,7 +102,7 @@ pub(crate) fn build_index(roots: &[PathBuf], files: Vec<PathBuf>, capped: bool) 
             })
         })
         .collect();
-    FileIndex { files, capped }
+    FileIndex { files }
 }
 
 fn is_subsequence(needle: &[char], hay: &str) -> bool {
@@ -169,13 +165,12 @@ pub(crate) fn walk(h: &dyn Host, cwds: &[PathBuf], home: Option<&Path>) -> FileL
     }
     match h.search(&roots, "", INDEX_LIMIT, INDEX_MAX_DIRS, false) {
         Ok(hits) => {
-            let capped = hits.len() >= INDEX_LIMIT;
             let files = hits
                 .into_iter()
                 .filter(|hit| !hit.is_dir)
                 .map(|hit| hit.path)
                 .collect();
-            FileList::Ready(Arc::new(build_index(&roots, files, capped)))
+            FileList::Ready(Arc::new(build_index(&roots, files)))
         }
         Err(e) => {
             log::warn!("file completion: walking {roots:?}: {e}");

@@ -1416,6 +1416,7 @@ fn segment_has_room_after(row: &[RenderCell], start: usize, cells: usize, icon: 
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn paint_glyphs(
     window: &mut Window,
     cx: &mut App,
@@ -1748,6 +1749,7 @@ fn preedit_has_ink(marked: &str) -> bool {
         .any(|c| !c.is_whitespace() && !c.is_control() && c.width().unwrap_or(0) > 0)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn paint_marked(
     window: &mut Window,
     cx: &mut App,
@@ -1837,6 +1839,7 @@ impl TerminalElement {
         (terminal.at_prompt() && !terminal.shell_vi_mode()).then_some(shape)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn build_grid(
         &self,
         colors: &PaintColors,
@@ -4319,19 +4322,21 @@ mod tests {
             b: 19. / 255.,
             a: 1.,
         };
-        let mut cell = RenderCell::default();
-        cell.c = 'x';
-        cell.fg = to_hsla(Rgb {
-            r: 218,
-            g: 98,
-            b: 125,
-        });
-        cell.bg = to_hsla(Rgb {
-            r: 154,
-            g: 52,
-            b: 142,
-        });
-        cell.draw_bg = true;
+        let cell = RenderCell {
+            c: 'x',
+            fg: to_hsla(Rgb {
+                r: 218,
+                g: 98,
+                b: 125,
+            }),
+            bg: to_hsla(Rgb {
+                r: 154,
+                g: 52,
+                b: 142,
+            }),
+            draw_bg: true,
+            ..RenderCell::default()
+        };
 
         let dimmed = dim_cell(cell, 0.55, under);
         assert_eq!(dimmed.c, 'x', "the character itself survives");
@@ -4345,13 +4350,16 @@ mod tests {
         assert_eq!(fg.a, 1.0, "opaque cell colours stay opaque");
 
         // A DIM-flagged cell keeps its reduced alpha through the blend.
-        let mut dim_flag = RenderCell::default();
-        dim_flag.fg = to_hsla(Rgb {
+        let mut fg = to_hsla(Rgb {
             r: 218,
             g: 98,
             b: 125,
         });
-        dim_flag.fg.a = DIM_OPACITY;
+        fg.a = DIM_OPACITY;
+        let dim_flag = RenderCell {
+            fg,
+            ..RenderCell::default()
+        };
         let dimmed_flag = dim_cell(dim_flag, 0.55, under);
         assert!(
             (dimmed_flag.fg.a - DIM_OPACITY).abs() < 1e-3,
