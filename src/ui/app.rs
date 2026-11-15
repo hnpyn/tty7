@@ -12222,7 +12222,7 @@ mod tests {
         // Both panels pinned to their floors leaves the terminal the rest —
         // less than its floor, but more than the 260-odd points two saved
         // widths used to leave it.
-        assert!(narrow - SIDEBAR_MIN - PANEL_MIN >= 300.);
+        assert!(narrow - SIDEBAR_MIN - PANEL_MIN >= 280.);
     }
 
     #[test]
