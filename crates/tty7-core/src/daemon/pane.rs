@@ -1956,9 +1956,16 @@ fn scan_chunk<'a>(
 /// by another syscall. The continuation never sets `O_NONBLOCK`. `dup`
 /// shares the open file description with [`PtyWriter`], and a non-blocking
 /// master would make `write_all` return `EAGAIN` when the input buffer is
-/// full. The drain `poll`s first — `XOFF` (`TS_TTSTOP`) leaves
-/// `TIOCOUTQ > 0` while `read` blocks until `Ctrl-Q` — and then reads at
-/// most the queued count. An empty or stopped queue never starts a `read`.
+/// full. The drain `poll`s with a zero timeout and, while `POLLIN` is set,
+/// reads another packet. `XOFF` (`TS_TTSTOP`) already clears `POLLIN` — a
+/// follow-up `read` would block until `Ctrl-Q` — so a stopped queue never
+/// starts one.
+///
+/// Darwin's `TIOCOUTQ` is the wrong size for that packet. A saturated master
+/// holds one 1024-byte clist block, `FIONREAD` stays 0 for it, and the ioctl
+/// itself once per block made a flooded `cat` take about twice as long. A
+/// continuation asks for at most that block. Asking for the rest of a
+/// 256 KiB buffer instead makes `ONLCR` occasionally emit a second CR.
 struct BurstRead {
     inner: Box<dyn Read + Send>,
     poll_fd: Option<i32>,
@@ -2007,22 +2014,12 @@ fn drain_queued(
     buf: &mut [u8],
     mut filled: usize,
 ) -> std::io::Result<usize> {
-    while filled < buf.len() {
-        // `poll` before the queue count. Flow control (`Ctrl-S` /
-        // `tcflow(TCOOFF)`) keeps `TIOCOUTQ` above zero while `read` blocks
-        // until `Ctrl-Q`; `POLLIN` is clear in that state.
-        if !pty_readable(fd) {
-            break;
-        }
-        let avail = queued_pty_output(fd).unwrap_or(0);
-        if avail == 0 {
-            break;
-        }
-        let end = filled.saturating_add(avail).min(buf.len());
-        if end == filled {
-            break;
-        }
-        match inner.read(&mut buf[filled..end]) {
+    // `POLLIN` is the only gate. Flow control (`Ctrl-S` / `tcflow(TCOOFF)`)
+    // clears it while `TIOCOUTQ` stays positive, and a zero-timeout `poll`
+    // does not consume the byte a later `read` has to return.
+    while filled < buf.len() && pty_readable(fd) {
+        let want = drain_read_len(buf.len() - filled);
+        match inner.read(&mut buf[filled..filled + want]) {
             Ok(0) => break,
             Ok(n) => filled += n,
             Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -2031,6 +2028,34 @@ fn drain_queued(
         }
     }
     Ok(filled)
+}
+
+/// Bytes the next continuation may ask the kernel for.
+///
+/// On Darwin that is one clist block. A larger request is not faster — the
+/// master never returns more than the block — and it is the request that
+/// makes `ONLCR` insert an extra CR. Other kernels will return a big buffer
+/// in one `read`, so the cap would only add syscalls.
+#[cfg(unix)]
+fn drain_read_len(remaining: usize) -> usize {
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "tvos",
+        target_os = "watchos"
+    ))]
+    {
+        remaining.min(1024)
+    }
+    #[cfg(not(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "tvos",
+        target_os = "watchos"
+    )))]
+    {
+        remaining
+    }
 }
 
 /// `POLLIN` with a zero timeout. False when the master is `XOFF`'d: the
@@ -2054,10 +2079,11 @@ fn pty_readable(fd: i32) -> bool {
     }
 }
 
-/// Bytes of slave output waiting on the master. `None` means "do not read":
-/// the queue is empty or the ioctl failed. This count stays positive while
-/// output is `XOFF`'d, so callers also require [`pty_readable`].
-#[cfg(unix)]
+/// Bytes of slave output waiting on the master. `None` means the queue is
+/// empty or the ioctl failed. Kept for the `XOFF` test: the count stays
+/// positive while output is stopped, which is exactly why the drain must
+/// not treat it as "safe to read".
+#[cfg(all(unix, test))]
 fn queued_pty_output(fd: i32) -> Option<usize> {
     let mut avail: libc::c_int = 0;
     // macOS reports the master's readable output through `TIOCOUTQ`.
@@ -8893,9 +8919,9 @@ mod tests {
     }
 
     /// A short master read is the whole delivery and must come back without a
-    /// second `read`. A full packet drains whatever `TIOCOUTQ` / `FIONREAD`
-    /// already has queued, and still returns when that queue is empty instead
-    /// of blocking for the next packet.
+    /// second `read`. A full packet drains while `poll` still reports the
+    /// master readable, and returns when it does not instead of blocking for
+    /// the next packet.
     #[cfg(unix)]
     #[test]
     fn burst_read_returns_a_short_packet_and_drains_only_queued_output() {
@@ -9159,7 +9185,7 @@ mod tests {
 
     /// A slave that keeps writing past one packet has to come back as one
     /// `read`. Each packet wakes the writer; the drain loops while `poll`
-    /// and the queue count both say more output is already there.
+    /// says more output is already there.
     #[cfg(unix)]
     #[test]
     fn burst_read_coalesces_while_the_slave_keeps_writing() {
