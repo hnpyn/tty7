@@ -92,6 +92,20 @@ impl ParkedCursorScanner {
         *self = Self::default();
     }
 
+    /// Between sequences. Text only leaves on `0x1b`.
+    pub fn is_ground(&self) -> bool {
+        self.state == State::Text
+    }
+
+    /// The effect of [`feed`](Self::feed) on a ground scanner given a chunk
+    /// that contains no ESC: the run no longer ends on a cursor move.
+    pub fn note_ground_text(&mut self, bytes: &[u8]) {
+        debug_assert!(self.is_ground());
+        if !bytes.is_empty() {
+            self.last_was_move = false;
+        }
+    }
+
     pub fn feed(&mut self, bytes: &[u8], mut on_cut: impl FnMut(usize, CursorCut)) {
         let mut i = 0;
         while i < bytes.len() {

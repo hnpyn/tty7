@@ -339,6 +339,12 @@ impl GraphicsSniffer {
         }
     }
 
+    /// Between sequences. Ground only leaves on `0x1b` (an APC is `ESC _`);
+    /// 8-bit C1 `0x9f` is not an introducer here.
+    pub fn is_ground(&self) -> bool {
+        matches!(self.tokenizer.state, State::Ground)
+    }
+
     /// Update whether the sender currently shares this host's filesystem. A pane
     /// is local when tty7 spawned a local shell and no foreground `ssh` owns the
     /// PTY; that can flip mid-session, and it gates whether the next `a=q` probe

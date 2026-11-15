@@ -37,6 +37,9 @@ use super::size::TermSize;
 pub struct EventProxy {
     tx: smol::channel::Sender<AlacEvent>,
     replaying: Arc<AtomicBool>,
+    /// A `Wakeup` is already queued. The reader used to enqueue one per ~1 KiB
+    /// batch, and the UI frame drains them long after the pane has moved on.
+    wakeup_pending: Arc<AtomicBool>,
 }
 
 impl EventListener for EventProxy {
@@ -54,7 +57,40 @@ impl EventListener for EventProxy {
         {
             return;
         }
+        // Cleared when the event is dequeued, before the view reads the grid,
+        // so a write that lands during that frame still schedules another.
+        if matches!(event, AlacEvent::Wakeup) && self.wakeup_pending.swap(true, Ordering::AcqRel) {
+            return;
+        }
         let _ = self.tx.try_send(event);
+    }
+}
+
+/// The view's end of [`EventProxy`]. Receiving a `Wakeup` clears the coalesce
+/// flag, including when a test drains the channel with `try_recv`.
+#[derive(Clone)]
+pub struct EventRx {
+    rx: smol::channel::Receiver<AlacEvent>,
+    wakeup_pending: Arc<AtomicBool>,
+}
+
+impl EventRx {
+    pub async fn recv(&self) -> Result<AlacEvent, smol::channel::RecvError> {
+        let event = self.rx.recv().await?;
+        self.observe(&event);
+        Ok(event)
+    }
+
+    pub fn try_recv(&self) -> Result<AlacEvent, smol::channel::TryRecvError> {
+        let event = self.rx.try_recv()?;
+        self.observe(&event);
+        Ok(event)
+    }
+
+    fn observe(&self, event: &AlacEvent) {
+        if matches!(event, AlacEvent::Wakeup) {
+            self.wakeup_pending.store(false, Ordering::Release);
+        }
     }
 }
 
@@ -598,6 +634,54 @@ impl Downlink {
     }
 }
 
+/// The pane reader's inbox. The live terminal shares a coalescing pipe with
+/// the PTY reader; tests and a relink still speak discrete frames.
+enum Inbox {
+    /// Discrete frames. Built by the tests and a relink; the live pane uses
+    /// [`Live`](Self::Live).
+    #[cfg_attr(not(test), allow(dead_code))]
+    Mpsc(std::sync::mpsc::Receiver<DaemonMsg>),
+    Live(tty7_core::daemon::pane::OutputRx),
+}
+
+impl Inbox {
+    fn recv_timeout(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Result<DaemonMsg, std::sync::mpsc::RecvTimeoutError> {
+        match self {
+            Inbox::Mpsc(rx) => rx.recv_timeout(timeout),
+            Inbox::Live(rx) => rx.recv_timeout(timeout),
+        }
+    }
+
+    fn try_recv(&self) -> Result<DaemonMsg, std::sync::mpsc::TryRecvError> {
+        match self {
+            Inbox::Mpsc(rx) => rx.try_recv(),
+            Inbox::Live(rx) => rx.try_recv(),
+        }
+    }
+
+    fn recycle(&self, buf: Vec<u8>) {
+        if let Inbox::Live(rx) = self {
+            rx.recycle(buf);
+        }
+    }
+}
+
+/// Bytes the output gate charged for this frame. The producer adds the same
+/// measure per send, including when several `Output`s have been appended into
+/// one buffer — the length here is that buffer's, taken after it was popped.
+fn queued_gate_len(msg: &DaemonMsg) -> usize {
+    match msg {
+        DaemonMsg::Output(bytes)
+        | DaemonMsg::Snapshot(bytes)
+        | DaemonMsg::Image(bytes)
+        | DaemonMsg::ClipboardWrite(bytes) => bytes.len(),
+        _ => 0,
+    }
+}
+
 #[cfg(test)]
 fn start_decoder(stream: Stream, buffered: Vec<u8>) -> std::sync::mpsc::Receiver<DaemonMsg> {
     let (tx, rx) = std::sync::mpsc::channel();
@@ -634,7 +718,7 @@ fn decode_frames(mut stream: Stream, mut pending: Vec<u8>, tx: std::sync::mpsc::
 
 pub struct RemoteTerminal {
     pub term: Arc<FairMutex<Term<EventProxy>>>,
-    pub events: smol::channel::Receiver<AlacEvent>,
+    pub events: EventRx,
     pub palette: [alacritty_terminal::vte::ansi::Rgb; 256],
     pub exited: bool,
     size: TermSize,
@@ -792,7 +876,7 @@ impl RemoteTerminal {
         let id = NEXT_PANE.fetch_add(1, Ordering::Relaxed);
         let win = win_size(size, cell_w, cell_h);
         let workspace = spawn_workspace(owner.as_deref(), route);
-        let (tx, inbox) = std::sync::mpsc::channel();
+        let (tx, inbox) = tty7_core::daemon::pane::output_pipe();
         // The subscriber is installed before the reader starts, so the first
         // output byte is delivered live. There is no replay buffer behind it.
         let pane = tty7_core::daemon::pane::DaemonPane::spawn_subscribed(
@@ -805,7 +889,7 @@ impl RemoteTerminal {
             None,
             false,
             use_config_shell,
-            tx,
+            tty7_core::daemon::pane::PaneLink::Coalesced(tx),
             || {},
         )?;
         let drain = pane.gate();
@@ -817,7 +901,7 @@ impl RemoteTerminal {
             .unwrap_or_else(|e| e.into_inner())
             .insert(id, Arc::clone(&hold));
         let mut term = Self::assemble(
-            inbox,
+            Inbox::Live(inbox),
             Some(drain),
             size,
             PtySource::for_route(route),
@@ -906,7 +990,7 @@ impl RemoteTerminal {
         let reader = Self::spawn_reader(
             self.term.clone(),
             self.proxy.clone(),
-            inbox,
+            Inbox::Mpsc(inbox),
             None,
             quit.clone(),
             ReaderSignals {
@@ -1009,11 +1093,19 @@ impl RemoteTerminal {
     ) -> anyhow::Result<Self> {
         let read_half = stream.try_clone()?;
         let inbox = start_decoder(read_half, buffered);
-        Self::assemble(inbox, None, size, pty, awaiting_replay, Some(stream), None)
+        Self::assemble(
+            Inbox::Mpsc(inbox),
+            None,
+            size,
+            pty,
+            awaiting_replay,
+            Some(stream),
+            None,
+        )
     }
 
     fn assemble(
-        inbox: std::sync::mpsc::Receiver<DaemonMsg>,
+        inbox: Inbox,
         drain: Option<Arc<tty7_core::daemon::pane::OutputGate>>,
         size: TermSize,
         pty: PtySource,
@@ -1022,10 +1114,13 @@ impl RemoteTerminal {
         hold: Option<Arc<PaneHold>>,
     ) -> anyhow::Result<Self> {
         let (tx, rx) = smol::channel::unbounded();
+        let wakeup_pending = Arc::new(AtomicBool::new(false));
         let proxy = EventProxy {
             tx,
             replaying: Arc::new(AtomicBool::new(false)),
+            wakeup_pending: Arc::clone(&wakeup_pending),
         };
+        let events = EventRx { rx, wakeup_pending };
 
         let user_config = crate::core::config::Config::load();
         let config = terminal_config_from_user(&user_config);
@@ -1097,7 +1192,7 @@ impl RemoteTerminal {
 
         Ok(Self {
             term,
-            events: rx,
+            events,
             palette: super::palette::build(),
             exited: false,
             size,
@@ -1178,7 +1273,7 @@ impl RemoteTerminal {
     fn spawn_reader(
         term: Arc<FairMutex<Term<EventProxy>>>,
         proxy: EventProxy,
-        inbox: std::sync::mpsc::Receiver<DaemonMsg>,
+        inbox: Inbox,
         drain: Option<Arc<tty7_core::daemon::pane::OutputGate>>,
         quit: Arc<AtomicBool>,
         signals: ReaderSignals,
@@ -1240,6 +1335,10 @@ impl RemoteTerminal {
                 // Set by a replay, sent by the first frame after it: a replay
                 // is a modes Snapshot plus one per ring segment.
                 let mut report_scheme = false;
+                // Taken with the first `Output` of a batch and judged after
+                // that whole batch is folded, so a `?2031h` later in the same
+                // burst still gets the reply.
+                let mut scheme_with_batch = false;
                 let mut queued: VecDeque<DaemonMsg> = VecDeque::new();
                 // Kitty-graphics decode runs on its own thread with newest-frame
                 // coalescing (issue #213): inflating a full-window browser frame
@@ -1283,7 +1382,7 @@ impl RemoteTerminal {
                     proxy.send_event(AlacEvent::Exit);
                 };
 
-                let mut out_batch: Vec<u8> = Vec::new();
+                let mut out_batch: Vec<u8> = Vec::with_capacity(256 * 1024);
 
                 // Whether this chunk ends with the title the pane is showing
                 // belonging to a command that has finished. The emulator has
@@ -1308,6 +1407,30 @@ impl RemoteTerminal {
                     macro_rules! flush_batch {
                         () => {
                             if !out_batch.is_empty() {
+                                // One SIMD scan. Each machine below is skipped
+                                // only while it is idle: an ESC split across
+                                // reads leaves it mid-sequence, and the next
+                                // chunk can be the payload plus BEL, or the
+                                // `\` of an ST, with no `0x1b` of its own.
+                                // Ground states here wait on `0x1b` alone.
+                                let has_esc = crate::core::osc::contains_esc(&out_batch);
+                                if has_esc || !modes.is_ground() {
+                                    super::color_scheme::fold(
+                                        &mut modes,
+                                        &out_batch,
+                                        &color_scheme_updates,
+                                    );
+                                }
+                                if std::mem::take(&mut scheme_with_batch)
+                                    && modes.is_on(COLOR_SCHEME_UPDATES)
+                                {
+                                    proxy.send_event(super::color_scheme::query_reply());
+                                }
+                                for query in modes.take_queries() {
+                                    if query == Query::ColorScheme {
+                                        proxy.send_event(super::color_scheme::query_reply());
+                                    }
+                                }
                                 // The scanner reports an offset one past each
                                 // sequence it matched, in ascending order, so
                                 // the batch splits at each of them: advance the
@@ -1315,11 +1438,17 @@ impl RemoteTerminal {
                                 // sequence left behind, carry on.
                                 let mut cuts: Vec<(usize, ReaderCut)> = Vec::new();
                                 if local_conpty.load(Ordering::Relaxed) {
-                                    cursor_scan.feed(&out_batch, |off, c| {
-                                        cuts.push((off, ReaderCut::Parked(c)))
-                                    });
+                                    if has_esc || !cursor_scan.is_ground() {
+                                        cursor_scan.feed(&out_batch, |off, c| {
+                                            cuts.push((off, ReaderCut::Parked(c)))
+                                        });
+                                    } else {
+                                        cursor_scan.note_ground_text(&out_batch);
+                                    }
                                 }
-                                command_cuts(&mut command_tok, &out_batch, &mut cuts);
+                                if has_esc || !command_tok.is_ground() {
+                                    command_cuts(&mut command_tok, &out_batch, &mut cuts);
+                                }
                                 {
                                     let t0 = trace.then(std::time::Instant::now);
                                     let Some(waited) = feed_grid(
@@ -1347,18 +1476,23 @@ impl RemoteTerminal {
                                         tr_adv_t += t0.elapsed() - waited;
                                     }
                                 }
-                                if let Ok(mut notes) = osc_notes.lock() {
-                                    osc.feed(&out_batch, &mut *notes);
-                                }
-                                mode_tok.feed(&out_batch, |payload| {
-                                    if let Some(mode) = payload.strip_prefix(b"133;V;") {
-                                        shell_vi_mode.store(
-                                            mode.first() == Some(&b'1'),
-                                            Ordering::Relaxed,
-                                        );
+                                if has_esc || !osc.is_ground() {
+                                    if let Ok(mut notes) = osc_notes.lock() {
+                                        osc.feed(&out_batch, &mut *notes);
                                     }
-                                });
-                                zle_tok.feed(&out_batch, |payload| {
+                                }
+                                if has_esc || !mode_tok.is_ground() {
+                                    mode_tok.feed(&out_batch, |payload| {
+                                        if let Some(mode) = payload.strip_prefix(b"133;V;") {
+                                            shell_vi_mode.store(
+                                                mode.first() == Some(&b'1'),
+                                                Ordering::Relaxed,
+                                            );
+                                        }
+                                    });
+                                }
+                                if has_esc || !zle_tok.is_ground() {
+                                    zle_tok.feed(&out_batch, |payload| {
                                     if let Some(mark) = payload.strip_prefix(b"133;") {
                                         match mark.first() {
                                             Some(b'B') => {
@@ -1398,7 +1532,10 @@ impl RemoteTerminal {
                                         }
                                     }
                                 });
-                                if chunk_retires_the_title!(&out_batch) {
+                                }
+                                if (has_esc || !title_tok.is_ground())
+                                    && chunk_retires_the_title!(&out_batch)
+                                {
                                     proxy.send_event(AlacEvent::ResetTitle);
                                 }
                                 proxy.send_event(AlacEvent::Wakeup);
@@ -1420,18 +1557,6 @@ impl RemoteTerminal {
                         let Some(msg) = queued.pop_front() else {
                             break;
                         };
-                        if let Some(gate) = &drain {
-                            let n = match &msg {
-                                DaemonMsg::Output(bytes)
-                                | DaemonMsg::Snapshot(bytes)
-                                | DaemonMsg::Image(bytes)
-                                | DaemonMsg::ClipboardWrite(bytes) => bytes.len(),
-                                _ => 0,
-                            };
-                            if n > 0 {
-                                gate.sub(n);
-                            }
-                        }
                         // Once per replay (a modes Snapshot, then one per
                         // ring segment), at the first frame past the ring —
                         // not when what was read runs out: an 8 MiB ring
@@ -1558,18 +1683,11 @@ impl RemoteTerminal {
                                 // time, and that report would be discounted.
                                 awaiting_replay = false;
                                 replaying_state = false;
-                                super::color_scheme::fold(&mut modes, &bytes, &color_scheme_updates);
-                                if std::mem::take(&mut report_scheme)
-                                    && modes.is_on(COLOR_SCHEME_UPDATES)
-                                {
-                                    proxy.send_event(super::color_scheme::query_reply());
-                                }
-                                for query in modes.take_queries() {
-                                    if query == Query::ColorScheme {
-                                        proxy.send_event(super::color_scheme::query_reply());
-                                    }
+                                if std::mem::take(&mut report_scheme) {
+                                    scheme_with_batch = true;
                                 }
                                 out_batch.extend_from_slice(&bytes);
+                                inbox.recycle(bytes);
                                 tr_frames += 1;
                             }
                             // Kitty graphics (issue #213): the daemon lifted an
@@ -1848,9 +1966,25 @@ impl RemoteTerminal {
                                     tr_bytes += bytes.len() as u64;
                                 }
                             }
+                            // Lengths are frozen once a frame is popped, so
+                            // one credit covers the whole drain — including
+                            // output the producer appended into a single vec.
+                            let mut gated = queued_gate_len(&msg);
                             queued.push_back(msg);
                             while let Ok(more) = inbox.try_recv() {
+                                if tr0.is_some()
+                                    && let DaemonMsg::Output(bytes) | DaemonMsg::Snapshot(bytes) =
+                                        &more
+                                {
+                                    tr_bytes += bytes.len() as u64;
+                                }
+                                gated += queued_gate_len(&more);
                                 queued.push_back(more);
+                            }
+                            if gated > 0
+                                && let Some(gate) = &drain
+                            {
+                                gate.sub(gated);
                             }
                         }
                         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
@@ -3038,6 +3172,10 @@ impl Default for OscNotifyScanner {
 }
 
 impl OscNotifyScanner {
+    fn is_ground(&self) -> bool {
+        self.tok.is_ground()
+    }
+
     fn feed(&mut self, bytes: &[u8], out: &mut VecDeque<Note>) {
         let notes = &mut self.notes;
         self.tok.feed(bytes, |payload| {
@@ -3323,9 +3461,11 @@ fn command_cuts(tok: &mut OscTokenizer, bytes: &[u8], cuts: &mut Vec<(usize, Rea
 /// How much output the reader parses per hold of the grid lock. Every UI-thread
 /// handler that touches the grid — a scroll, a selection drag, a keystroke —
 /// queues on this lock, and one UI thread serves every window, so a hold is how
-/// long all of them can stall. Alacritty's own reader lets go at the same size
-/// (`MAX_LOCKED_READ`).
-const MAX_LOCKED_FEED: usize = 64 * 1024;
+/// long all of them can stall. A coalesced PTY burst is one 256 KiB batch;
+/// holding the fair lock across that batch is one acquisition instead of a
+/// wake per kilobyte, and the next handler still runs before the following
+/// batch.
+const MAX_LOCKED_FEED: usize = 256 * 1024;
 
 /// Parses `bytes` into the emulator, stopping at each of `cuts` for `on_cut` to
 /// act on the state the bytes before it left behind — and letting go of the
