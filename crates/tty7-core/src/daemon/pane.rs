@@ -662,10 +662,15 @@ const REMOTE_CONTEXT_POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// `B`/`C`/`D`) and a cwd report.
 const GROUP_CHECK_INTERVAL: Duration = Duration::from_millis(50);
 
-/// A read this small is a prompt, an echo, a `preexec` line, or a TUI's first
-/// paint. Those always recheck the foreground group, including a child that
-/// took the tty within [`GROUP_CHECK_INTERVAL`] and then went quiet.
-const GROUP_FLOOD_BYTES: usize = 4096;
+/// A read this small is a prompt, an echo, or a `preexec` line. A sustained
+/// burst is anything larger that `read` returned without blocking: one Darwin
+/// packet is about 1 KiB (often a few bytes under that when `ONLCR` would
+/// have to split `\n` → `\r\n` across the boundary), and a slave racing the
+/// drain commonly leaves only the next packet queued as well. Those must not
+/// call `tcgetpgrp` on every read. A child that took the tty and then went
+/// quiet still shows up, because a pause of [`GROUP_IDLE_GAP`], a prompt
+/// mark, or a group that is not settled yet checks immediately.
+const GROUP_FLOOD_BYTES: usize = 512;
 
 /// How long `read` itself may block before the next chunk counts as a pause.
 /// A flood that is already queued returns at once, so it stays on the 50 ms
@@ -676,11 +681,15 @@ const GROUP_IDLE_GAP: Duration = Duration::from_millis(2);
 /// becomes one buffer instead of a 1 KiB syscall per iteration.
 const READ_BURST: usize = 256 * 1024;
 
-/// A macOS pty master `read` returns about one 1 KiB packet even when the
-/// slave has written megabytes. A shorter read is the whole delivery (a
-/// prompt, an echo, a keystroke) and must not be followed by another `read`.
+/// Smallest master `read` that is a packet rather than a keystroke. Darwin
+/// stops a PTY delivery at about 1 KiB, but `OPOST|ONLCR` often returns a few
+/// bytes under that when `\n` → `\r\n` would cross the boundary, and a reader
+/// that keeps up with the slave sees a few hundred bytes of whatever is
+/// already queued. A threshold of 1024 never enters the drain for those, so
+/// every read stays one packet. Prompts and echoes are smaller than this and
+/// must not pay for another syscall.
 #[cfg_attr(not(unix), allow(dead_code))]
-const PTY_CHUNK: usize = 1024;
+const PTY_CHUNK: usize = 256;
 
 pub struct OutputGate {
     queued: AtomicI64,
@@ -2733,9 +2742,14 @@ impl DaemonPane {
                             // did that every time, and the pane never learned
                             // it was running an agent until something else
                             // printed.
-                            // `tcgetpgrp` on every 1 KiB read dominated a plain
-                            // burst. A flood of full chunks asks on a timer. A
-                            // short read or a pause asks every time: an
+                            // `tcgetpgrp` on every PTY packet dominated a plain
+                            // burst. A flood — anything of [`GROUP_FLOOD_BYTES`]
+                            // or more that did not block in `read` — asks on a
+                            // timer. One Darwin packet is already that big,
+                            // including the `ONLCR` deliveries that come back a
+                            // few bytes under 1 KiB and the one-or-two packets
+                            // a racing slave has queued when the drain stops.
+                            // A short read or a pause asks every time: an
                             // uninstrumented shell, and a `preexec` line that
                             // lands before the child calls `tcsetpgrp`, both
                             // look settled until that next small chunk. A `C`
@@ -9804,6 +9818,69 @@ mod tests {
         );
     }
 
+    /// A Darwin `ONLCR` packet is about 1 KiB, sometimes a few bytes under
+    /// that, which is more than [`GROUP_FLOOD_BYTES`] and far less than 4 KiB.
+    /// After the group has been seen twice, those packets stay on the timer.
+    /// A short prompt still asks at once.
+    #[test]
+    fn an_onlcr_sized_packet_does_not_query_the_foreground_group_every_read() {
+        struct Chunks(std::collections::VecDeque<Vec<u8>>);
+
+        impl Read for Chunks {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                match self.0.pop_front() {
+                    Some(chunk) => {
+                        buf[..chunk.len()].copy_from_slice(&chunk);
+                        Ok(chunk.len())
+                    }
+                    None => Ok(0),
+                }
+            }
+        }
+
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_in = calls.clone();
+        let packet = || vec![b'a'; 1020];
+        let handle = DaemonPane::spawn_reader(
+            Arc::new(Mutex::new(test_state(true))),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(OutputGate::new()),
+            Box::new(Chunks(
+                [
+                    packet(),
+                    packet(),
+                    packet(),
+                    packet(),
+                    packet(),
+                    packet(),
+                    b"ready $ ".to_vec(),
+                    packet(),
+                ]
+                .into_iter()
+                .collect(),
+            )),
+            null_writer(),
+            || false,
+            ForegroundProbes {
+                group: Box::new(move || {
+                    calls_in.fetch_add(1, Ordering::SeqCst);
+                    Some(7)
+                }),
+                remote: Box::new(|| None),
+                agent: Box::new(|| None),
+                cwd: Box::new(|| None),
+            },
+            Arc::new(DeathReporter::new(|| {})),
+        );
+        handle.join().unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3,
+            "two ~1 KiB packets settle the group, the later packets stay on \
+             the timer, and the short prompt asks again"
+        );
+    }
+
     /// Prompt, echo, and a child screen, back to back, with no OSC 133 and
     /// no pause long enough to expire the 50 ms timer. Every short read asks,
     /// so the child's first paint is seen on that chunk.
@@ -10601,6 +10678,279 @@ mod tests {
                 assert!(got.iter().all(|b| *b == b'Z'));
             }
             other => panic!("coalesced read did not return: {other:?}"),
+        }
+    }
+
+    /// A first packet a few bytes under 1024 is still a full delivery, which
+    /// is what Darwin returns when `ONLCR` refuses to split `\r\n`. The drain
+    /// has to take whatever else is already queued; stopping at that packet
+    /// is the old `PTY_CHUNK == 1024` bug.
+    #[cfg(unix)]
+    #[test]
+    fn burst_read_drains_a_packet_short_of_1024() {
+        struct OwnedFd(i32);
+        impl Drop for OwnedFd {
+            fn drop(&mut self) {
+                if self.0 >= 0 {
+                    unsafe { libc::close(self.0) };
+                    self.0 = -1;
+                }
+            }
+        }
+        impl Read for OwnedFd {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let n = unsafe { libc::read(self.0, buf.as_mut_ptr().cast(), buf.len()) };
+                if n < 0 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Ok(n as usize)
+                }
+            }
+        }
+
+        let mut master = -1;
+        let mut slave = -1;
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            },
+            0,
+            "openpty: {}",
+            std::io::Error::last_os_error()
+        );
+        let mut termios = unsafe { std::mem::zeroed::<libc::termios>() };
+        assert_eq!(unsafe { libc::tcgetattr(slave, &mut termios) }, 0);
+        unsafe { libc::cfmakeraw(&mut termios) };
+        assert_eq!(
+            unsafe { libc::tcsetattr(slave, libc::TCSANOW, &termios) },
+            0
+        );
+        let flags = unsafe { libc::fcntl(slave, libc::F_GETFL) };
+        assert!(flags >= 0);
+        assert_eq!(
+            unsafe { libc::fcntl(slave, libc::F_SETFL, flags | libc::O_NONBLOCK) },
+            0
+        );
+        let blob = vec![b'Q'; 8192];
+        let mut written = 0;
+        while written < blob.len() {
+            let n = unsafe {
+                libc::write(slave, blob[written..].as_ptr().cast(), blob.len() - written)
+            };
+            if n < 0 {
+                assert_eq!(
+                    std::io::Error::last_os_error().kind(),
+                    std::io::ErrorKind::WouldBlock
+                );
+                break;
+            }
+            assert!(n > 0);
+            written += n as usize;
+        }
+        assert!(
+            written > PTY_CHUNK,
+            "the pty queue held {written}, short of a second packet"
+        );
+
+        /// The kernel's first `read` came back 1020 bytes: under the old
+        /// 1024 threshold, over a keystroke.
+        struct ShortOf1024 {
+            fd: i32,
+            served: bool,
+        }
+        impl Read for ShortOf1024 {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if !self.served {
+                    self.served = true;
+                    let n = 1020.min(buf.len());
+                    buf[..n].fill(b'A');
+                    return Ok(n);
+                }
+                let n = unsafe { libc::read(self.fd, buf.as_mut_ptr().cast(), buf.len()) };
+                if n < 0 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Ok(n as usize)
+                }
+            }
+        }
+        impl Drop for ShortOf1024 {
+            fn drop(&mut self) {
+                if self.fd >= 0 {
+                    unsafe { libc::close(self.fd) };
+                    self.fd = -1;
+                }
+            }
+        }
+
+        let poll = unsafe { libc::dup(master) };
+        assert!(poll >= 0);
+        let mut burst = BurstRead {
+            inner: Box::new(ShortOf1024 {
+                fd: master,
+                served: false,
+            }),
+            poll_fd: Some(poll),
+        };
+        let slave = OwnedFd(slave);
+        let mut buf = vec![0u8; READ_BURST];
+        let n = burst
+            .read(&mut buf)
+            .expect("drain returns the packet already in hand");
+        drop(burst);
+        drop(slave);
+        assert!(
+            n > 1020,
+            "a 1020-byte packet must drain the bytes already queued, got {n}"
+        );
+        assert!(buf[..1020].iter().all(|b| *b == b'A'));
+        assert!(
+            buf[1020..n].iter().all(|b| *b == b'Q'),
+            "drained bytes should be the queued payload"
+        );
+        assert_eq!(n, 1020 + written);
+    }
+
+    /// Cooked `cat` of 80-column lines: default termios, `OPOST|ONLCR`. One
+    /// `BurstRead` has to come back with many packets, not the first ~1 KiB.
+    #[cfg(unix)]
+    #[test]
+    fn burst_read_coalesces_onlcr_eighty_column_lines() {
+        struct OwnedFd {
+            fd: i32,
+            sizes: Arc<Mutex<Vec<usize>>>,
+        }
+        impl Drop for OwnedFd {
+            fn drop(&mut self) {
+                if self.fd >= 0 {
+                    unsafe { libc::close(self.fd) };
+                    self.fd = -1;
+                }
+            }
+        }
+        impl Read for OwnedFd {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let n = unsafe { libc::read(self.fd, buf.as_mut_ptr().cast(), buf.len()) };
+                if n > 0 {
+                    self.sizes.lock().unwrap().push(n as usize);
+                    // The slave refills the ~1 KiB queue after this packet.
+                    // Give it the cpu before `drain_queued` polls.
+                    let start = std::time::Instant::now();
+                    while start.elapsed() < Duration::from_millis(50) && !pty_readable(self.fd) {
+                        std::thread::yield_now();
+                    }
+                }
+                if n < 0 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Ok(n as usize)
+                }
+            }
+        }
+
+        let mut master = -1;
+        let mut slave = -1;
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            },
+            0,
+            "openpty: {}",
+            std::io::Error::last_os_error()
+        );
+        let mut termios = unsafe { std::mem::zeroed::<libc::termios>() };
+        assert_eq!(unsafe { libc::tcgetattr(slave, &mut termios) }, 0);
+        let oflag = termios.c_oflag;
+        assert!(
+            oflag & libc::OPOST != 0 && oflag & libc::ONLCR != 0,
+            "openpty default oflag={oflag:#x}, wanted OPOST|ONLCR"
+        );
+
+        let lines = 600;
+        let mut input = Vec::with_capacity(lines * 81);
+        let mut expected = Vec::with_capacity(lines * 82);
+        for _ in 0..lines {
+            input.extend(std::iter::repeat_n(b'C', 80));
+            input.push(b'\n');
+            expected.extend(std::iter::repeat_n(b'C', 80));
+            expected.extend_from_slice(b"\r\n");
+        }
+
+        let slave_fd = slave;
+        let writer = std::thread::spawn(move || {
+            let mut off = 0;
+            while off < input.len() {
+                let end = (off + 8192).min(input.len());
+                let n =
+                    unsafe { libc::write(slave_fd, input[off..end].as_ptr().cast(), end - off) };
+                if n < 0 {
+                    let err = std::io::Error::last_os_error();
+                    if err.kind() == std::io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    return Err(err);
+                }
+                if n == 0 {
+                    break;
+                }
+                off += n as usize;
+            }
+            unsafe { libc::close(slave_fd) };
+            Ok(off)
+        });
+
+        let sizes = Arc::new(Mutex::new(Vec::new()));
+        let poll = unsafe { libc::dup(master) };
+        assert!(poll >= 0);
+        let mut burst = BurstRead {
+            inner: Box::new(OwnedFd {
+                fd: master,
+                sizes: Arc::clone(&sizes),
+            }),
+            poll_fd: Some(poll),
+        };
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut buf = vec![0u8; READ_BURST];
+            let n = burst.read(&mut buf);
+            drop(burst);
+            let _ = tx.send(n.map(|n| buf[..n].to_vec()));
+        });
+        let reported = rx.recv_timeout(Duration::from_secs(3));
+        let wrote = writer.join().expect("writer thread");
+        match reported {
+            Ok(Ok(got)) => {
+                let wrote = wrote.expect("slave write");
+                assert_eq!(wrote, lines * 81);
+                assert!(
+                    got.len() > 16 * 1024,
+                    "one ONLCR read coalesced only {} bytes (kernel reads {:?})",
+                    got.len(),
+                    sizes.lock().unwrap()
+                );
+                assert!(
+                    expected.starts_with(&got),
+                    "coalesced bytes are not the ONLCR expansion of 80-column lines"
+                );
+                let sizes = sizes.lock().unwrap();
+                assert!(
+                    sizes.iter().any(|n| *n >= PTY_CHUNK),
+                    "drain never engaged; kernel reads were {sizes:?}"
+                );
+            }
+            other => panic!("ONLCR coalesced read did not return: {other:?}"),
         }
     }
 }
