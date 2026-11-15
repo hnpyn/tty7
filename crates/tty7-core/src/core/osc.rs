@@ -391,6 +391,51 @@ impl TitleLifetime {
     }
 }
 
+/// A known alphabet of marks agents paint in front of a title, not a shape.
+/// Matching a list we have actually seen cannot eat a title that merely
+/// starts with an emoji.
+const STATUS_MARKS: &[char] = &[
+    // Claude Code: the quadrant circles while it works, the asterisk at rest.
+    '\u{25D0}', '\u{25D1}', '\u{25D2}', '\u{25D3}', '\u{2733}',
+];
+
+/// Whether `c` is one of the braille cells the common spinners are built from.
+fn is_braille_frame(c: char) -> bool {
+    ('\u{2800}'..='\u{28FF}').contains(&c)
+}
+
+/// `title` with any leading status marks taken off.
+///
+/// A mark only counts with whitespace behind it, which is how every agent
+/// writes one. Variation selectors and zero-width joiners ride along with
+/// the mark. A mark with nothing behind it is the whole title and stays.
+pub fn strip_status_mark(title: &str) -> &str {
+    let mut rest = title;
+    loop {
+        let mut chars = rest.chars();
+        let Some(first) = chars.next() else {
+            return rest;
+        };
+        if !STATUS_MARKS.contains(&first) && !is_braille_frame(first) {
+            return rest;
+        }
+        let after = chars
+            .as_str()
+            .trim_start_matches(|c: char| matches!(c, '\u{FE00}'..='\u{FE0F}' | '\u{200D}'));
+        let trimmed = after.trim_start();
+        if trimmed.len() == after.len() || trimmed.is_empty() {
+            return rest;
+        }
+        rest = trimmed;
+    }
+}
+
+/// Whether two titles read the same once the status mark in front of each is
+/// taken off, which is all a spinner frame changes.
+pub fn same_title_ignoring_status_mark(a: &str, b: &str) -> bool {
+    strip_status_mark(a.trim()) == strip_status_mark(b.trim())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -662,7 +662,7 @@ enum TitleSettle {
 }
 
 fn settle_title(showing: &str, waiting: bool, incoming: &str) -> TitleSettle {
-    if tty7_core::core::tab_view::same_title_ignoring_status_mark(incoming, showing) {
+    if tty7_core::core::osc::same_title_ignoring_status_mark(incoming, showing) {
         return TitleSettle::Revert;
     }
     match waiting {
@@ -1908,7 +1908,7 @@ impl TerminalView {
 
     pub fn adopt_relink(
         &mut self,
-        stream: crate::daemon::transport::Stream,
+        stream: crate::terminal::remote::Stream,
         buffered: Vec<u8>,
         route: &crate::terminal::PaneRoute,
         size: TermSize,
@@ -8769,7 +8769,15 @@ mod tests {
     fn staged_images_land_under_the_remote_users_own_home() {
         let mut dir = "/home/me".to_string();
         for component in super::REMOTE_CLIPBOARD_PATH {
-            dir = crate::daemon::ssh::sftp::remote_join(&dir, component);
+            dir = if dir.is_empty() || dir == "/" {
+                format!("/{}", component.trim_start_matches('/'))
+            } else {
+                format!(
+                    "{}/{}",
+                    dir.trim_end_matches('/'),
+                    component.trim_start_matches('/')
+                )
+            };
         }
         assert_eq!(dir, "/home/me/.cache/tty7/clipboard");
         assert!(
@@ -8781,8 +8789,14 @@ mod tests {
 
     #[test]
     fn the_pasted_image_name_stands_alone_as_a_remote_path_component() {
-        use crate::daemon::ssh::sftp::safe_local_name;
         use gpui::{Image, ImageFormat};
+        let safe_local_name = |name: &str| {
+            !name.is_empty()
+                && name != "."
+                && name != ".."
+                && !name.contains('/')
+                && !name.contains('\\')
+        };
 
         let pixel = image::RgbaImage::from_pixel(1, 1, image::Rgba([4, 5, 6, 255]));
         let mut png = Vec::new();
@@ -9497,7 +9511,7 @@ mod tests {
         let a = super::paste_dir_name();
         let b = super::paste_dir_name();
         assert_ne!(a, b);
-        assert!(crate::daemon::ssh::sftp::safe_local_name(&a));
+        assert!(!a.is_empty() && !a.contains('/') && !a.contains('\\') && a != "." && a != "..");
     }
 
     #[test]
@@ -10089,7 +10103,7 @@ mod tests {
     }
 }
 
-/// A connected pair of [`crate::daemon::transport::Stream`]s, one for each end
+/// A connected pair of [`crate::terminal::remote::Stream`]s, one for each end
 /// of a pane's link to its daemon.
 ///
 /// The client half is what a pane really reads and writes; the daemon half is
@@ -10101,8 +10115,8 @@ mod tests {
 /// `UnixStream` itself.
 #[cfg(test)]
 pub(crate) fn test_stream_pair() -> (
-    crate::daemon::transport::Stream,
-    crate::daemon::transport::Stream,
+    crate::terminal::remote::Stream,
+    crate::terminal::remote::Stream,
 ) {
     #[cfg(unix)]
     {
@@ -10123,7 +10137,7 @@ pub(crate) fn quiet_test_pane(
     pane_id: u64,
     window: &mut Window,
     cx: &mut gpui::App,
-) -> (gpui::Entity<TerminalView>, crate::daemon::transport::Stream) {
+) -> (gpui::Entity<TerminalView>, crate::terminal::remote::Stream) {
     let (client_side, daemon_side) = test_stream_pair();
     let terminal = RemoteTerminal::from_stream(client_side, TermSize::new(80, 24))
         .expect("quiet test terminal");
@@ -10139,7 +10153,7 @@ pub(crate) fn quiet_reattached_test_pane(
     pane_id: u64,
     window: &mut Window,
     cx: &mut gpui::App,
-) -> (gpui::Entity<TerminalView>, crate::daemon::transport::Stream) {
+) -> (gpui::Entity<TerminalView>, crate::terminal::remote::Stream) {
     let (client_side, daemon_side) = test_stream_pair();
     let terminal = RemoteTerminal::from_stream_reattached(client_side, TermSize::new(80, 24))
         .expect("quiet reattached test terminal");
@@ -10151,8 +10165,8 @@ pub(crate) fn quiet_reattached_test_pane(
 mod gpui_tests {
     use super::*;
     use crate::daemon::protocol::{ClientMsg, DaemonMsg};
-    use crate::daemon::transport::Stream;
     use crate::terminal::remote::PtySource;
+    use crate::terminal::remote::Stream;
     use gpui::{Entity, TestAppContext, point};
 
     fn harness(cx: &mut TestAppContext) -> (gpui::WindowHandle<TerminalView>, Stream) {
@@ -16988,7 +17002,7 @@ mod gpui_tests {
 mod prompt_handover_tests {
     use super::*;
     use crate::daemon::protocol::{ClientMsg, DaemonMsg};
-    use crate::daemon::transport::Stream;
+    use crate::terminal::remote::Stream;
     use gpui::TestAppContext;
 
     fn harness(cx: &mut TestAppContext) -> (gpui::WindowHandle<TerminalView>, Stream) {

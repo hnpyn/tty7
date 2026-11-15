@@ -606,7 +606,7 @@ pub(crate) fn apply_theme(mut window: Option<&mut Window>, cx: &mut App) {
     // and reads it back when it spawns a Windows pane, where ConPTY drops an
     // OSC 11 background query before tty7's emulator can answer it. Derived
     // state, so it deliberately stays out of the user's `config.json`.
-    crate::core::machine::note_appearance(theme.dark);
+    crate::core::appearance::note_appearance(theme.dark);
     let config = cx.global::<Config>();
     let mode = if theme.dark {
         ThemeMode::Dark

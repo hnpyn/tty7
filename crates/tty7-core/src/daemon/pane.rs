@@ -3,7 +3,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::mpsc::{self, Sender};
-use std::sync::{Arc, Condvar, Mutex, Weak};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -17,8 +17,7 @@ use crate::core::kitty_graphics::{GraphicsSniffer, Segment, Sniffed};
 use crate::core::osc::OscTokenizer;
 use crate::core::term_modes::{Query, TerminalModes};
 use crate::daemon::protocol::{
-    AuthResponse, DaemonMsg, LeaseRequest, MAX_FRAME, NativeSshSpec, PaneInfo, RemoteContext,
-    RemoteKind, ShellSpec, WinSize,
+    DaemonMsg, LeaseRequest, MAX_FRAME, PaneInfo, RemoteContext, RemoteKind, ShellSpec, WinSize,
 };
 use crate::daemon::shell_integration;
 
@@ -125,7 +124,7 @@ struct SpawnConfig {
     remote: Option<RemoteContext>,
     /// The shell this pane actually got, after the override and the config have
     /// been resolved against each other. Recorded so the machine tree can name
-    /// it — see [`crate::core::machine::PaneRecord::shell`].
+    /// it — see the shell the pane was started with.
     shell: Option<ShellSpec>,
 }
 
@@ -391,10 +390,10 @@ pub(crate) const NTTY7_PANE_ENV: &str = "NTTY7_PANE";
 const NTTY7_WS_ENV: &str = "NTTY7_WS";
 
 fn config_dir_env() -> Option<String> {
-    // The directory the shell's CLI uses to reconstruct both sockets. That is
-    // the runtime directory when this process pinned one, so a pane talks to
-    // the daemon that spawned it rather than to a shared install.
-    crate::core::config::runtime_dir_path().map(|p| p.display().to_string())
+    // The shell integration and a nested `ntty7` both read this. It is the
+    // real config directory (`--config-dir`, else `~/.config/ntty7`), never a
+    // per-process temp dir.
+    crate::core::config::config_dir_path().map(|p| p.display().to_string())
 }
 
 /// The shell the pane is running, not the one the passwd entry names.
@@ -629,7 +628,7 @@ fn apply_common_command_setup(
         cmd.env(k, v);
     }
 
-    let dark = crate::core::machine::appearance().dark;
+    let dark = crate::core::appearance::appearance().dark;
     let injected_zdotdir = cmd
         .get_env("ZDOTDIR")
         .and_then(|z| z.to_str())
@@ -655,6 +654,14 @@ fn apply_common_command_setup(
 }
 
 const RING_CAP: usize = 8 * 1024 * 1024;
+
+/// One geometry-homogeneous run of pane output. Replaying it means telling the
+/// subscriber the size those bytes were written at, then handing it the bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReplaySegment {
+    size: WinSize,
+    bytes: Vec<u8>,
+}
 
 const MAX_RING_SEGMENTS: usize = 64;
 const REMOTE_CONTEXT_POLL_INTERVAL: Duration = Duration::from_millis(500);
@@ -790,8 +797,7 @@ struct PaneState {
     /// Reset with every new controller.
     lease_watch: bool,
     cwd: Option<PathBuf>,
-    /// The last title the pane reported over OSC 0/2, for the machine tree to
-    /// record. See [`crate::core::machine::PaneRecord::osc_title`].
+    /// The last title the pane reported over OSC 0/2.
     osc_title: Option<String>,
     shell: ShellState,
     /// Whether a prompt mark has arrived since `remote` was last set.
@@ -1120,11 +1126,6 @@ fn fan_out_output(st: &mut PaneState, bytes: &[u8], frames: Vec<GraphicsFrame>, 
     }
 }
 
-enum PaneBackend {
-    Pty(PtyBackend),
-    NativeSsh(NativeSshBackend),
-}
-
 struct ForegroundProbes {
     /// The pty's foreground process group: one ioctl, cheap enough to ask on
     /// every read, and a change in it is what says the probes below would now
@@ -1158,30 +1159,185 @@ struct PtyParts {
     shell_pid: Option<u32>,
     integration_dir: Option<PathBuf>,
     reader_handle: Box<dyn Read + Send>,
-    writer: Arc<Mutex<Box<dyn Write + Send>>>,
-}
-
-struct NativeSshBackend {
-    handle: Arc<crate::daemon::ssh::SshSessionHandle>,
-    connection: crate::daemon::ssh::SharedConnection,
+    writer: Arc<PtyWriter>,
 }
 
 pub struct DaemonPane {
     pub id: u64,
     owner: Option<String>,
-    backend: PaneBackend,
-    /// The input side (keyboard input / pasted text): the PTY writer, or the
-    /// native-SSH channel writer. Behind a `Mutex` because writes can arrive from
-    /// different connection threads. `Arc`-shared so the reader thread can write
-    /// kitty-graphics query replies (`\x1b_G…;OK\x1b\\`) back to the PTY inline
-    /// with the sniff, without routing through `write_input`.
-    writer: Arc<Mutex<Box<dyn Write + Send>>>,
+    backend: PtyBackend,
+    /// Keyboard input and in-band replies (kitty query acknowledgements,
+    /// clipboard errors, detached device-attribute answers). A thread owns
+    /// the fd: [`PtyWriter::write`] only enqueues, so a PTY that has stopped
+    /// reading cannot block the UI thread or the reader.
+    writer: Arc<PtyWriter>,
     /// Set during teardown so the reader doesn't emit a spurious exit.
     shutting_down: Arc<AtomicBool>,
     gate: Arc<OutputGate>,
     state: Arc<Mutex<PaneState>>,
     reader: Mutex<Option<JoinHandle<()>>>,
-    broker: Option<Arc<crate::daemon::ssh::PromptBroker>>,
+}
+
+/// Bytes of PTY input that may sit queued while the child is not reading.
+/// One chunk is still accepted when the queue is empty, so a paste is not
+/// thrown away whole; anything further is dropped until the queue drains.
+/// The caller never waits on the fd.
+const PTY_WRITE_BOUND: usize = 4 << 20;
+
+struct PtyQueue {
+    chunks: VecDeque<Vec<u8>>,
+    bytes: usize,
+    closing: bool,
+    /// Set when the writer thread is outside `write_all` and `chunks` is empty.
+    /// Tests wait on it. Production only writes it.
+    #[cfg_attr(not(test), allow(dead_code))]
+    idle: bool,
+}
+
+/// Owns the PTY master writer on a background thread.
+///
+/// `write` copies the bytes onto a bounded queue and returns. A foreground
+/// program that has stopped reading — XOFF, a hung child, a paste larger
+/// than the kernel's input buffer — blocks that thread inside `write_all`,
+/// not the GPUI thread and not the pane reader (kitty and OSC replies use
+/// this queue too).
+struct PtyWriter {
+    queue: Arc<(Mutex<PtyQueue>, Condvar)>,
+    thread: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl PtyWriter {
+    fn spawn(mut sink: Box<dyn Write + Send>) -> Arc<Self> {
+        let queue = Arc::new((
+            Mutex::new(PtyQueue {
+                chunks: VecDeque::new(),
+                bytes: 0,
+                closing: false,
+                idle: true,
+            }),
+            Condvar::new(),
+        ));
+        let sending = Arc::clone(&queue);
+        let thread = std::thread::Builder::new()
+            .name("tty7-pty-writer".to_string())
+            .spawn(move || {
+                crate::core::threads::promote_to_user_interactive();
+                pty_write_loop(&sending, &mut sink);
+            })
+            .expect("spawn pty writer");
+        Arc::new(Self {
+            queue,
+            thread: Mutex::new(Some(thread)),
+        })
+    }
+
+    /// Queue `bytes` and return. Never blocks on the PTY.
+    fn write(&self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        let (lock, wake) = &*self.queue;
+        let Ok(mut q) = lock.lock() else {
+            return;
+        };
+        if q.closing {
+            return;
+        }
+        if q.bytes > 0 && q.bytes.saturating_add(bytes.len()) > PTY_WRITE_BOUND {
+            return;
+        }
+        q.bytes = q.bytes.saturating_add(bytes.len());
+        q.idle = false;
+        q.chunks.push_back(bytes.to_vec());
+        drop(q);
+        wake.notify_all();
+    }
+
+    /// Block until queued bytes have been handed to the sink, or `timeout`.
+    #[cfg(test)]
+    fn wait_idle(&self, timeout: Duration) -> bool {
+        let (lock, wake) = &*self.queue;
+        let Ok(guard) = lock.lock() else {
+            return false;
+        };
+        match wake.wait_timeout_while(guard, timeout, |q| !q.idle) {
+            Ok((q, _)) => q.idle,
+            Err(_) => false,
+        }
+    }
+
+    /// Ask the writer thread to finish. A `write_all` stuck on the PTY is
+    /// abandoned after two seconds — the caller, often the UI thread tearing
+    /// a pane down, must not wait on that fd. `hangup` has already killed
+    /// the child, which is what usually unblocks the write first.
+    fn shutdown(&self) {
+        let (lock, wake) = &*self.queue;
+        if let Ok(mut q) = lock.lock() {
+            q.closing = true;
+            wake.notify_all();
+        }
+        let handle = self.thread.lock().ok().and_then(|mut slot| slot.take());
+        if let Some(handle) = handle {
+            join_bounded(handle, Duration::from_secs(2));
+        }
+    }
+}
+
+impl Drop for PtyWriter {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+fn pty_write_loop(queue: &Arc<(Mutex<PtyQueue>, Condvar)>, sink: &mut Box<dyn Write + Send>) {
+    let (lock, wake) = &**queue;
+    loop {
+        let chunks = {
+            let Ok(mut q) = lock.lock() else {
+                return;
+            };
+            loop {
+                if !q.chunks.is_empty() {
+                    break;
+                }
+                q.idle = true;
+                wake.notify_all();
+                if q.closing {
+                    return;
+                }
+                q = match wake.wait(q) {
+                    Ok(next) => next,
+                    Err(_) => return,
+                };
+            }
+            q.idle = false;
+            let chunks = std::mem::take(&mut q.chunks);
+            let n = chunks.iter().map(Vec::len).sum();
+            q.bytes = q.bytes.saturating_sub(n);
+            chunks
+        };
+        for chunk in &chunks {
+            if sink.write_all(chunk).is_err() {
+                abandon_pty_queue(queue);
+                return;
+            }
+        }
+        if sink.flush().is_err() {
+            abandon_pty_queue(queue);
+            return;
+        }
+    }
+}
+
+fn abandon_pty_queue(queue: &Arc<(Mutex<PtyQueue>, Condvar)>) {
+    let (lock, wake) = &**queue;
+    if let Ok(mut q) = lock.lock() {
+        q.chunks.clear();
+        q.bytes = 0;
+        q.idle = true;
+        q.closing = true;
+    }
+    wake.notify_all();
 }
 
 struct DeathReporter {
@@ -1228,13 +1384,11 @@ impl DeathReporter {
         );
         if shutting_down.load(Ordering::SeqCst) {
             drop(st);
-            crate::core::machine::observe_pane(pane, |p| p.live = false);
             return;
         }
         let subscribed = st.subscriber.is_some();
         notify(&mut st, DaemonMsg::Exited { code });
         drop(st);
-        crate::core::machine::observe_pane(pane, |p| p.live = false);
         if subscribed {
             return;
         }
@@ -1332,7 +1486,7 @@ fn process_graphics_output(
     ordered: bool,
     pass: &mut Vec<u8>,
     frames: &mut Vec<GraphicsFrame>,
-    writer: &Arc<Mutex<Box<dyn Write + Send>>>,
+    writer: &PtyWriter,
 ) {
     match sniffed {
         Sniffed::Plain(bytes) => {
@@ -1349,10 +1503,7 @@ fn process_graphics_output(
                         frames.push(GraphicsFrame::Output(bytes));
                     }
                     Segment::Query(reply) => {
-                        if let Ok(mut writer) = writer.lock() {
-                            let _ = writer.write_all(&reply);
-                            let _ = writer.flush();
-                        }
+                        writer.write(&reply);
                     }
                     Segment::Image(image) => {
                         push_image_frame(frames, image.encode_frame());
@@ -1387,7 +1538,7 @@ fn lift_out_of_band<'a>(
     clipboard: &mut ClipboardSniffer,
     graphics: &mut GraphicsSniffer,
     has_controller: bool,
-    writer: &Arc<Mutex<Box<dyn Write + Send>>>,
+    writer: &PtyWriter,
     frames: &mut Vec<GraphicsFrame>,
 ) -> std::borrow::Cow<'a, [u8]> {
     match clipboard.sniff(raw) {
@@ -1408,273 +1559,21 @@ fn lift_out_of_band<'a>(
                         process_graphics_output(sniffed, true, &mut pass, frames, writer);
                     }
                     ClipboardSegment::Event(ClipboardEvent::Reply(reply)) => {
-                        if let Ok(mut w) = writer.lock() {
-                            let _ = w.write_all(&reply);
-                            let _ = w.flush();
-                        }
+                        writer.write(&reply);
                     }
                     ClipboardSegment::Event(ClipboardEvent::Write(write)) => {
                         if has_controller {
                             frames.push(GraphicsFrame::ClipboardWrite(write.encode_frame()));
-                        } else if let Ok(mut w) = writer.lock() {
+                        } else {
                             let reply =
                                 crate::core::clipboard::response(write.id.as_deref(), "EBUSY");
-                            let _ = w.write_all(&reply);
-                            let _ = w.flush();
+                            writer.write(&reply);
                         }
                     }
                 }
             }
             std::borrow::Cow::Owned(pass)
         }
-    }
-}
-
-/// A live pane, reduced to what survives an `exec` plus what has to be written
-/// down because it does not.
-///
-/// The descriptor number and the child pid are the half the kernel keeps for
-/// us. Everything else here was in memory, and memory is exactly what `exec`
-/// replaces — so a pane's screen, its cwd, its prompt state and its agent are
-/// carried across by hand or not at all. See `daemon::handoff`.
-#[cfg(unix)]
-pub struct Carried {
-    pub id: u64,
-    pub owner: Option<String>,
-    pub master_fd: std::os::fd::RawFd,
-    pub child_pid: u32,
-    pub integration_dir: Option<PathBuf>,
-    pub size: WinSize,
-    pub ring: Vec<crate::daemon::scrollback::Segment>,
-    pub cwd: Option<PathBuf>,
-    pub osc_title: Option<String>,
-    /// What the pane is running. Nothing on the other side of the exec can work
-    /// it out again — the command line belongs to a child this image never
-    /// spawned — so a handoff that dropped it would leave the tree naming no
-    /// shell for a pane that plainly has one.
-    pub shell_spec: Option<ShellSpec>,
-    pub shell_active: bool,
-    pub at_prompt: bool,
-    pub last_exit: Option<i32>,
-    pub remote: Option<RemoteContext>,
-    pub agent: Option<crate::core::cli_agent::CLIAgent>,
-    pub agent_argv: Option<Vec<String>>,
-    pub agent_session: Option<crate::core::cli_agent::AgentSessionState>,
-    /// The modes the ring dropped off its front, as bytes that switch them
-    /// back on. A program sets them once at startup, so after an `exec` a
-    /// long-running TUI would otherwise lose its alternate screen, mouse, 2031
-    /// and kitty keyboard flags for good.
-    pub head_modes: Option<Vec<u8>>,
-}
-
-/// A pty master this process inherited from its own previous image.
-///
-/// `portable-pty` can only hand out a master it opened, and after an `exec`
-/// there is nothing left of the one it opened except the descriptor number. The
-/// operations a pane actually performs on a master are few enough — resize, ask
-/// the size, clone a reader, take a writer, ask which process group is in the
-/// foreground — and all of them are ioctls on that descriptor.
-#[cfg(unix)]
-struct AdoptedMaster {
-    fd: std::os::fd::OwnedFd,
-}
-
-#[cfg(unix)]
-impl AdoptedMaster {
-    fn from_fd(fd: std::os::fd::RawFd) -> anyhow::Result<Self> {
-        use std::os::fd::FromRawFd as _;
-
-        // A descriptor that no longer refers to a terminal is one the previous
-        // image did not really hold — a number reused after a close, or a blob
-        // that named the wrong one. Adopting it would produce a pane whose
-        // every ioctl fails in a different way; refusing produces a pane that
-        // is simply gone, which is a thing the client already handles.
-        if unsafe { libc::isatty(fd) } != 1 {
-            anyhow::bail!("descriptor {fd} is not a terminal");
-        }
-        // Crossing the exec required stripping close-on-exec; being across is
-        // when it goes back on. Children this daemon spawns from here — shells,
-        // `lsof`, ssh transports — must not inherit another pane's master: a
-        // child holding one keeps the pty open after this pane closes it, and
-        // the hangup the shell should see never comes.
-        if let Err(e) = crate::daemon::handoff::close_on_exec_again(fd) {
-            log::warn!("could not restore close-on-exec on adopted pty {fd}: {e}");
-        }
-        Ok(Self {
-            fd: unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) },
-        })
-    }
-
-    fn dup(&self) -> std::io::Result<std::fs::File> {
-        Ok(std::fs::File::from(self.fd.try_clone()?))
-    }
-}
-
-#[cfg(unix)]
-impl MasterPty for AdoptedMaster {
-    fn resize(&self, size: PtySize) -> anyhow::Result<()> {
-        use std::os::fd::AsRawFd as _;
-
-        let ws = libc::winsize {
-            ws_row: size.rows,
-            ws_col: size.cols,
-            ws_xpixel: size.pixel_width,
-            ws_ypixel: size.pixel_height,
-        };
-        if unsafe { libc::ioctl(self.fd.as_raw_fd(), libc::TIOCSWINSZ, &ws as *const _) } != 0 {
-            anyhow::bail!("TIOCSWINSZ failed: {}", std::io::Error::last_os_error());
-        }
-        Ok(())
-    }
-
-    fn get_size(&self) -> anyhow::Result<PtySize> {
-        use std::os::fd::AsRawFd as _;
-
-        let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
-        if unsafe { libc::ioctl(self.fd.as_raw_fd(), libc::TIOCGWINSZ, &mut ws as *mut _) } != 0 {
-            anyhow::bail!("TIOCGWINSZ failed: {}", std::io::Error::last_os_error());
-        }
-        Ok(PtySize {
-            rows: ws.ws_row,
-            cols: ws.ws_col,
-            pixel_width: ws.ws_xpixel,
-            pixel_height: ws.ws_ypixel,
-        })
-    }
-
-    fn try_clone_reader(&self) -> anyhow::Result<Box<dyn Read + Send>> {
-        Ok(Box::new(self.dup()?))
-    }
-
-    /// Deliberately a plain `File`, unlike the writer `portable-pty` hands out:
-    /// that one sends EOF to the shell when it is dropped. Correct for a pty
-    /// whose pane is being closed, wrong for one whose pane is only changing
-    /// which program serves it.
-    fn take_writer(&self) -> anyhow::Result<Box<dyn Write + Send>> {
-        Ok(Box::new(self.dup()?))
-    }
-
-    fn as_raw_fd(&self) -> Option<std::os::fd::RawFd> {
-        use std::os::fd::AsRawFd as _;
-        Some(self.fd.as_raw_fd())
-    }
-
-    fn process_group_leader(&self) -> Option<libc::pid_t> {
-        use std::os::fd::AsRawFd as _;
-        match unsafe { libc::tcgetpgrp(self.fd.as_raw_fd()) } {
-            pid if pid > 0 => Some(pid),
-            _ => None,
-        }
-    }
-}
-
-/// A child this process inherited from its own previous image.
-///
-/// Still genuinely our child — `exec` keeps the process, so the kernel's
-/// parent-child bookkeeping is untouched and `waitpid` works. What was lost is
-/// the `Child` value that knew how to ask.
-#[cfg(unix)]
-#[derive(Debug)]
-struct AdoptedChild {
-    pid: libc::pid_t,
-    exited: Option<portable_pty::ExitStatus>,
-}
-
-#[cfg(unix)]
-impl AdoptedChild {
-    fn new(pid: u32) -> Self {
-        Self {
-            pid: pid as libc::pid_t,
-            exited: None,
-        }
-    }
-
-    fn reap(&mut self, flags: libc::c_int) -> std::io::Result<Option<portable_pty::ExitStatus>> {
-        if let Some(status) = &self.exited {
-            return Ok(Some(status.clone()));
-        }
-        let mut raw: libc::c_int = 0;
-        let seen = unsafe { libc::waitpid(self.pid, &mut raw, flags) };
-        if seen == 0 {
-            return Ok(None);
-        }
-        if seen < 0 {
-            let e = std::io::Error::last_os_error();
-            // ECHILD means someone already reaped it, or it was never ours.
-            // Either way there is no status left to collect and no point in
-            // asking again — reporting an exit of zero is what an unknown but
-            // finished child amounts to.
-            if e.raw_os_error() == Some(libc::ECHILD) {
-                let status = portable_pty::ExitStatus::with_exit_code(0);
-                self.exited = Some(status.clone());
-                return Ok(Some(status));
-            }
-            return Err(e);
-        }
-        let code = if libc::WIFEXITED(raw) {
-            libc::WEXITSTATUS(raw) as u32
-        } else if libc::WIFSIGNALED(raw) {
-            128 + libc::WTERMSIG(raw) as u32
-        } else {
-            0
-        };
-        let status = portable_pty::ExitStatus::with_exit_code(code);
-        self.exited = Some(status.clone());
-        Ok(Some(status))
-    }
-}
-
-#[cfg(unix)]
-impl portable_pty::Child for AdoptedChild {
-    fn try_wait(&mut self) -> std::io::Result<Option<portable_pty::ExitStatus>> {
-        self.reap(libc::WNOHANG)
-    }
-
-    fn wait(&mut self) -> std::io::Result<portable_pty::ExitStatus> {
-        loop {
-            if let Some(status) = self.reap(0)? {
-                return Ok(status);
-            }
-        }
-    }
-
-    fn process_id(&self) -> Option<u32> {
-        Some(self.pid as u32)
-    }
-}
-
-#[cfg(unix)]
-#[derive(Debug)]
-struct AdoptedKiller {
-    pid: libc::pid_t,
-}
-
-#[cfg(unix)]
-impl portable_pty::ChildKiller for AdoptedChild {
-    fn kill(&mut self) -> std::io::Result<()> {
-        AdoptedKiller { pid: self.pid }.kill()
-    }
-
-    fn clone_killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> {
-        Box::new(AdoptedKiller { pid: self.pid })
-    }
-}
-
-#[cfg(unix)]
-impl portable_pty::ChildKiller for AdoptedKiller {
-    fn kill(&mut self) -> std::io::Result<()> {
-        if unsafe { libc::kill(self.pid, libc::SIGKILL) } != 0 {
-            let e = std::io::Error::last_os_error();
-            // Already gone is the outcome kill was asked for.
-            if e.raw_os_error() != Some(libc::ESRCH) {
-                return Err(e);
-            }
-        }
-        Ok(())
-    }
-
-    fn clone_killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> {
-        Box::new(AdoptedKiller { pid: self.pid })
     }
 }
 
@@ -1686,7 +1585,7 @@ impl portable_pty::ChildKiller for AdoptedKiller {
 /// own. Both are decoration over a shell that is unambiguously new: nothing
 /// here revives a process.
 pub struct Restore {
-    pub segments: Vec<crate::daemon::scrollback::Segment>,
+    pub(crate) segments: Vec<ReplaySegment>,
     pub banner: Option<String>,
     /// The pane's last OSC title, carried beside the bytes rather than in them:
     /// the OSC that set it was usually emitted screens ago and trimmed out of
@@ -1853,7 +1752,7 @@ impl DaemonPane {
         drop(pair.slave);
 
         let reader_handle = pair.master.try_clone_reader()?;
-        let writer = Arc::new(Mutex::new(pair.master.take_writer()?));
+        let writer = PtyWriter::spawn(pair.master.take_writer()?);
 
         let (ring, restored_title) = match restore {
             Some(restore) => {
@@ -1939,18 +1838,17 @@ impl DaemonPane {
         let pane = Arc::new(Self {
             id,
             owner,
-            backend: PaneBackend::Pty(PtyBackend {
+            backend: PtyBackend {
                 master: master.clone(),
                 child: child.clone(),
                 shell_pid,
                 integration_dir,
-            }),
+            },
             writer: writer.clone(),
             shutting_down: shutting_down.clone(),
             gate: gate.clone(),
             state: state.clone(),
             reader: Mutex::new(None),
-            broker: None,
         });
 
         let death = Arc::new(DeathReporter::new(on_dead));
@@ -2014,287 +1912,15 @@ impl DaemonPane {
         pane
     }
 
-    /// Reduce a live pane to what can be handed to another program image.
-    ///
-    /// Nothing is taken: the descriptor number is copied out, not the
-    /// descriptor, and the pane keeps serving exactly as before. That is what
-    /// lets the caller stage a whole handoff and then abandon it — an `exec`
-    /// that fails costs a log line, not a machine's worth of shells.
-    ///
-    /// `None` for a native-SSH pane. Its session lives in this process's
-    /// memory, not in a descriptor, and no amount of copying descriptor numbers
-    /// would let the new image speak on the wire the old one had encrypted.
-    #[cfg(unix)]
-    pub fn carry(&self) -> Option<crate::daemon::pane::Carried> {
-        let PaneBackend::Pty(pty) = &self.backend else {
-            return None;
-        };
-        let master_fd = pty
-            .master
-            .lock()
-            .ok()?
-            .as_ref()
-            .and_then(|master| master.as_raw_fd())?;
-        let st = self.state.lock().unwrap();
-        Some(Carried {
-            id: self.id,
-            owner: self.owner.clone(),
-            master_fd,
-            child_pid: pty.shell_pid?,
-            integration_dir: pty.integration_dir.clone(),
-            size: st.ring.tail_size(),
-            ring: st.ring.snapshot(),
-            cwd: st.cwd.clone(),
-            osc_title: st.osc_title.clone(),
-            shell_spec: st.shell_spec.clone(),
-            shell_active: st.shell.active,
-            at_prompt: st.shell.at_prompt,
-            last_exit: st.shell.last_exit_code,
-            remote: st.remote.clone(),
-            agent: st.agent,
-            agent_argv: st.agent_argv.clone(),
-            agent_session: st.agent_session.clone(),
-            head_modes: st.ring.head_modes.restore_bytes(),
-        })
-    }
-
-    /// Rebuild a pane around a pty this process already holds.
-    ///
-    /// The descriptor and the child pid came through an `exec`, so both are
-    /// still ours in the only sense that matters: the kernel still has us down
-    /// as the pty's owner and the shell's parent. What is gone is everything
-    /// that was in memory, which is why the ring and the pane's status come
-    /// back from the handoff blob rather than from the shell.
-    #[cfg(unix)]
-    pub fn adopt(
-        carried: crate::daemon::pane::Carried,
-        on_dead: impl FnOnce() + Send + 'static,
-    ) -> anyhow::Result<Arc<Self>> {
-        let master = AdoptedMaster::from_fd(carried.master_fd)?;
-        let reader_handle = master.try_clone_reader()?;
-        let writer = Arc::new(Mutex::new(master.take_writer()?));
-        let shell_pid = carried.child_pid;
-        // The size the pty is actually at is the kernel's to answer, and it is
-        // the truth: nobody resized it while we were not running. The carried
-        // size only says where the ring's tail was cut.
-        let size = master
-            .get_size()
-            .map(|s| WinSize {
-                cols: s.cols,
-                rows: s.rows,
-                cell_w: carried.size.cell_w,
-                cell_h: carried.size.cell_h,
-            })
-            .unwrap_or(carried.size);
-
-        let (mut ring, modes) =
-            ReplayRing::adopted(carried.ring, size, carried.head_modes.as_deref());
-        // Not a restore banner: nothing was lost, so there is nothing to
-        // announce and nothing to reset. The shell below these bytes is the
-        // same shell that wrote them.
-        ring.resize(size);
-
-        Ok(Self::over_pty(
-            PtyParts {
-                master: Box::new(master),
-                child: Arc::new(Mutex::new(Box::new(AdoptedChild::new(shell_pid)))),
-                shell_pid: Some(shell_pid),
-                integration_dir: carried.integration_dir,
-                reader_handle,
-                writer,
-            },
-            PaneState {
-                id: carried.id,
-                ring,
-                subscriber: None,
-                subscriber_epoch: 0,
-                allow_remote_clipboard_write: false,
-                clipboard_write_from_spec: None,
-                observers: Vec::new(),
-                observer_seq: 0,
-                lease: None,
-                lease_watch: false,
-                cwd: carried.cwd,
-                osc_title: carried.osc_title,
-                shell_spec: carried.shell_spec,
-                shell: ShellState {
-                    active: carried.shell_active,
-                    at_prompt: carried.at_prompt,
-                    last_exit_code: carried.last_exit,
-                    command: None,
-                    // Not carried: the handoff record is a wire format shared
-                    // with older images, and a pane mid-`ssh` that comes back
-                    // claiming a prompt it cannot vouch for would be worse
-                    // than one that says it does not know. It re-latches on
-                    // the far side's next prompt.
-                    mark_at_prompt: false,
-                },
-                remote_prompt_seen: false,
-                ssh_phase: None,
-                modes,
-                remote: carried.remote,
-                agent: carried.agent,
-                agent_session: carried.agent_session,
-                agent_argv: carried.agent_argv,
-                agent_clock: AgentClock::default(),
-                alive: true,
-                exit_code: None,
-                last_redraw_nudge: None,
-            },
-            carried.owner,
-            on_dead,
-        ))
-    }
-
-    /// A pane bridged to a shell channel on `spec`'s host.
-    ///
-    /// `remote_start_dir` is a directory on that host for the shell to start
-    /// in. The pane's own `cwd` is deliberately left unknown until the far
-    /// shell reports one: the `cd` that takes it there can quietly fail, and a
-    /// guess recorded now would be persisted as fact.
-    pub fn spawn_native_ssh(
-        id: u64,
-        size: WinSize,
-        spec: Box<NativeSshSpec>,
-        remote_start_dir: Option<String>,
-        on_dead: impl FnOnce() + Send + 'static,
-    ) -> anyhow::Result<Arc<Self>> {
-        let allow_remote_clipboard_write = spec.remote_clipboard_write;
-        let bridge = crate::daemon::ssh::session::make_bridge();
-        let reader_handle: Box<dyn Read + Send> = Box::new(bridge.reader);
-        let writer: Arc<Mutex<Box<dyn Write + Send>>> =
-            Arc::new(Mutex::new(Box::new(bridge.writer)));
-        // The connect task fills this once authenticated; the pane exposes it to
-        // WS4/WS5 via `ssh_connection()`.
-        let connection: crate::daemon::ssh::SharedConnection = Arc::new(Mutex::new(Weak::new()));
-
-        let target = spec
-            .display_name
-            .clone()
-            .unwrap_or_else(|| format!("{}@{}", spec.user, spec.host));
-        let remote = RemoteContext {
-            kind: RemoteKind::NativeSsh,
-            argv: Vec::new(),
-            target,
-        };
-
-        let state = Arc::new(Mutex::new(PaneState {
-            id,
-            ring: ReplayRing::new(size),
-            subscriber: None,
-            subscriber_epoch: 0,
-            allow_remote_clipboard_write,
-            clipboard_write_from_spec: Some(allow_remote_clipboard_write),
-            observers: Vec::new(),
-            observer_seq: 0,
-            lease: None,
-            lease_watch: false,
-            // A native ssh pane is not running a shell of this machine's; what
-            // it is, `ssh_spec` already says.
-            shell_spec: None,
-            cwd: None,
-            osc_title: None,
-            shell: ShellState::default(),
-            remote_prompt_seen: false,
-            ssh_phase: None,
-            modes: TerminalModes::default(),
-            remote: Some(remote),
-            agent: None,
-            agent_session: None,
-            agent_argv: None,
-            agent_clock: AgentClock::default(),
-            alive: true,
-            exit_code: None,
-            last_redraw_nudge: None,
-        }));
-        let shutting_down = Arc::new(AtomicBool::new(false));
-        let gate = Arc::new(OutputGate::new());
-
-        let broker = {
-            let state = state.clone();
-            crate::daemon::ssh::PromptBroker::new(Box::new(move |msg: DaemonMsg| {
-                let mut st = state.lock().unwrap();
-                if let DaemonMsg::SshStatus { phase } = &msg {
-                    st.ssh_phase = Some(phase.clone());
-                }
-                match &st.subscriber {
-                    Some(sub) => sub.send(msg).is_ok(),
-                    None => false,
-                }
-            }))
-        };
-
-        let pane = Arc::new(Self {
-            id,
-            owner: None,
-            backend: PaneBackend::NativeSsh(NativeSshBackend {
-                handle: bridge.handle,
-                connection: connection.clone(),
-            }),
-            writer: writer.clone(),
-            shutting_down: shutting_down.clone(),
-            gate: gate.clone(),
-            state: state.clone(),
-            reader: Mutex::new(None),
-            broker: Some(broker.clone()),
-        });
-
-        let death = Arc::new(DeathReporter::new(on_dead));
-
-        let reader = Self::spawn_reader(
-            state,
-            shutting_down,
-            gate,
-            reader_handle,
-            writer.clone(),
-            || false,
-            ForegroundProbes {
-                group: Box::new(|| None),
-                remote: Box::new(|| None),
-                agent: Box::new(|| None),
-                cwd: Box::new(|| None),
-            },
-            death,
-        );
-        *pane.reader.lock().unwrap() = Some(reader);
-
-        crate::daemon::ssh::SshManager::global().spawn_native_session(
-            id,
-            spec,
-            remote_start_dir,
-            size,
-            broker,
-            bridge.data_tx,
-            bridge.cmd_rx,
-            connection,
-        );
-
-        Ok(pane)
-    }
-
-    pub fn deliver_auth_response(&self, request_id: u64, response: AuthResponse) {
-        if let Some(broker) = &self.broker {
-            broker.deliver(request_id, response);
-        }
-    }
-
-    #[allow(dead_code)]
-    pub fn ssh_connection(&self) -> Option<Arc<crate::daemon::ssh::SshConnection>> {
-        match &self.backend {
-            PaneBackend::NativeSsh(b) => b.connection.lock().unwrap().upgrade(),
-            PaneBackend::Pty(_) => None,
-        }
-    }
-
     fn spawn_reader(
         state: Arc<Mutex<PaneState>>,
         shutting_down: Arc<AtomicBool>,
         gate: Arc<OutputGate>,
         mut reader: Box<dyn Read + Send>,
-        // The pane's input side, shared so the reader can write kitty-graphics
-        // query replies (`\x1b_G…;OK\x1b\\`) straight back to the PTY — see the
-        // graphics sniff in the loop below.
-        writer: Arc<Mutex<Box<dyn Write + Send>>>,
+        // The pane's input side, shared so the reader can queue kitty-graphics
+        // query replies (`\x1b_G…;OK\x1b\\`) without touching the PTY fd — see
+        // the graphics sniff in the loop below.
+        writer: Arc<PtyWriter>,
         foreground_running: impl Fn() -> bool + Send + 'static,
         probes: ForegroundProbes,
         death: Arc<DeathReporter>,
@@ -2339,7 +1965,7 @@ impl DaemonPane {
                 loop {
                     if trace && tr_last.elapsed() >= std::time::Duration::from_secs(1) {
                         // Not `eprintln!`: a daemon can be running without any
-                        // standard error at all (see `daemon::server`), and a
+                        // standard error at all (see the pane reader), and a
                         // failed write there would panic the reader thread.
                         let _ = writeln!(
                             std::io::stderr(),
@@ -2539,10 +2165,7 @@ impl DaemonPane {
     /// [`redraw_nudge`]. A native ssh pane has no local pty to ask, and its
     /// alternate screen can only be the far program's.
     fn runs_foreground_program(&self, foreground_command: bool) -> bool {
-        match &self.backend {
-            PaneBackend::Pty(_) => foreground_command,
-            PaneBackend::NativeSsh(_) => true,
-        }
+        foreground_command
     }
 
     /// Puts the pty at `transient` now and back at the pane's size a moment
@@ -2554,22 +2177,14 @@ impl DaemonPane {
     /// back is read when it is put back, so a real resize that lands in
     /// between is what the pane ends up at.
     fn nudge_redraw(&self, transient: WinSize) {
-        let resize: Box<dyn Fn(WinSize) + Send> = match &self.backend {
-            PaneBackend::Pty(p) => {
-                let master = Arc::clone(&p.master);
-                Box::new(move |size| {
-                    if let Ok(master) = master.lock()
-                        && let Some(master) = master.as_ref()
-                    {
-                        let _ = master.resize(pty_size(size));
-                    }
-                })
+        let master = Arc::clone(&self.backend.master);
+        let resize: Box<dyn Fn(WinSize) + Send> = Box::new(move |size| {
+            if let Ok(master) = master.lock()
+                && let Some(master) = master.as_ref()
+            {
+                let _ = master.resize(pty_size(size));
             }
-            PaneBackend::NativeSsh(b) => {
-                let handle = Arc::clone(&b.handle);
-                Box::new(move |size| handle.resize(size))
-            }
-        };
+        });
         let state = Arc::clone(&self.state);
         let _ = run_redraw_nudge(transient, REDRAW_NUDGE_SETTLE, resize, move || {
             let st = state.lock().unwrap();
@@ -2585,10 +2200,7 @@ impl DaemonPane {
     /// every pane on Windows, where the pty has no foreground process group)
     /// answers "no", which is what the live suppression already assumes.
     fn has_foreground_command(&self) -> bool {
-        match &self.backend {
-            PaneBackend::Pty(pty) => foreground_command_running(&pty.master, pty.shell_pid),
-            PaneBackend::NativeSsh(_) => false,
-        }
+        foreground_command_running(&self.backend.master, self.backend.shell_pid)
     }
 
     pub fn detach(&self, epoch: u64) -> bool {
@@ -2679,10 +2291,6 @@ impl DaemonPane {
         self.state.lock().unwrap().subscriber_epoch == epoch
     }
 
-    pub fn agent_state(&self) -> Option<crate::daemon::control::PaneAgentState> {
-        agent_state_snapshot(&self.state.lock().unwrap())
-    }
-
     /// See [`expire_stale_agent`].
     pub fn expire_stale_agent(&self) {
         expire_stale_agent(&mut self.state.lock().unwrap(), std::time::Instant::now());
@@ -2746,6 +2354,9 @@ impl DaemonPane {
         self.gate.clone()
     }
 
+    /// Queue `bytes` for the PTY. Returns without waiting on the fd, so a
+    /// program that has stopped reading (XOFF, a hung child, a full input
+    /// buffer) cannot freeze the thread that called this.
     pub fn write_input(&self, bytes: &[u8]) {
         if bytes.is_empty() {
             return;
@@ -2754,10 +2365,7 @@ impl DaemonPane {
         if interrupts(agent, bytes) {
             arm_interrupt(&self.state);
         }
-        if let Ok(mut writer) = self.writer.lock() {
-            let _ = writer.write_all(bytes);
-            let _ = writer.flush();
-        }
+        self.writer.write(bytes);
     }
 
     pub fn procs(&self) -> crate::daemon::protocol::PaneProcs {
@@ -2786,7 +2394,7 @@ impl DaemonPane {
             // per tick for a fact the reader already refreshes on every prompt
             // would put the cost on the wrong side.
             remote: st.remote.clone(),
-            local_pty: matches!(self.backend, PaneBackend::Pty(_)),
+            local_pty: true,
             at_prompt: st.shell.active.then_some(st.shell.mark_at_prompt),
             remote_prompt_seen: st.remote_prompt_seen,
             bracketed_paste: Some(st.modes.is_on(crate::core::term_modes::BRACKETED_PASTE)),
@@ -2794,10 +2402,7 @@ impl DaemonPane {
     }
 
     fn pty(&self) -> Option<&PtyBackend> {
-        match &self.backend {
-            PaneBackend::Pty(p) => Some(p),
-            PaneBackend::NativeSsh(_) => None,
-        }
+        Some(&self.backend)
     }
 
     /// The controller's resize; see [`controller_resize`] for what a lease
@@ -2809,15 +2414,10 @@ impl DaemonPane {
     }
 
     fn resize_pty(&self, size: WinSize) {
-        match &self.backend {
-            PaneBackend::Pty(p) => {
-                if let Ok(master) = p.master.lock() {
-                    if let Some(master) = master.as_ref() {
-                        let _ = master.resize(pty_size(size));
-                    }
-                }
-            }
-            PaneBackend::NativeSsh(b) => b.handle.resize(size),
+        if let Ok(master) = self.backend.master.lock()
+            && let Some(master) = master.as_ref()
+        {
+            let _ = master.resize(pty_size(size));
         }
     }
 
@@ -2838,38 +2438,6 @@ impl DaemonPane {
             alive,
             owner: self.owner.clone(),
         }
-    }
-
-    pub(crate) fn remote_context(&self) -> Option<RemoteContext> {
-        let cached = self.state.lock().unwrap().remote.clone();
-        cached.or_else(|| self.foreground_remote_context())
-    }
-
-    /// The pane's screen, capped for storage, with the mark that says how much
-    /// output it had produced when the copy was taken.
-    ///
-    /// Both come from one acquisition of the state lock. Reading them apart
-    /// would let output land in between, and the writer would then record a
-    /// mark that claims to cover bytes its snapshot does not have — a pane
-    /// that stopped producing at that moment would keep the stale copy for
-    /// good, because its mark would never move again.
-    /// The mark alone, for deciding whether a snapshot is worth taking:
-    /// [`scrollback_snapshot`](Self::scrollback_snapshot) clones the whole
-    /// ring under the state lock, which is a lot to pay every tick for the
-    /// answer "nothing changed". A pane that moves between this read and the
-    /// snapshot is fine — the snapshot returns its own mark, and that pair is
-    /// what gets recorded.
-    pub fn scrollback_mark(&self) -> u64 {
-        self.state.lock().unwrap().ring.appended
-    }
-
-    pub fn scrollback_snapshot(
-        &self,
-    ) -> (Vec<crate::daemon::scrollback::Segment>, Option<String>, u64) {
-        let st = self.state.lock().unwrap();
-        let mut segments = st.ring.snapshot();
-        crate::daemon::scrollback::trim_to(&mut segments, crate::daemon::scrollback::SNAPSHOT_CAP);
-        (segments, st.osc_title.clone(), st.ring.appended)
     }
 
     pub fn kill(&self) {
@@ -2893,20 +2461,15 @@ impl DaemonPane {
     fn hangup(&self) {
         self.shutting_down.store(true, Ordering::SeqCst);
         self.disconnect_clients();
-        match &self.backend {
-            PaneBackend::Pty(p) => {
-                #[cfg(unix)]
-                Self::signal_group(p, libc::SIGHUP);
-                #[cfg(windows)]
-                Self::kill_descendants(p);
-                if let Ok(mut child) = p.child.lock() {
-                    let _ = child.kill();
-                }
-                #[cfg(unix)]
-                Self::signal_group(p, libc::SIGKILL);
-            }
-            PaneBackend::NativeSsh(b) => b.handle.close(),
+        #[cfg(unix)]
+        Self::signal_group(&self.backend, libc::SIGHUP);
+        #[cfg(windows)]
+        Self::kill_descendants(&self.backend);
+        if let Ok(mut child) = self.backend.child.lock() {
+            let _ = child.kill();
         }
+        #[cfg(unix)]
+        Self::signal_group(&self.backend, libc::SIGKILL);
     }
 
     #[cfg(windows)]
@@ -3015,40 +2578,30 @@ impl DaemonPane {
     fn foreground_title(&self) -> String {
         String::new()
     }
-
-    fn foreground_remote_context(&self) -> Option<RemoteContext> {
-        match &self.backend {
-            PaneBackend::Pty(p) => foreground_remote_context(&p.master),
-            PaneBackend::NativeSsh(_) => None,
-        }
-    }
 }
 
 impl Drop for DaemonPane {
     fn drop(&mut self) {
-        if matches!(self.backend, PaneBackend::NativeSsh(_)) {
-            crate::daemon::ssh::SshManager::global().teardown_pane_forwards(self.id);
-        }
         self.hangup();
-        if let PaneBackend::Pty(p) = &self.backend {
-            if let Ok(mut child) = p.child.lock() {
-                match child.wait() {
-                    Ok(status) => log::info!(
-                        "pane {} child exited; child_pid={:?} status={status}",
-                        self.id,
-                        p.shell_pid
-                    ),
-                    Err(e) => log::warn!("pane {} child wait failed: {e}", self.id),
-                }
+        if let Ok(mut child) = self.backend.child.lock() {
+            match child.wait() {
+                Ok(status) => log::info!(
+                    "pane {} child exited; child_pid={:?} status={status}",
+                    self.id,
+                    self.backend.shell_pid
+                ),
+                Err(e) => log::warn!("pane {} child wait failed: {e}", self.id),
             }
         }
+        // The child is gone, so a write parked in a full PTY buffer should
+        // already have returned. If it has not, shutdown abandons the thread
+        // instead of waiting on the fd.
+        self.writer.shutdown();
         if let Some(handle) = self.reader.lock().unwrap().take() {
             join_bounded(handle, Duration::from_secs(2));
         }
-        if let PaneBackend::Pty(p) = &mut self.backend {
-            if let Some(dir) = p.integration_dir.take() {
-                let _ = std::fs::remove_dir_all(&dir);
-            }
+        if let Some(dir) = self.backend.integration_dir.take() {
+            let _ = std::fs::remove_dir_all(&dir);
         }
         // The pane is over — by a kill, by the shell exiting, or by the daemon
         // shutting down — so whatever it typed goes back to the history file it
@@ -3195,7 +2748,7 @@ impl ReplayRing {
     /// cap is far above what a snapshot can hold — but not into `appended`,
     /// which exists to answer "has this pane produced anything since the last
     /// snapshot?" and would otherwise answer yes for a pane that never ran.
-    fn seeded(segments: Vec<crate::daemon::scrollback::Segment>, size: WinSize) -> Self {
+    fn seeded(segments: Vec<ReplaySegment>, size: WinSize) -> Self {
         let mut ring = Self::new(size);
         if segments.is_empty() {
             return ring;
@@ -3217,9 +2770,9 @@ impl ReplayRing {
     /// A ring carried across a handoff, with the pane's modes folded back
     /// from it: `head` is the carried [`Self::head_modes`], and the pane's
     /// modes are that plus every byte the ring still holds.
-    #[cfg(any(unix, test))]
+    #[cfg(test)]
     fn adopted(
-        segments: Vec<crate::daemon::scrollback::Segment>,
+        segments: Vec<ReplaySegment>,
         size: WinSize,
         head: Option<&[u8]>,
     ) -> (Self, TerminalModes) {
@@ -3229,26 +2782,6 @@ impl ReplayRing {
         }
         let modes = ring.modes_from(ring.head_modes.clone());
         (ring, modes)
-    }
-
-    /// The geometry new output would be recorded at.
-    #[cfg(unix)]
-    fn tail_size(&self) -> WinSize {
-        self.segments
-            .back()
-            .map(|seg| seg.size)
-            .expect("ring always has a tail")
-    }
-
-    fn snapshot(&self) -> Vec<crate::daemon::scrollback::Segment> {
-        self.segments
-            .iter()
-            .filter(|seg| !seg.bytes.is_empty())
-            .map(|seg| crate::daemon::scrollback::Segment {
-                size: seg.size,
-                bytes: seg.to_vec(),
-            })
-            .collect()
     }
 
     fn tail(&mut self) -> &mut RingSegment {
@@ -3407,9 +2940,9 @@ fn record_output(st: &mut PaneState, bytes: &[u8]) {
 ///
 /// Returns the queries the daemon owes an answer to. With a client attached
 /// the client answers, so none are owed. Read under the state lock; the
-/// answers are written by [`answer_queries`] after it is released, because a
-/// pty whose program is not reading its input blocks the write, and nothing
-/// else that needs this pane's state should wait on that.
+/// answers are queued by [`answer_queries`] after it is released. The PTY
+/// writer thread performs the write, so a program that is not reading its
+/// input cannot stall the reader on the fd.
 fn detached_queries(st: &mut PaneState) -> Vec<Query> {
     let asked = st.modes.take_queries();
     if st.subscriber.is_some() {
@@ -3430,17 +2963,16 @@ fn detached_reply(query: Query, dark: bool) -> &'static [u8] {
     }
 }
 
-fn answer_queries(writer: &Mutex<Box<dyn Write + Send>>, owed: &[Query]) {
+fn answer_queries(writer: &PtyWriter, owed: &[Query]) {
     if owed.is_empty() {
         return;
     }
-    let dark = owed.contains(&Query::ColorScheme) && crate::core::machine::appearance().dark;
-    if let Ok(mut writer) = writer.lock() {
-        for &query in owed {
-            let _ = writer.write_all(detached_reply(query, dark));
-        }
-        let _ = writer.flush();
+    let dark = owed.contains(&Query::ColorScheme) && crate::core::appearance::appearance().dark;
+    let mut bytes = Vec::new();
+    for &query in owed {
+        bytes.extend_from_slice(detached_reply(query, dark));
     }
+    writer.write(&bytes);
 }
 
 /// Everything a client needs to rebuild the pane's screen and status, in the
@@ -3681,30 +3213,45 @@ fn observe_subscriber(
     st.observer_seq
 }
 
-fn agent_state_snapshot(st: &PaneState) -> Option<crate::daemon::control::PaneAgentState> {
-    st.agent_session
-        .clone()
-        .map(|state| crate::daemon::control::PaneAgentState {
-            pane_id: st.id,
-            agent: st.agent,
-            state,
-        })
+#[cfg(test)]
+fn agent_state_snapshot(st: &PaneState) -> Option<PaneAgentState> {
+    st.agent_session.clone().map(|state| PaneAgentState {
+        pane_id: st.id,
+        agent: st.agent,
+        state,
+    })
 }
 
 /// What the daemon has learned about a pane that the machine tree wants to
 /// hold. Compared before and after each read, and written out only when it
 /// moved — every field here costs a `PaneFacts` delta to every attached client.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AgentFacts {
+    agent: crate::core::cli_agent::CLIAgent,
+    session_id: Option<String>,
+    launch_argv: Option<Vec<String>>,
+    status: Option<crate::core::cli_agent::AgentStatus>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PaneAgentState {
+    pane_id: u64,
+    agent: Option<crate::core::cli_agent::CLIAgent>,
+    state: crate::core::cli_agent::AgentSessionState,
+}
+
 #[derive(Debug, PartialEq)]
 struct ObservedFacts {
     cwd: Option<String>,
     osc_title: Option<String>,
-    agent: Option<crate::core::machine::AgentFacts>,
+    agent: Option<AgentFacts>,
     shell: Option<ShellSpec>,
 }
 
 fn observed_facts(st: &PaneState) -> ObservedFacts {
     let cwd = st.cwd.as_ref().map(|p| p.to_string_lossy().into_owned());
-    let agent = st.agent.map(|agent| crate::core::machine::AgentFacts {
+    let agent = st.agent.map(|agent| AgentFacts {
         agent,
         session_id: st.agent_session.as_ref().and_then(|s| s.session_id.clone()),
         launch_argv: st
@@ -3722,23 +3269,7 @@ fn observed_facts(st: &PaneState) -> ObservedFacts {
     }
 }
 
-fn publish_facts(pane: u64, alive: bool, after: ObservedFacts) {
-    crate::core::machine::observe_pane(pane, |p| {
-        if after.cwd.is_some() {
-            p.cwd = after.cwd;
-        }
-        // Unlike the others this one is also cleared by a reset, so it is
-        // assigned either way.
-        p.osc_title = after.osc_title;
-        p.agent = after.agent;
-        if after.shell.is_some() {
-            p.shell = after.shell;
-        }
-        if alive {
-            p.live = true;
-        }
-    });
-}
+fn publish_facts(_pane: u64, _alive: bool, _after: ObservedFacts) {}
 
 fn facts_changed(before: &ObservedFacts, after: &ObservedFacts) -> bool {
     before.cwd != after.cwd
@@ -3747,10 +3278,7 @@ fn facts_changed(before: &ObservedFacts, after: &ObservedFacts) -> bool {
         || before.shell != after.shell
 }
 
-fn agent_facts_changed(
-    before: Option<&crate::core::machine::AgentFacts>,
-    after: Option<&crate::core::machine::AgentFacts>,
-) -> bool {
+fn agent_facts_changed(before: Option<&AgentFacts>, after: Option<&AgentFacts>) -> bool {
     match (before, after) {
         (None, None) => false,
         (Some(a), Some(b)) => {
@@ -4262,6 +3790,190 @@ fn foreground_cwd(
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
+fn foreground_argv(pid: i32) -> Option<Vec<String>> {
+    #[cfg(target_os = "linux")]
+    {
+        if pid <= 0 {
+            return None;
+        }
+        let bytes = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+        let argv: Vec<String> = bytes
+            .split(|&b| b == 0)
+            .filter(|part| !part.is_empty())
+            .map(|part| String::from_utf8_lossy(part).into_owned())
+            .collect();
+        return (!argv.is_empty()).then_some(argv);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if pid <= 0 {
+            return None;
+        }
+        let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid as libc::c_int];
+        let mut len = 0usize;
+        if unsafe {
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                mib.len() as u32,
+                std::ptr::null_mut(),
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        } != 0
+            || len < std::mem::size_of::<libc::c_int>()
+        {
+            return None;
+        }
+        let mut buf = vec![0u8; len];
+        if unsafe {
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                mib.len() as u32,
+                buf.as_mut_ptr() as *mut libc::c_void,
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        } != 0
+        {
+            return None;
+        }
+        buf.truncate(len);
+        parse_macos_procargs(&buf)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn parse_macos_procargs(buf: &[u8]) -> Option<Vec<String>> {
+    if buf.len() < std::mem::size_of::<libc::c_int>() {
+        return None;
+    }
+    let argc = i32::from_ne_bytes(buf[..4].try_into().ok()?) as usize;
+    let mut i = 4;
+    while i < buf.len() && buf[i] != 0 {
+        i += 1;
+    }
+    while i < buf.len() && buf[i] == 0 {
+        i += 1;
+    }
+    let mut argv = Vec::new();
+    for _ in 0..argc {
+        if i >= buf.len() {
+            break;
+        }
+        let start = i;
+        while i < buf.len() && buf[i] != 0 {
+            i += 1;
+        }
+        if i > start {
+            argv.push(String::from_utf8_lossy(&buf[start..i]).into_owned());
+        }
+        while i < buf.len() && buf[i] == 0 {
+            i += 1;
+        }
+    }
+    (!argv.is_empty()).then_some(argv)
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn parse_ssh_invocation(argv: &[String]) -> Option<RemoteContext> {
+    let program = argv.first()?;
+    let name = std::path::Path::new(program).file_name()?.to_string_lossy();
+    if name != "ssh" {
+        return None;
+    }
+
+    let mut i = 1;
+    let mut target = None;
+    while i < argv.len() {
+        let arg = &argv[i];
+        if arg == "--" {
+            i += 1;
+            break;
+        }
+        if !arg.starts_with('-') || arg == "-" {
+            target = Some(arg.clone());
+            i += 1;
+            break;
+        }
+        if arg == "-W" || arg == "-w" || arg == "-L" || arg == "-R" || arg == "-D" {
+            return None;
+        }
+        if arg == "-N" || arg == "-f" {
+            return None;
+        }
+        if arg.starts_with("--") {
+            return None;
+        }
+        if let Some(short) = arg.strip_prefix('-')
+            && !short.starts_with('-')
+            && short.len() > 1
+        {
+            let mut chars = short.chars();
+            let Some(flag) = chars.next() else {
+                return None;
+            };
+            if ssh_option_takes_value(flag) && chars.as_str().is_empty() {
+                i += 1;
+                if i >= argv.len() {
+                    return None;
+                }
+            }
+            i += 1;
+            continue;
+        }
+        if arg.len() == 2 {
+            let flag = arg.as_bytes()[1] as char;
+            if ssh_option_takes_value(flag) {
+                i += 1;
+                if i >= argv.len() {
+                    return None;
+                }
+            }
+        }
+        i += 1;
+    }
+
+    let target = target?;
+    if i < argv.len() {
+        return None;
+    }
+    Some(RemoteContext {
+        kind: RemoteKind::Ssh,
+        argv: argv.to_vec(),
+        target,
+    })
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn ssh_option_takes_value(flag: char) -> bool {
+    matches!(
+        flag,
+        'B' | 'b'
+            | 'c'
+            | 'D'
+            | 'E'
+            | 'e'
+            | 'F'
+            | 'I'
+            | 'i'
+            | 'J'
+            | 'L'
+            | 'l'
+            | 'm'
+            | 'O'
+            | 'o'
+            | 'p'
+            | 'Q'
+            | 'R'
+            | 'S'
+            | 'W'
+            | 'w'
+    )
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn foreground_remote_context(
     master: &Mutex<Option<Box<dyn MasterPty + Send>>>,
 ) -> Option<RemoteContext> {
@@ -4269,8 +3981,8 @@ fn foreground_remote_context(
         .lock()
         .ok()
         .and_then(|m| m.as_ref().and_then(|m| m.process_group_leader()))?;
-    let argv = crate::daemon::remote::foreground_argv(pid)?;
-    crate::daemon::remote::parse_ssh_invocation(&argv).map(|inv| inv.context)
+    let argv = foreground_argv(pid)?;
+    parse_ssh_invocation(&argv)
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -4289,7 +4001,7 @@ fn foreground_agent(
             .lock()
             .ok()
             .and_then(|m| m.as_ref().and_then(|m| m.process_group_leader()))?;
-        let argv = crate::daemon::remote::foreground_argv(pid)?;
+        let argv = foreground_argv(pid)?;
         let agent = crate::core::cli_agent::CLIAgent::detect_from_argv_with(
             &argv,
             &crate::core::config::agent_detection_aliases(),
@@ -5197,8 +4909,7 @@ mod tests {
         let frame = "\x1b[?2026h\x1b[2A\r\x1b[2K## 资源\r\n\x1b[2K\
                      \x1b]133;B\x07\x1b]133;C\x07下一步。\x1b[?2026l"
             .as_bytes();
-        let writer: Arc<Mutex<Box<dyn Write + Send>>> =
-            Arc::new(Mutex::new(Box::new(std::io::sink())));
+        let writer = PtyWriter::spawn(Box::new(std::io::sink()));
         let run = |chunks: &[&[u8]]| {
             let mut clipboard = ClipboardSniffer::default();
             clipboard.set_controller(Some(1), true);
@@ -5295,7 +5006,7 @@ mod tests {
 
     #[test]
     fn a_seeded_ring_replays_the_old_screen_at_the_size_it_was_written() {
-        use crate::daemon::scrollback::Segment;
+        use super::ReplaySegment as Segment;
 
         let mut ring = ReplayRing::seeded(
             vec![Segment {
@@ -5325,7 +5036,7 @@ mod tests {
 
     #[test]
     fn seeding_does_not_make_an_untouched_pane_look_like_it_produced_output() {
-        use crate::daemon::scrollback::Segment;
+        use super::ReplaySegment as Segment;
 
         let ring = ReplayRing::seeded(
             vec![Segment {
@@ -5343,7 +5054,7 @@ mod tests {
 
     #[test]
     fn a_handoff_keeps_the_modes_the_ring_dropped_off_its_front() {
-        use crate::daemon::scrollback::Segment;
+        use super::ReplaySegment as Segment;
 
         let mut head = TerminalModes::new();
         head.feed(b"\x1b[?1049h\x1b[?2031h\x1b[>1u");
@@ -5378,50 +5089,6 @@ mod tests {
             "the ring always has exactly one tail"
         );
         assert_eq!(ring.flatten(), b"output");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn a_descriptor_that_is_not_a_terminal_is_refused_rather_than_adopted() {
-        use std::os::fd::AsRawFd as _;
-
-        let file = std::fs::File::open("/dev/null").expect("open /dev/null");
-        let err = AdoptedMaster::from_fd(file.as_raw_fd())
-            .err()
-            .expect("a plain file is not a pty");
-        assert!(
-            err.to_string().contains("not a terminal"),
-            "the refusal was {err}"
-        );
-        // Refused means not taken: the caller still owns what it passed, and
-        // dropping `file` here is what closes it. Adopting first and failing
-        // later would have closed a descriptor belonging to someone else.
-        drop(file);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn an_adopted_master_goes_back_to_close_on_exec() {
-        let pair = native_pty_system()
-            .openpty(PtySize::default())
-            .expect("open a pty");
-        let fd = pair
-            .master
-            .as_raw_fd()
-            .expect("a fresh master has a descriptor");
-        // What crossing the exec leaves behind: `dup` hands out a descriptor
-        // with close-on-exec clear, exactly like one that was deliberately
-        // stripped to survive.
-        let inherited = unsafe { libc::dup(fd) };
-        assert!(inherited >= 0, "dup the master");
-        let master = AdoptedMaster::from_fd(inherited).expect("a pty is adoptable");
-        let flags = unsafe { libc::fcntl(inherited, libc::F_GETFD) };
-        assert!(
-            flags >= 0 && flags & libc::FD_CLOEXEC != 0,
-            "an adopted master left inheritable ends up in every child this daemon spawns, \
-             and a child holding it keeps the pty from ever hanging up"
-        );
-        drop(master);
     }
 
     #[test]
@@ -5505,7 +5172,7 @@ mod tests {
         // actually holds. There is no epilogue: `DaemonPane::kill` is a hangup
         // with no grace period, so the program never sent its own `?1002l`,
         // and the snapshot was taken before it could have anyway.
-        let snapshot = crate::daemon::scrollback::Segment {
+        let snapshot = super::ReplaySegment {
             size,
             bytes: b"\x1b[?1049h\x1b[?1002h\x1b[?1003h\x1b[?1006h\x1b[?1004h\
 \x1b[?2004hframe one\x1b[Hframe two"
@@ -6329,8 +5996,62 @@ mod tests {
 
     /// A discard writer for `spawn_reader` tests that don't inspect the PTY
     /// write-back path (graphics query replies).
-    fn null_writer() -> Arc<Mutex<Box<dyn Write + Send>>> {
-        Arc::new(Mutex::new(Box::new(std::io::sink())))
+    fn null_writer() -> Arc<PtyWriter> {
+        PtyWriter::spawn(Box::new(std::io::sink()))
+    }
+
+    /// Keystrokes are queued. A PTY that has stopped reading blocks the writer
+    /// thread inside `write`, and the call that queued the next chunk returns
+    /// without waiting for that write.
+    #[test]
+    fn queued_pty_writes_return_while_the_pty_is_not_reading() {
+        struct Gate {
+            started: Option<mpsc::Sender<()>>,
+            release: mpsc::Receiver<()>,
+            written: Arc<Mutex<Vec<u8>>>,
+        }
+        impl Write for Gate {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                if let Some(started) = self.started.take() {
+                    let _ = started.send(());
+                    let _ = self.release.recv_timeout(Duration::from_secs(5));
+                }
+                self.written.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let writer = PtyWriter::spawn(Box::new(Gate {
+            started: Some(started_tx),
+            release: release_rx,
+            written: written.clone(),
+        }));
+        // Dropped before `writer`, including on panic, so a blocked `write`
+        // unblocks and the writer thread can be joined.
+        let _release = release_tx;
+
+        writer.write(b"stall");
+        started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("the writer thread reaches the stalled pty");
+        let started = std::time::Instant::now();
+        writer.write(b"more");
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "queueing input must not wait on a pty that is not reading"
+        );
+        drop(_release);
+        assert!(
+            writer.wait_idle(Duration::from_secs(2)),
+            "once the pty reads again, the queued bytes are written"
+        );
+        assert_eq!(written.lock().unwrap().as_slice(), b"stallmore");
     }
 
     fn test_state(alive: bool) -> PaneState {
@@ -6604,144 +6325,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_pane_killed_with_its_agent_keeps_the_facts_a_resume_needs() {
-        use crate::core::cli_agent::{AgentSessionState, CLIAgent};
-        use crate::core::machine::{
-            AgentFacts, MACHINE_FILE, MachineStore, OBSERVE_SLOT, PaneSeed, publish_observations,
-            withdraw_observations,
-        };
-
-        const PANE: u64 = 77;
-        let _slot = OBSERVE_SLOT.lock().unwrap_or_else(|e| e.into_inner());
-        let dir = tempfile::TempDir::new().unwrap();
-        let store = MachineStore::open(dir.path().join(MACHINE_FILE));
-        let ws = store.workspace_create(None, None, None).unwrap();
-        store
-            .tab_create(
-                ws.id,
-                None,
-                PaneSeed {
-                    pane: PANE,
-                    cwd: Some("/work/api".to_string()),
-                    ssh_spec: None,
-                    agent: Some(AgentFacts {
-                        agent: CLIAgent::Claude,
-                        session_id: Some("sess-1".to_string()),
-                        launch_argv: Some(vec!["claude".to_string()]),
-                        status: None,
-                    }),
-                    shell: None,
-                },
-                None,
-                None,
-            )
-            .unwrap();
-        publish_observations(&store);
-
-        let run = |shutting_down: bool| {
-            let mut state = test_state(true);
-            state.id = PANE;
-            state.agent = Some(CLIAgent::Claude);
-            state.agent_session = Some(AgentSessionState {
-                session_id: Some("sess-1".to_string()),
-                ..Default::default()
-            });
-            DaemonPane::spawn_reader(
-                Arc::new(Mutex::new(state)),
-                Arc::new(AtomicBool::new(shutting_down)),
-                Arc::new(OutputGate::new()),
-                Box::new(std::io::Cursor::new(b"\x1b]133;D;0\x07".to_vec())),
-                null_writer(),
-                || false,
-                ForegroundProbes {
-                    group: Box::new(|| None),
-                    remote: Box::new(|| None),
-                    agent: Box::new(|| Some(None)),
-                    cwd: Box::new(|| None),
-                },
-                Arc::new(DeathReporter::new(|| {})),
-            )
-            .join()
-            .unwrap();
-        };
-
-        run(true);
-        let kept = store
-            .pane(PANE)
-            .expect("the record outlives the pane")
-            .agent
-            .expect("a teardown must not report the agent away");
-        assert_eq!(kept.session_id.as_deref(), Some("sess-1"));
-
-        run(false);
-        assert!(
-            store.pane(PANE).unwrap().agent.is_none(),
-            "an agent that left a pane still in use is a fact, and clears"
-        );
-
-        withdraw_observations();
-    }
-
-    /// The whole path a title takes into the tree: sniffed out of the pane's
-    /// own output, kept on its state, and written to the record every other
-    /// viewer reads. Nothing else can name the tabs of a workspace this process
-    /// does not own — without this the switcher fell back to the agent, and
-    /// every tab of a workspace running one read "Claude Code".
-    #[test]
-    fn a_pane_title_reaches_the_machine_tree() {
-        use crate::core::machine::{
-            MACHINE_FILE, MachineStore, OBSERVE_SLOT, PaneSeed, publish_observations,
-            withdraw_observations,
-        };
-
-        const PANE: u64 = 78;
-        let _slot = OBSERVE_SLOT.lock().unwrap_or_else(|e| e.into_inner());
-        let dir = tempfile::TempDir::new().unwrap();
-        let store = MachineStore::open(dir.path().join(MACHINE_FILE));
-        let ws = store.workspace_create(None, None, None).unwrap();
-        store
-            .tab_create(ws.id, None, PaneSeed::bare(PANE), None, None)
-            .unwrap();
-        publish_observations(&store);
-
-        let run = |had: Option<&str>, output: &[u8]| {
-            let mut state = test_state(true);
-            state.id = PANE;
-            state.osc_title = had.map(str::to_string);
-            DaemonPane::spawn_reader(
-                Arc::new(Mutex::new(state)),
-                Arc::new(AtomicBool::new(false)),
-                Arc::new(OutputGate::new()),
-                Box::new(std::io::Cursor::new(output.to_vec())),
-                null_writer(),
-                || false,
-                ForegroundProbes {
-                    group: Box::new(|| None),
-                    remote: Box::new(|| None),
-                    agent: Box::new(|| Some(None)),
-                    cwd: Box::new(|| None),
-                },
-                Arc::new(DeathReporter::new(|| {})),
-            )
-            .join()
-            .unwrap();
-            store.pane(PANE).expect("the record was seeded").osc_title
-        };
-
-        assert_eq!(
-            run(None, b"\x1b]0;\xe2\x9c\xb3 fixing the switcher\x07").as_deref(),
-            Some("✳ fixing the switcher")
-        );
-        assert_eq!(
-            run(Some("✳ fixing the switcher"), b"\x1b]2;\x07"),
-            None,
-            "a pane that resets its title clears the one on record"
-        );
-
-        withdraw_observations();
-    }
-
     /// Claude Code ends its OSC 11 theme query with DA1 and waits for both.
     /// Started in a pane no window shows (an agent woken at launch), it got
     /// neither and never checked the theme again.
@@ -6759,12 +6342,16 @@ mod tests {
             }
         }
         let sink = Sink::default();
-        let writer: Mutex<Box<dyn Write + Send>> = Mutex::new(Box::new(sink.clone()));
+        let writer = PtyWriter::spawn(Box::new(sink.clone()));
         let mut st = test_state(true);
         let da1 = detached_reply(Query::DeviceAttributes, false);
         let read = |st: &mut PaneState, bytes: &[u8]| {
             record_output(st, bytes);
             answer_queries(&writer, &detached_queries(st));
+            assert!(
+                writer.wait_idle(Duration::from_secs(2)),
+                "the detached reply is written on the pty thread"
+            );
             std::mem::take(&mut *sink.0.lock().unwrap())
         };
 
@@ -7646,9 +7233,19 @@ mod tests {
         observe_subscriber(&mut st, observer_tx, observer_gate.clone(), false);
 
         // The daemon's own writer puts the replay on the wire, as for a phone.
-        let (mut client, server) = UnixStream::pair().unwrap();
-        let writer =
-            crate::daemon::server::spawn_writer(observer_rx, server, observer_gate.clone());
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        let writer_gate = Arc::clone(&observer_gate);
+        let writer = std::thread::spawn(move || {
+            while let Ok(msg) = observer_rx.recv() {
+                let n = gated_len(&msg);
+                if msg.encode(&mut server).is_err() {
+                    break;
+                }
+                if n > 0 {
+                    writer_gate.sub(n);
+                }
+            }
+        });
         let mut replayed = 0;
         while replayed < RING_CAP {
             if let DaemonMsg::Snapshot(b) = DaemonMsg::read(&mut client).unwrap() {
@@ -8215,8 +7812,7 @@ mod tests {
             }
         }
         let sink = Arc::new(Mutex::new(Vec::new()));
-        let writer: Arc<Mutex<Box<dyn Write + Send>>> =
-            Arc::new(Mutex::new(Box::new(SharedBuf(sink.clone()))));
+        let writer = PtyWriter::spawn(Box::new(SharedBuf(sink.clone())));
 
         // One 1x1 opaque-red RGBA pixel, transmitted-and-displayed inline.
         let pixel = [0xffu8, 0x00, 0x00, 0xff];
@@ -8231,7 +7827,7 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
             Arc::new(OutputGate::new()),
             Box::new(std::io::Cursor::new(stream.into_bytes())),
-            writer,
+            writer.clone(),
             || false,
             ForegroundProbes {
                 group: Box::new(|| None),
@@ -8242,6 +7838,10 @@ mod tests {
             Arc::new(DeathReporter::new(|| {})),
         );
         handle.join().unwrap();
+        assert!(
+            writer.wait_idle(Duration::from_secs(2)),
+            "the query reply is written on the pty thread"
+        );
 
         // (1) The ring holds the text, none of the graphics bytes.
         assert_eq!(state.lock().unwrap().ring.flatten(), b"beforemidafter");
@@ -8399,8 +7999,7 @@ mod tests {
             }
         }
         let sink = Arc::new(Mutex::new(Vec::new()));
-        let writer: Arc<Mutex<Box<dyn Write + Send>>> =
-            Arc::new(Mutex::new(Box::new(SharedBuf(sink.clone()))));
+        let writer = PtyWriter::spawn(Box::new(SharedBuf(sink.clone())));
         let mime = base64::engine::general_purpose::STANDARD.encode("image/png");
         let data = base64::engine::general_purpose::STANDARD.encode(b"png-data");
         let stream = format!(
@@ -8413,7 +8012,7 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
             Arc::new(OutputGate::new()),
             Box::new(std::io::Cursor::new(stream.into_bytes())),
-            writer,
+            writer.clone(),
             || false,
             ForegroundProbes {
                 group: Box::new(|| None),
@@ -8425,6 +8024,10 @@ mod tests {
         )
         .join()
         .unwrap();
+        assert!(
+            writer.wait_idle(Duration::from_secs(2)),
+            "the clipboard rejection is written on the pty thread"
+        );
 
         assert!(state.lock().unwrap().ring.flatten().is_empty());
         assert!(
@@ -9073,29 +8676,6 @@ mod tests {
                 "the daemon must tell every spawned shell which config dir it serves"
             );
         }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn the_two_endpoints_are_siblings_derived_from_one_config_dir() {
-        // The bug this pins: the control socket used to ignore the config dir
-        // and sit in ~/.local/share/tty7 as `daemon.sock`, the same basename the
-        // pane socket uses. A `--config-dir` server therefore published someone
-        // else's control endpoint, and anything deriving one path from the other
-        // by filename got the wrong socket. Both must come from the config dir,
-        // and they must not collide.
-        let dir = std::path::Path::new("/tmp/tty7-endpoint-test");
-        let pane = crate::daemon::transport::socket_path_for(dir);
-        let control = crate::host::server::socket_path_in(dir, &[]).expect("short enough path");
-
-        assert_eq!(pane.parent(), control.parent(), "one directory, two files");
-        assert_ne!(
-            pane.file_name(),
-            control.file_name(),
-            "same basename is what made them indistinguishable"
-        );
-        assert_eq!(pane, dir.join("daemon.sock"));
-        assert_eq!(control, dir.join("control.sock"));
     }
 
     #[test]

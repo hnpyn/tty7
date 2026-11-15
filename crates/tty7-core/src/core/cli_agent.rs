@@ -328,7 +328,7 @@ impl CLIAgent {
     /// took a turn (or ran with transcript saving off), and resuming one
     /// fails at once. `None` for agents that cannot name a new session.
     pub fn start_command(self, session_id: &str, launch_argv: Option<&[String]>) -> Option<String> {
-        if self != CLIAgent::Claude || uuid::Uuid::parse_str(session_id).is_err() {
+        if self != CLIAgent::Claude || !is_session_uuid(session_id) {
             return None;
         }
         let flags = self.session_command_flags(session_id, launch_argv)?;
@@ -874,6 +874,17 @@ pub fn command_argv(command: &str) -> Vec<String> {
         argv.remove(0);
     }
     argv
+}
+
+fn is_session_uuid(session_id: &str) -> bool {
+    let bytes = session_id.as_bytes();
+    if bytes.len() != 36 {
+        return false;
+    }
+    bytes.iter().enumerate().all(|(i, byte)| match i {
+        8 | 13 | 18 | 23 => *byte == b'-',
+        _ => byte.is_ascii_hexdigit(),
+    })
 }
 
 fn is_env_assignment(token: &str) -> bool {

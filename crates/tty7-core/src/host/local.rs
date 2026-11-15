@@ -7,11 +7,10 @@ use std::time::{Duration, Instant};
 
 use notify::{RecursiveMode, Watcher};
 
-use crate::core::git;
 use crate::core::gitignore::GitignoreChain;
 use crate::host::{
-    ContentLimits, ContentQuery, ContentResults, Entry, Host, HostId, MTime, Meta, Output,
-    SearchHit, SharedHost, ShellInventory, WatchHandle, WatchSub, guard_off_ui,
+    Entry, Host, HostId, MTime, Meta, SearchHit, SharedHost, ShellInventory, WatchHandle, WatchSub,
+    guard_off_ui,
 };
 
 const COALESCE_WINDOW: Duration = Duration::from_millis(100);
@@ -19,49 +18,6 @@ const COALESCE_WINDOW: Duration = Duration::from_millis(100);
 /// How often a directory on a WSL distro's share is re-read, since nothing
 /// there says when it changed (#942).
 const WSL_POLL_INTERVAL: Duration = Duration::from_secs(2);
-
-/// What every git we spawn runs with, on top of what `git_output_with_env`
-/// already sets: nothing may stop and ask a human anything.
-///
-/// It only bites when git reaches for a credential, which in practice is
-/// `fetch`/`pull`/`push` — `status`, `diff` and `log` have nothing to prompt
-/// about, so carrying it on the read path too costs nothing and buys the one
-/// thing we cannot get any other way: the wire carries a single `Git` request
-/// with no "this one talks to a network" bit, so the remote `tty7-server`
-/// arrives here with the same args and is protected by the same rule, without a
-/// protocol change.
-///
-/// `git_output_with_env` already nulls stdin, and that is not enough — with no
-/// `GIT_TERMINAL_PROMPT` git opens `/dev/tty` directly and blocks on it, which
-/// is exactly the hang this prevents.
-const NO_PROMPT_ENV: &[(&str, Option<&str>)] = &[
-    // Fail instead of blocking on `Username for 'https://…'`.
-    ("GIT_TERMINAL_PROMPT", Some("0")),
-    // Nobody is watching for a password dialog a background probe popped up.
-    ("GIT_ASKPASS", None),
-    ("SSH_ASKPASS", None),
-    // OpenSSH 8.4+; without it ssh may fall back to askpass on its own.
-    ("SSH_ASKPASS_REQUIRE", Some("never")),
-];
-
-/// `NO_PROMPT_ENV`, plus a batch-mode ssh unless the user picked their own
-/// `GIT_SSH_COMMAND` — replacing theirs would drop the identity file or jump
-/// host they configured. `BatchMode=yes` bans only interactive password and
-/// passphrase prompts; a key held by ssh-agent still authenticates.
-///
-/// A repository's `core.sshCommand` does lose to this, because that is git's
-/// own precedence. Honouring it would mean a `git config` probe before every
-/// call, and this is the read path too.
-fn no_prompt_env() -> Vec<(&'static str, Option<&'static str>)> {
-    let mut env = NO_PROMPT_ENV.to_vec();
-    // `GIT_SSH` too: it is the older spelling of the same choice (plink on
-    // Windows, most commonly), and `GIT_SSH_COMMAND` outranks it — forcing
-    // ours would silently swap their transport out.
-    if std::env::var_os("GIT_SSH_COMMAND").is_none() && std::env::var_os("GIT_SSH").is_none() {
-        env.push(("GIT_SSH_COMMAND", Some("ssh -o BatchMode=yes")));
-    }
-    env
-}
 
 pub struct LocalHost {
     gitignore: Arc<Mutex<GitignoreChain>>,
@@ -245,16 +201,6 @@ impl Host for LocalHost {
         Ok(out)
     }
 
-    fn search_content(
-        &self,
-        roots: &[PathBuf],
-        query: &ContentQuery,
-        limits: &ContentLimits,
-    ) -> io::Result<ContentResults> {
-        guard_off_ui();
-        crate::host::content_search::search(roots, query, limits)
-    }
-
     /// Replaces `p` with `bytes` atomically where it can, so a crash, a full
     /// disk or a killed process halfway through a save leaves either the old
     /// file or the new one and never a truncated mix — see [`write_replacing`]
@@ -311,44 +257,9 @@ impl Host for LocalHost {
             .map(Path::to_path_buf))
     }
 
-    fn git(&self, cwd: &Path, args: &[&str]) -> io::Result<Output> {
-        guard_off_ui();
-        git::git_output_with_env(cwd, args, &no_prompt_env())
-    }
-
-    fn repo_head(&self, cwd: &Path) -> Option<Option<git::head::RepoHead>> {
-        guard_off_ui();
-        Some(git::head::read_head(cwd))
-    }
-
-    fn git_lines(
-        &self,
-        cwd: &Path,
-        args: &[&str],
-        on_line: &mut dyn FnMut(&str),
-    ) -> io::Result<Option<i32>> {
-        guard_off_ui();
-        let mut split = git::LineSplitter::default();
-        let code = git::git_stream(cwd, args, |chunk| {
-            split.push(chunk, &mut *on_line);
-            true
-        })?;
-        split.finish(&mut *on_line);
-        Ok(code)
-    }
-
     fn shells(&self) -> io::Result<ShellInventory> {
         guard_off_ui();
         Ok(crate::core::shells::inventory())
-    }
-
-    fn agent_sessions(
-        &self,
-        known_dirs: &[PathBuf],
-    ) -> io::Result<Vec<crate::core::agent_history::PastSession>> {
-        guard_off_ui();
-        use crate::core::agent_history::{Roots, scan};
-        Ok(Roots::local().map_or_else(Vec::new, |roots| scan(&roots, known_dirs)))
     }
 
     fn watch(&self, dirs: &[PathBuf]) -> io::Result<WatchSub> {
@@ -708,36 +619,10 @@ fn notify_to_io(e: notify::Error) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::host::conformance::Sandbox;
 
-    struct TempSandbox(tempfile::TempDir);
-
-    impl Sandbox for TempSandbox {
-        fn path(&self) -> &Path {
-            self.0.path()
-        }
-
-        fn symlink(&self, target: &Path, link: &Path) -> Option<io::Result<()>> {
-            #[cfg(unix)]
-            {
-                Some(std::os::unix::fs::symlink(target, link))
-            }
-            #[cfg(not(unix))]
-            {
-                let _ = (target, link);
-                None
-            }
-        }
+    fn sandbox() -> (SharedHost, tempfile::TempDir) {
+        (LocalHost::new(), tempfile::tempdir().expect("temp dir"))
     }
-
-    fn sandbox() -> (SharedHost, TempSandbox) {
-        (
-            LocalHost::new(),
-            TempSandbox(tempfile::TempDir::new().unwrap()),
-        )
-    }
-
-    crate::host_conformance_suite!(local, sandbox);
 
     #[test]
     fn wsl_shares_are_polled_and_nothing_else_is() {

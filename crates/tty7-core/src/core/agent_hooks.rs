@@ -33,27 +33,10 @@ pub fn run_agent_hook(agent: &str, event: &str) {
     write_to_controlling_tty(&hook_sequence(&body));
 }
 
-/// Hand the report to the daemon that owns this pane, over its socket.
-///
-/// The tty is the channel of last resort. The agent draws on it too, and a
-/// tty write is not atomic — on macOS the kernel parks a writer mid-write
-/// whenever the output queue is full, which is exactly when an agent is busy
-/// redrawing — so the agent's output can land inside the sequence, break it,
-/// and leave the rest of it on screen as text. The socket has no such
-/// neighbour. It only works where the daemon runs, though: a hook the
-/// environment points at no daemon, at a daemon that predates this message,
-/// or at a pane it does not run in (see `DaemonPane::report_agent_event`)
-/// falls back to the tty.
-fn report_to_daemon(body: &str) -> bool {
-    let Some(pane) = std::env::var(crate::daemon::pane::NTTY7_PANE_ENV)
-        .ok()
-        .and_then(|p| p.trim().parse::<u64>().ok())
-    else {
-        return false;
-    };
-    crate::client::PaneClient::local()
-        .report_agent_event(pane, std::process::id(), body)
-        .is_ok()
+/// A hook is its own process. The pane that owns the tty already sniffs the
+/// OSC the fallback below writes, so there is no separate listener to report to.
+fn report_to_daemon(_body: &str) -> bool {
+    false
 }
 
 #[cfg(not(unix))]
@@ -545,7 +528,10 @@ fn write_to_controlling_tty(bytes: &[u8]) -> bool {
 
 #[cfg(any(not(unix), test))]
 fn is_tty7_host_exe(name: &str) -> bool {
-    matches!(name, "tty7-app.exe" | "tty7-server.exe" | "tty7.exe")
+    matches!(
+        name,
+        "tty7-app.exe" | "tty7-server.exe" | "tty7.exe" | "ntty7.exe"
+    )
 }
 
 #[cfg(not(unix))]
@@ -900,30 +886,8 @@ impl<'a> HookTarget<'a> {
     }
 
     pub fn remote(host: &'a dyn Host, home: PathBuf) -> HookTarget<'a> {
-        use crate::daemon::install::asset;
-        let dialect = crate::daemon::install::RemoteProtocol::of_this_build();
-        let home_str = home.to_string_lossy();
-        // A Windows server reports its home natively (`C:\Users\me`), and the
-        // hook command runs there, so the binary is named the way that
-        // machine's installer put it — and spelled natively again.
-        let binary = match asset::sftp_path_from_windows(&home_str) {
-            Some(sftp_home) => {
-                let installed = asset::remote_paths_on(
-                    asset::RemotePlatform::Windows,
-                    &sftp_home,
-                    dialect.control,
-                    dialect.protocol,
-                )
-                .binary;
-                asset::windows_native_path(&installed).unwrap_or(installed)
-            }
-            None => asset::remote_paths(&home_str, dialect.control, dialect.protocol).binary,
-        };
-        HookTarget {
-            host,
-            home,
-            exe: PathBuf::from(binary),
-        }
+        let exe = PathBuf::from(remote_hook_binary(&home.to_string_lossy()));
+        HookTarget { host, home, exe }
     }
 
     fn is_local(&self) -> bool {
@@ -1257,6 +1221,64 @@ pub fn refresh_hooks(target: &HookTarget) -> usize {
         }
     }
     refreshed
+}
+
+/// Control dialect the old remote installer stamped into `tty7-server`.
+/// Kept so a hook command still names the binary an already-installed
+/// remote server would have.
+const REMOTE_CONTROL_DIALECT: u32 = 12;
+
+fn remote_hook_binary(home: &str) -> String {
+    let name = format!(
+        "tty7-server-c{}p{}",
+        REMOTE_CONTROL_DIALECT,
+        crate::daemon::protocol::PROTOCOL_VERSION
+    );
+    if let Some(sftp_home) = sftp_path_from_windows(home) {
+        let installed = format!(
+            "{}/AppData/Local/tty7/bin/{name}.exe",
+            sftp_home.trim_end_matches('/')
+        );
+        return windows_native_path(&installed).unwrap_or(installed);
+    }
+    format!(
+        "{}/.local/share/tty7/bin/{name}",
+        home.trim_end_matches('/')
+    )
+}
+
+fn sftp_path_from_windows(native: &str) -> Option<String> {
+    let native = native.trim();
+    let b = native.as_bytes();
+    if b.len() < 2 || !b[0].is_ascii_alphabetic() || b[1] != b':' {
+        return None;
+    }
+    if b.len() > 2 && b[2] != b'\\' && b[2] != b'/' {
+        return None;
+    }
+    let sftp = format!("/{}", native.replace('\\', "/"));
+    Some(if sftp.len() > 4 {
+        sftp.trim_end_matches('/').to_string()
+    } else {
+        sftp
+    })
+}
+
+fn windows_native_path(sftp: &str) -> Option<String> {
+    let b = sftp.as_bytes();
+    let windows = b.len() >= 3
+        && b[0] == b'/'
+        && b[1].is_ascii_alphabetic()
+        && b[2] == b':'
+        && (b.len() == 3 || b[3] == b'/');
+    if !windows {
+        return None;
+    }
+    let mut native = sftp[1..].replace('/', "\\");
+    if native.len() == 2 {
+        native.push('\\');
+    }
+    Some(native)
 }
 
 pub fn refresh_remote_hooks(host: &dyn Host, home: PathBuf) -> usize {
@@ -2930,7 +2952,7 @@ mod tests {
 
     #[test]
     fn every_tty7_daemon_host_takes_the_console_fast_path() {
-        for name in ["tty7-app.exe", "tty7-server.exe", "tty7.exe"] {
+        for name in ["tty7-app.exe", "tty7-server.exe", "tty7.exe", "ntty7.exe"] {
             assert!(is_tty7_host_exe(name), "{name} hosts tty7 shells");
         }
         for name in ["explorer.exe", "cmd.exe", "tty7", "tty7-app", "wt.exe"] {
@@ -3107,8 +3129,10 @@ mod tests {
     #[test]
     fn a_remote_hook_names_the_server_its_own_installer_placed() {
         let host = FakeRemote::shared();
-        let dialect = crate::daemon::install::RemoteProtocol::of_this_build();
-        let name = crate::daemon::install::asset::binary_name(dialect.control, dialect.protocol);
+        let name = format!(
+            "tty7-server-c{REMOTE_CONTROL_DIALECT}p{}",
+            crate::daemon::protocol::PROTOCOL_VERSION
+        );
 
         let unix = HookTarget::remote(&*host, PathBuf::from("/home/me"));
         assert_eq!(
@@ -3986,8 +4010,10 @@ mod tests {
     fn the_hook_command_names_the_binary_on_that_machine() {
         let host = FakeRemote::shared();
         let target = HookTarget::remote(&*host, PathBuf::from("/home/me"));
-        let dialect = crate::daemon::install::RemoteProtocol::of_this_build();
-        let name = format!("tty7-server-c{}p{}", dialect.control, dialect.protocol);
+        let name = format!(
+            "tty7-server-c{REMOTE_CONTROL_DIALECT}p{}",
+            crate::daemon::protocol::PROTOCOL_VERSION
+        );
         assert_eq!(
             target.hook_command(HookAgent::Claude, "stop"),
             format!("\"/home/me/.local/share/tty7/bin/{name}\" agent-hook claude stop")
@@ -4377,10 +4403,9 @@ mod tests {
             install_hooks(&target, agent).expect("install succeeds");
             assert_eq!(hooks_state(&target, agent), HooksState::Installed);
             let path = agent.target_path(&target);
-            let dialect = crate::daemon::install::RemoteProtocol::of_this_build();
             assert!(std::fs::read_to_string(&path).unwrap().contains(&format!(
-                "tty7-server-c{}p{}",
-                dialect.control, dialect.protocol
+                "tty7-server-c{REMOTE_CONTROL_DIALECT}p{}",
+                crate::daemon::protocol::PROTOCOL_VERSION
             )));
             uninstall_hooks(&target, agent).expect("uninstall succeeds");
             assert_eq!(hooks_state(&target, agent), HooksState::NotInstalled);

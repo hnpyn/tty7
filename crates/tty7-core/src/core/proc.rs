@@ -16,14 +16,6 @@ pub fn hide_console(cmd: &mut Command) -> &mut Command {
     cmd
 }
 
-pub fn hide_console_tokio(cmd: &mut tokio::process::Command) -> &mut tokio::process::Command {
-    #[cfg(windows)]
-    {
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
-    cmd
-}
-
 pub fn output_within(cmd: &mut Command, timeout: Duration) -> io::Result<Output> {
     let mut child = cmd
         .stdin(Stdio::null())
@@ -80,6 +72,55 @@ pub fn spawn_reaped(cmd: &mut Command) -> io::Result<u32> {
             let _ = child.wait();
         })?;
     Ok(pid)
+}
+
+/// Whether `pid` still names a process.
+///
+/// `0` is not a process: on Unix `kill(0, …)` signals the caller's process
+/// group. A permission error counts as alive, so a sweep will not delete
+/// files that belong to a process this one cannot signal.
+pub fn pid_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    pid_alive_os(pid)
+}
+
+#[cfg(unix)]
+fn pid_alive_os(pid: u32) -> bool {
+    // `pid_t` is `i32`. A value that does not fit would become negative, and
+    // `kill(-1, 0)` signals every process this one may signal.
+    if pid > i32::MAX as u32 {
+        return false;
+    }
+    if unsafe { libc::kill(pid as i32, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
+#[cfg(windows)]
+fn pid_alive_os(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return false;
+        }
+        let mut code = 0u32;
+        let ok = GetExitCodeProcess(handle, &mut code);
+        CloseHandle(handle);
+        ok != 0 && code == STILL_ACTIVE as u32
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn pid_alive_os(_pid: u32) -> bool {
+    true
 }
 
 fn drain<R: Read + Send + 'static>(pipe: Option<R>) -> Vec<u8> {

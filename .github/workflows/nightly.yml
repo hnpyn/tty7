@@ -118,9 +118,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y pkg-config cmake clang libxkbcommon-dev \
             libxkbcommon-x11-dev libfontconfig1-dev libfreetype6-dev \
-            libwayland-dev libx11-dev libxcb1-dev libzstd-dev libssl-dev \
-            libkrb5-dev libfuse2 file imagemagick
-          echo "LIBGSSAPI_IMPL=mit" >> "$GITHUB_ENV"
+            libwayland-dev libx11-dev libxcb1-dev libzstd-dev \
+            libfuse2 file imagemagick
 
       - uses: dtolnay/rust-toolchain@stable
         with:

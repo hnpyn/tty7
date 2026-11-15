@@ -332,32 +332,15 @@ fn load_shell_history() -> Vec<Raw> {
 }
 
 /// Written by the shell integration snippet, one absolute path per line.
+/// The snippet writes it under `NTTY7_CONFIG_DIR`, which a pane is given as
+/// this process's config directory.
 pub const REPORTED_HISTORY_FILES: &str = "shell-histfiles";
 
-/// The shell integration writes this list into the directory named by
-/// `NTTY7_CONFIG_DIR`, which a pane inherits as the runtime directory. The
-/// config directory is only the fallback for a process that never pinned one.
-fn reported_history_list_path(
-    runtime: Option<PathBuf>,
-    config: Option<PathBuf>,
-) -> Option<PathBuf> {
-    if runtime.as_ref().is_some_and(|path| path.is_file()) {
-        return runtime;
-    }
-    if config.as_ref().is_some_and(|path| path.is_file()) {
-        return config;
-    }
-    runtime.or(config)
-}
-
 fn reported_history_files() -> Vec<PathBuf> {
-    reported_history_list_path(
-        crate::core::config::runtime_path(REPORTED_HISTORY_FILES),
-        config_path(REPORTED_HISTORY_FILES),
-    )
-    .and_then(|list| std::fs::read_to_string(list).ok())
-    .map(|text| parse_reported_history_files(&text))
-    .unwrap_or_default()
+    config_path(REPORTED_HISTORY_FILES)
+        .and_then(|list| std::fs::read_to_string(list).ok())
+        .map(|text| parse_reported_history_files(&text))
+        .unwrap_or_default()
 }
 
 fn parse_reported_history_files(text: &str) -> Vec<PathBuf> {
@@ -752,32 +735,18 @@ mod tests {
     }
 
     #[test]
-    fn reported_history_list_prefers_the_runtime_file() {
-        let dir = std::env::temp_dir().join(format!(
-            "ntty7-histfiles-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
-        let runtime = dir.join("runtime").join(REPORTED_HISTORY_FILES);
-        let config = dir.join("config").join(REPORTED_HISTORY_FILES);
-        std::fs::create_dir_all(runtime.parent().unwrap()).unwrap();
-        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
-        std::fs::write(&runtime, "/runtime/.zsh_history\n").unwrap();
-        std::fs::write(&config, "/config/.zsh_history\n").unwrap();
-
+    fn reported_history_list_is_read_from_the_config_dir() {
+        crate::core::config::pin_test_config_dir();
+        let path = config_path(REPORTED_HISTORY_FILES).expect("pinned config dir");
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&path, "/config/.zsh_history\n").unwrap();
         assert_eq!(
-            reported_history_list_path(Some(runtime.clone()), Some(config.clone())),
-            Some(runtime.clone())
+            reported_history_files(),
+            vec![PathBuf::from("/config/.zsh_history")]
         );
-        let _ = std::fs::remove_file(&runtime);
-        assert_eq!(
-            reported_history_list_path(Some(runtime), Some(config.clone())),
-            Some(config)
-        );
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

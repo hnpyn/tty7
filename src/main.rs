@@ -56,13 +56,10 @@ fn spawn_config_watcher(cx: &mut App) {
         if !tty7_core::host::is_content_change(&event.kind) {
             return;
         }
-        // The saved SSH hosts live beside config.json in a file of their own
-        // (#911), and a hand edit there has to land the same way.
-        let hit = event.paths.iter().any(|p| {
-            p.file_name() == watched_file.file_name()
-                || p.file_name() == Some(std::ffi::OsStr::new(crate::core::config::SERVERS_FILE))
-                || is_theme_file(p)
-        });
+        let hit = event
+            .paths
+            .iter()
+            .any(|p| p.file_name() == watched_file.file_name() || is_theme_file(p));
         if hit {
             let _ = tx.try_send(());
         }
@@ -596,8 +593,6 @@ fn apply_font_thicken(thicken: bool) {
     gpui_platform::set_glyph_dilation(thicken);
 }
 
-static EPHEMERAL_RUNTIME: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
-
 /// Drop the identity a parent terminal exported before this process reads
 /// config or spawns a shell.
 ///
@@ -709,25 +704,10 @@ pub(crate) fn inherited_runtime_dirname_is_ephemeral(name: Option<&str>) -> bool
     !pid.is_empty() && pid.chars().all(|c| c.is_ascii_digit())
 }
 
-fn pin_ephemeral_runtime() {
-    let dir = std::env::temp_dir().join(format!("ntty7-{}", std::process::id()));
-    let _ = std::fs::create_dir_all(&dir);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
-    }
-    let _ = EPHEMERAL_RUNTIME.set(dir.clone());
-    crate::core::config::set_runtime_dir(dir);
-}
-
 pub(crate) fn cleanup_runtime() {
-    // Panes have to drop before the directory they were talking through is
-    // removed: `DaemonPane::drop` merges per-pane history back first.
-    crate::daemon::server::shutdown_in_process();
-    if let Some(dir) = EPHEMERAL_RUNTIME.get() {
-        let _ = std::fs::remove_dir_all(dir);
-    }
+    // Drop every live pane on this thread. gpui only polls the quit future
+    // for 200ms, which is not long enough for a pane's history merge.
+    crate::terminal::shutdown_panes();
 }
 
 pub(crate) fn cleanup_and_quit(cx: &mut App) {
@@ -790,32 +770,17 @@ pub(crate) fn spawn_new_instance(cwd: Option<&std::path::Path>) {
     }
 }
 
-fn wait_for_daemon() -> bool {
-    let start = std::time::Instant::now();
-    while start.elapsed() < std::time::Duration::from_secs(2) {
-        if crate::daemon::transport::endpoint_exists() {
-            return true;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(2));
-    }
-    crate::daemon::transport::endpoint_exists()
-}
-
 fn main() {
     // Before args, config, or the log file: a parent tty7's `TTY7_*` must not
     // decide this process's directory.
     scrub_inherited_terminal_env();
 
     let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
-    // ntty7 does not install or serve agent hooks. A hook pointed at this
-    // binary must not rewrite Claude or Cursor settings that belong to an
-    // installed tty7.app, and it must not open a window at a fake path.
-    if args.first().map(std::ffi::OsString::as_os_str) == Some(std::ffi::OsStr::new("agent-hook")) {
-        return;
-    }
 
     apply_config_dir_arg(&args);
-    pin_ephemeral_runtime();
+    // A killed window never retires. Drop files whose process is gone; a
+    // live window's pane-history stays, because the names carry its pid.
+    crate::daemon::history::sweep(&std::collections::HashSet::new());
     crate::core::crash::install("gui");
     crate::core::logfile::install("gui");
 
@@ -829,23 +794,6 @@ fn main() {
 
     #[cfg(target_os = "windows")]
     crate::core::aumid::init();
-
-    #[cfg(target_os = "macos")]
-    crate::daemon::responsibility::skip_disclaim();
-
-    std::thread::Builder::new()
-        .name("ntty7-daemon".into())
-        .spawn(|| {
-            if let Err(error) = crate::daemon::server::run_daemon() {
-                log::error!("terminal server stopped: {error:#}");
-            }
-        })
-        .expect("ntty7 daemon thread");
-    if !wait_for_daemon() {
-        log::error!("the in-process terminal server did not come up");
-        cleanup_runtime();
-        std::process::exit(1);
-    }
 
     let open_path = open_path_from(args.into_iter());
     let application = gpui_platform::application()

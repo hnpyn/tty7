@@ -100,7 +100,49 @@ impl DaemonVersion {
 
 pub fn process_instance() -> &'static str {
     static INSTANCE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    INSTANCE.get_or_init(|| uuid::Uuid::new_v4().to_string())
+    INSTANCE.get_or_init(|| {
+        let mut bytes = [0u8; 16];
+        fill_instance_bytes(&mut bytes);
+        bytes[6] = (bytes[6] & 0x0f) | 0x40;
+        bytes[8] = (bytes[8] & 0x3f) | 0x80;
+        format!(
+            "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+            bytes[0],
+            bytes[1],
+            bytes[2],
+            bytes[3],
+            bytes[4],
+            bytes[5],
+            bytes[6],
+            bytes[7],
+            bytes[8],
+            bytes[9],
+            bytes[10],
+            bytes[11],
+            bytes[12],
+            bytes[13],
+            bytes[14],
+            bytes[15]
+        )
+    })
+}
+
+fn fill_instance_bytes(buf: &mut [u8; 16]) {
+    #[cfg(unix)]
+    if let Ok(mut file) = std::fs::File::open("/dev/urandom") {
+        use std::io::Read as _;
+        if file.read_exact(buf).is_ok() {
+            return;
+        }
+    }
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let mixed = nanos ^ (std::process::id() as u128).rotate_left(17);
+    for (i, byte) in buf.iter_mut().enumerate() {
+        *byte = mixed.wrapping_shr((i as u32) * 8) as u8;
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -186,7 +228,7 @@ pub struct LoopbackForwardRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspaceRequest {
-    pub workspace: crate::core::session::WorkspaceId,
+    pub workspace: String,
     pub spec: Box<NativeSshSpec>,
     pub view_pane: u64,
     pub op: WorkspaceOp,
@@ -2615,7 +2657,7 @@ mod tests {
 
     #[test]
     fn on_workspace_roundtrip() {
-        let ws = crate::core::session::WorkspaceId::new();
+        let ws = "ws-1".to_string();
         let spec = Box::new(sample_native_spec().without_secrets());
         let ops = vec![
             WorkspaceOp::EnsureLoopback {
@@ -2661,7 +2703,7 @@ mod tests {
             .into_iter()
             .map(|op| {
                 ClientMsg::OnWorkspace(Box::new(WorkspaceRequest {
-                    workspace: ws,
+                    workspace: ws.clone(),
                     spec: spec.clone(),
                     view_pane: 12,
                     op,
@@ -2845,7 +2887,7 @@ mod tests {
         assert_eq!(v.protocol, 2);
         assert_eq!(v.build, "26.7.4");
         assert!(v.features.is_empty());
-        assert!(!v.has_feature(crate::daemon::control::feature::CONTROL));
+        assert!(!v.has_feature("control"));
     }
 
     #[test]
@@ -2854,7 +2896,7 @@ mod tests {
                           "something_new":{"a":1}}"#;
         let v: DaemonVersion = serde_json::from_slice(future).unwrap();
         assert_eq!(v.protocol, 4);
-        assert!(v.has_feature(crate::daemon::control::feature::CONTROL));
+        assert!(v.has_feature("control"));
     }
 
     #[test]
@@ -2862,7 +2904,7 @@ mod tests {
         let v = DaemonVersion::current();
         assert_eq!(v.protocol, 6);
         assert!(
-            !v.has_feature(crate::daemon::control::feature::CONTROL),
+            !v.has_feature("control"),
             "the session daemon must not advertise a dialect it cannot serve"
         );
     }

@@ -1,8 +1,4 @@
-pub mod conformance;
-pub mod content_search;
 pub mod local;
-pub mod remote;
-pub mod server;
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -313,10 +309,15 @@ pub trait Host: Send + Sync + 'static {
     /// from "no matches".
     fn search_content(
         &self,
-        roots: &[PathBuf],
-        query: &ContentQuery,
-        limits: &ContentLimits,
-    ) -> io::Result<ContentResults>;
+        _roots: &[PathBuf],
+        _query: &ContentQuery,
+        _limits: &ContentLimits,
+    ) -> io::Result<ContentResults> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "content search is not available",
+        ))
+    }
 
     fn write_file(&self, p: &Path, bytes: &[u8]) -> io::Result<Meta>;
 
@@ -330,69 +331,14 @@ pub trait Host: Send + Sync + 'static {
 
     fn repo_root(&self, p: &Path) -> io::Result<Option<PathBuf>>;
 
-    fn git(&self, cwd: &Path, args: &[&str]) -> io::Result<Output>;
-
-    /// The repository `cwd` is in, answered without running `git` — or
-    /// `None` when this host cannot, and [`crate::core::git::probe_repo`]
-    /// asks `git` instead.
-    ///
-    /// Only this machine answers. A remote host could read the same files on
-    /// its side, but asking it to would be a request its server has never
-    /// heard of, and one of those takes the whole link down; the `git` it
-    /// runs over there has no Xcode shim to trip on anyway.
-    fn repo_head(&self, _cwd: &Path) -> Option<Option<crate::core::git::head::RepoHead>> {
-        None
-    }
-
-    /// `git`, but with an explicit ceiling on how long to wait for the far side.
-    ///
-    /// Network verbs (`fetch`/`pull`/`push`) run for as long as the network
-    /// takes, which is minutes, not the seconds an interactive query is allowed.
-    ///
-    /// `LocalHost` deliberately does not override this: `Command::output()`
-    /// blocks until the child exits and has no timeout of its own, so waiting
-    /// "until the deadline" and waiting "until git is done" are the same wait —
-    /// forwarding to `git` is the honest implementation, not a stub. `RemoteHost`
-    /// does override it, because its per-request deadline is sized for
-    /// interactive queries and a push walks straight into it.
-    ///
-    /// The reply is still the plain `Git` request on the wire, so a server that
-    /// predates this method serves it unchanged.
-    fn git_with_deadline(
-        &self,
-        cwd: &Path,
-        args: &[&str],
-        deadline: std::time::Duration,
-    ) -> io::Result<Output> {
-        let _ = deadline;
-        self.git(cwd, args)
-    }
-
-    fn git_lines(
-        &self,
-        cwd: &Path,
-        args: &[&str],
-        on_line: &mut dyn FnMut(&str),
-    ) -> io::Result<Option<i32>> {
-        let out = self.git(cwd, args)?;
-        let mut split = crate::core::git::LineSplitter::default();
-        split.push(&out.stdout, &mut *on_line);
-        split.finish(&mut *on_line);
-        Ok(out.status)
+    fn git(&self, _cwd: &Path, _args: &[&str]) -> io::Result<Output> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "git is not available",
+        ))
     }
 
     fn shells(&self) -> io::Result<ShellInventory>;
-
-    /// Past coding-agent sessions on this host, most recent first.
-    /// `known_dirs` are directories open on it (see
-    /// [`crate::core::agent_history::scan`]). A host that cannot look has
-    /// none to offer.
-    fn agent_sessions(
-        &self,
-        _known_dirs: &[PathBuf],
-    ) -> io::Result<Vec<crate::core::agent_history::PastSession>> {
-        Ok(Vec::new())
-    }
 
     fn watch(&self, dirs: &[PathBuf]) -> io::Result<WatchSub>;
 

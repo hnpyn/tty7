@@ -7,8 +7,11 @@
 //! pane per task wants Up to walk *this* task's commands, not an interleaving
 //! of four.
 //!
-//! So each pane gets its own file, named after the pane, and the shell is told
-//! to use it. Two consequences follow from that being all it is:
+//! So each pane gets its own file, and the shell is told to use it. The file
+//! is `pane-{pid}-{seq}`. Every window is its own process, each one numbers
+//! panes from 1, and they share this directory — the pid is what keeps one
+//! window's cleanup from removing a file another live window still has open.
+//! Two consequences follow from a pane having a file of its own:
 //!
 //! - **The pane does not start blank.** The file is seeded from whatever the
 //!   shell's real history file was, so Up still reaches last week's commands.
@@ -54,11 +57,13 @@ pub fn enabled() -> bool {
 }
 
 fn dir() -> Option<PathBuf> {
-    crate::core::config::config_path("history")
+    // `history` is the GUI's own command file. A directory of the same name
+    // would hide it, and `create_dir_all` fails once that file exists.
+    crate::core::config::config_path("pane-history")
 }
 
 pub fn path_for(pane: u64) -> Option<PathBuf> {
-    Some(dir()?.join(format!("pane-{pane}")))
+    Some(dir()?.join(format!("pane-{}-{pane}", std::process::id())))
 }
 
 /// What to put in a pane's environment, if it should have a history of its own.
@@ -182,12 +187,15 @@ fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(name)
 }
 
-/// Drop the files of panes that no longer exist.
+/// Drop history files whose process is gone, and this process's files for
+/// panes that are not in `keep`.
 ///
-/// A daemon killed outright never gets to retire anything, so its panes' files
-/// are still here the next time one starts. Their commands are lost either way
-/// — the mark that says which of them were new is only meaningful while the
-/// shell that wrote them is alive — so what is left is to not accumulate them.
+/// A window killed outright never gets to retire anything, so its panes'
+/// files are still here the next time one starts. Their commands are lost
+/// either way — the mark that says which of them were new is only meaningful
+/// while the shell that wrote them is alive — so what is left is to not
+/// accumulate them. A file named for a pid that is still alive belongs to
+/// another window and stays: pane numbers restart at 1 in every process.
 pub fn sweep(keep: &HashSet<u64>) {
     let Some(dir) = dir() else {
         return;
@@ -195,10 +203,19 @@ pub fn sweep(keep: &HashSet<u64>) {
     sweep_in(&dir, keep);
 }
 
+/// `pane-{pid}-{seq}`, ignoring a `.seed` / `.origin` suffix already stripped
+/// by the caller. Anything else is not a history file this module wrote.
+fn parse_pane_file(stem: &str) -> Option<(u32, u64)> {
+    let rest = stem.strip_prefix("pane-")?;
+    let (pid, seq) = rest.split_once('-')?;
+    Some((pid.parse().ok()?, seq.parse().ok()?))
+}
+
 fn sweep_in(dir: &Path, keep: &HashSet<u64>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
+    let ours = std::process::id();
     for entry in entries.flatten() {
         let name = entry.file_name();
         let name = name.to_string_lossy();
@@ -206,15 +223,18 @@ fn sweep_in(dir: &Path, keep: &HashSet<u64>) {
             .split_once('.')
             .map(|(stem, _)| stem)
             .unwrap_or(name.as_ref());
-        let Some(id) = stem
-            .strip_prefix("pane-")
-            .and_then(|id| id.parse::<u64>().ok())
-        else {
+        let Some((pid, seq)) = parse_pane_file(stem) else {
             continue;
         };
-        if !keep.contains(&id) {
-            let _ = std::fs::remove_file(entry.path());
+        // Another live window. `keep` is this process's panes, and must not
+        // decide the fate of a file whose owner is still running.
+        if pid != ours && crate::core::proc::pid_alive(pid) {
+            continue;
         }
+        if pid == ours && keep.contains(&seq) {
+            continue;
+        }
+        let _ = std::fs::remove_file(entry.path());
     }
 }
 
@@ -363,8 +383,9 @@ mod tests {
         // that. Hence `sweep_in` rather than `sweep`.
         let dir = std::env::temp_dir().join(format!("tty7-sweeptest-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let kept = dir.join("pane-80007");
-        let dropped = dir.join("pane-80008");
+        let pid = std::process::id();
+        let kept = dir.join(format!("pane-{pid}-80007"));
+        let dropped = dir.join(format!("pane-{pid}-80008"));
         std::fs::write(&kept, "old\n").unwrap();
         std::fs::write(&dropped, "old\n").unwrap();
         std::fs::write(with_suffix(&dropped, ".seed"), "0").unwrap();
@@ -394,5 +415,102 @@ mod tests {
         );
         assert!(!understands("pwsh.exe"));
         assert!(!understands("C:\\Windows\\System32\\cmd.exe"));
+    }
+
+    /// A second window is a second process, and both number panes from 1.
+    /// Sweeping this process must leave `pane-{live_pid}-1` in place and
+    /// remove only the files whose process has already exited.
+    #[test]
+    fn sweep_in_leaves_a_live_pids_pane_history_and_drops_a_dead_ones() {
+        let dir = std::env::temp_dir().join(format!(
+            "tty7-sweeplive-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let live = Reap(spawn_live());
+        let live_pid = live.0.id();
+        assert!(
+            crate::core::proc::pid_alive(live_pid),
+            "the stand-in for another ntty7 window has to be running"
+        );
+        let dead_pid = exited_pid();
+
+        let kept = dir.join(format!("pane-{live_pid}-1"));
+        let dropped = dir.join(format!("pane-{dead_pid}-1"));
+        std::fs::write(&kept, "live\n").unwrap();
+        std::fs::write(with_suffix(&kept, ".seed"), "0").unwrap();
+        std::fs::write(with_suffix(&kept, ".origin"), "/tmp/live\n").unwrap();
+        std::fs::write(&dropped, "dead\n").unwrap();
+        std::fs::write(with_suffix(&dropped, ".seed"), "0").unwrap();
+        std::fs::write(with_suffix(&dropped, ".origin"), "/tmp/dead\n").unwrap();
+
+        // `keep` lists this process's panes. The other window's pane 1 is
+        // not among them, and has to survive anyway.
+        sweep_in(&dir, &HashSet::new());
+
+        assert!(
+            kept.exists(),
+            "sweep_in must leave pane-{live_pid}-1 untouched"
+        );
+        assert!(with_suffix(&kept, ".seed").exists());
+        assert!(with_suffix(&kept, ".origin").exists());
+        assert!(
+            !dropped.exists(),
+            "a dead pid's leftover pane history is swept"
+        );
+        assert!(!with_suffix(&dropped, ".seed").exists());
+        assert!(!with_suffix(&dropped, ".origin").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    struct Reap(std::process::Child);
+    impl Drop for Reap {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    fn spawn_live() -> std::process::Child {
+        let mut cmd = std::process::Command::new(if cfg!(windows) { "ping" } else { "sleep" });
+        if cfg!(windows) {
+            cmd.args(["-n", "30", "127.0.0.1"]);
+        } else {
+            cmd.arg("60");
+        }
+        cmd.stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        crate::core::proc::hide_console(&mut cmd)
+            .spawn()
+            .expect("a process that stays alive for the sweep")
+    }
+
+    fn exited_pid() -> u32 {
+        for _ in 0..8 {
+            let mut cmd = if cfg!(windows) {
+                let mut cmd = std::process::Command::new("cmd");
+                cmd.args(["/c", "exit"]);
+                cmd
+            } else {
+                std::process::Command::new("true")
+            };
+            cmd.stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            crate::core::proc::hide_console(&mut cmd);
+            let mut child = cmd.spawn().expect("a process that exits");
+            let pid = child.id();
+            child.wait().expect("reap the exited process");
+            if !crate::core::proc::pid_alive(pid) {
+                return pid;
+            }
+        }
+        panic!("could not observe a dead pid");
     }
 }
