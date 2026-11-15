@@ -33,34 +33,17 @@ fi
 PACKAGE_UPDATE_ZIP="${TTY7_PACKAGE_UPDATE_ZIP:-1}"
 # A rebranded or local build sets its own name and id, binary dir and output
 # dir. TTY7_BUNDLE_ONLY stops after the .app, before the update zip and DMG.
-APP_NAME="${TTY7_APP_NAME:-tty7}"
-BUNDLE_ID="${TTY7_BUNDLE_ID:-com.github.tty7}"
+APP_NAME="${TTY7_APP_NAME:-ntty7}"
+BUNDLE_ID="${TTY7_BUNDLE_ID:-com.github.ntty7}"
 BIN_DIR="${TTY7_BIN_DIR:-target/${TARGET}/release}"
 DIST="${TTY7_DIST:-dist}"
 APP="$DIST/$APP_NAME.app"
 
 rm -rf "$DIST"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-cp "$BIN_DIR/tty7-app" "$APP/Contents/MacOS/tty7-app"
-chmod +x "$APP/Contents/MacOS/tty7-app"
-# The CLI rides inside the bundle rather than beside it: a DMG is drag-to-
-# Applications, so anything not in the .app never reaches the user's disk. The
-# GUI symlinks it onto PATH at launch (see core::cli_install), which is why it
-# sits next to tty7-app under MacOS/ — that is the directory the GUI resolves
-# relative to its own executable.
-cp "$BIN_DIR/tty7" "$APP/Contents/MacOS/tty7"
-chmod +x "$APP/Contents/MacOS/tty7"
-if [[ "$PACKAGE_UPDATE_ZIP" != "0" ]]; then
-    # A focused out-of-process updater can replace the bundle after the GUI
-    # exits, then relaunch or roll back without teaching the GUI to mutate
-    # itself. Every macOS build carries it beside the app/CLI so its signature
-    # is covered by the outer bundle — including Nightly, whose users are
-    # offered the stable release that supersedes their prerelease and need a
-    # working helper to get there.
-    cp "$BIN_DIR/tty7-updater" "$APP/Contents/MacOS/tty7-updater"
-    chmod +x "$APP/Contents/MacOS/tty7-updater"
-fi
-cp assets/tty7.icns "$APP/Contents/Resources/tty7.icns"
+cp "$BIN_DIR/ntty7" "$APP/Contents/MacOS/ntty7"
+chmod +x "$APP/Contents/MacOS/ntty7"
+cp assets/ntty7.icns "$APP/Contents/Resources/ntty7.icns"
 # Completion signatures are loaded at runtime (not embedded), resolved relative
 # to the executable as ../Resources/completions — see terminal::signature.
 mkdir -p "$APP/Contents/Resources/completions"
@@ -81,8 +64,8 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>CFBundleIdentifier</key><string>${BUNDLE_ID}</string>
     <key>CFBundleVersion</key><string>${VERSION}</string>
     <key>CFBundleShortVersionString</key><string>${VERSION}</string>
-    <key>CFBundleExecutable</key><string>tty7-app</string>
-    <key>CFBundleIconFile</key><string>tty7</string>
+    <key>CFBundleExecutable</key><string>ntty7</string>
+    <key>CFBundleIconFile</key><string>ntty7</string>
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>NSHighResolutionCapable</key><true/>
     <key>NSPrincipalClass</key><string>NSApplication</string>
@@ -244,14 +227,8 @@ ENT
     # entitlements: the JIT and library-validation exemptions exist for gpui's
     # Metal path, and a CLI that never renders anything has no business holding
     # them.
-    codesign --force --options runtime "$TIMESTAMP" \
-        --sign "$SIGN_ID" "$APP/Contents/MacOS/tty7"
-    if [[ "$PACKAGE_UPDATE_ZIP" != "0" ]]; then
-        codesign --force --options runtime "$TIMESTAMP" \
-            --sign "$SIGN_ID" "$APP/Contents/MacOS/tty7-updater"
-    fi
     codesign --force --options runtime "$TIMESTAMP" --entitlements "$ENTITLEMENTS" \
-        --sign "$SIGN_ID" "$APP/Contents/MacOS/tty7-app"
+        --sign "$SIGN_ID" "$APP/Contents/MacOS/ntty7"
     codesign --force --options runtime "$TIMESTAMP" --entitlements "$ENTITLEMENTS" \
         --sign "$SIGN_ID" "$APP"
     codesign --verify --strict --verbose=2 "$APP"
@@ -301,10 +278,7 @@ fi
 # cheap next to carrying a second copy of this block inside each branch.
 BUNDLE_FAIL=0
 ASSERT_MACHO="$(dirname "$0")/assert-macho.sh"
-BUNDLED_BINS=(tty7-app tty7)
-if [[ "$PACKAGE_UPDATE_ZIP" != "0" ]]; then
-    BUNDLED_BINS+=(tty7-updater)
-fi
+BUNDLED_BINS=(ntty7)
 # First the binaries we staged ourselves, held to the full standard the server
 # asset is: the right arch, links nothing macOS does not ship, carries a
 # signature. This also leaves every shipped binary's load commands in the

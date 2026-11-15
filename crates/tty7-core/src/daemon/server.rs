@@ -9,6 +9,27 @@ use crate::daemon::protocol::{ClientMsg, DaemonMsg, DaemonVersion, LeaseRequest,
 use crate::daemon::ssh::SshConnection;
 use crate::daemon::transport::{self, Stream};
 
+/// The registry the in-process daemon is serving, so the GUI can drop every
+/// pane on quit. `DaemonPane::drop` is what merges a pane's commands back into
+/// the user's shell history.
+static IN_PROCESS: Mutex<Option<Arc<Registry>>> = Mutex::new(None);
+
+fn publish_in_process(registry: &Arc<Registry>) {
+    *IN_PROCESS.lock().unwrap() = Some(registry.clone());
+}
+
+/// Hang up and drop every pane this process's daemon still holds.
+///
+/// Safe to call more than once, and when no daemon was started. The drop is
+/// what runs `history::retire`; callers that then delete the runtime directory
+/// must call this first.
+pub fn shutdown_in_process() {
+    let registry = IN_PROCESS.lock().unwrap().clone();
+    if let Some(registry) = registry {
+        registry.drain_and_kill();
+    }
+}
+
 struct Registry {
     panes: Mutex<HashMap<u64, Arc<DaemonPane>>>,
     next_id: AtomicU64,
@@ -74,8 +95,20 @@ impl Registry {
             let mut guard = self.panes.lock().unwrap();
             guard.drain().map(|(_, p)| p).collect()
         };
-        for pane in panes {
+        for pane in &panes {
+            // `kill` drops the client senders, so a stream parked in `read`
+            // wakes and releases its `Arc` before this wait has to sleep.
             pane.kill();
+        }
+        // A live attach holds its own `Arc` until that wake lands. Waiting
+        // until this vec is the last owner makes `Drop` — and the history
+        // merge it performs — run here, before the process exits.
+        let deadline = std::time::Duration::from_secs(2);
+        for pane in &panes {
+            let start = std::time::Instant::now();
+            while Arc::strong_count(pane) > 1 && start.elapsed() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
         }
     }
 
@@ -482,6 +515,7 @@ fn run_daemon_inner() -> anyhow::Result<()> {
     };
 
     let registry = Arc::new(Registry::new());
+    publish_in_process(&registry);
 
     #[cfg(any(unix, windows))]
     {
@@ -543,6 +577,7 @@ fn run_adopting(inheritance: crate::daemon::handoff::Inheritance) -> anyhow::Res
     }
 
     let registry = Arc::new(Registry::new());
+    publish_in_process(&registry);
 
     match crate::daemon::handoff::adopt(inheritance.blob_fd) {
         Some(adopted) => {
@@ -1888,5 +1923,79 @@ mod tests {
             writer.join().unwrap();
             drop(client);
         }
+    }
+
+    #[test]
+    fn shutdown_before_a_daemon_starts_is_a_no_op() {
+        super::shutdown_in_process();
+        super::shutdown_in_process();
+    }
+
+    /// A connected client used to pin the pane for the whole 2s drain: hangup
+    /// set `shutting_down` and the death reporter then left the subscriber in
+    /// place, so `stream_pane` never left `read` and `Drop` never ran.
+    #[cfg(unix)]
+    #[test]
+    fn drain_and_kill_drops_a_connected_pane_promptly() {
+        use crate::daemon::protocol::{ShellSpec, WinSize};
+        use std::os::unix::net::UnixStream;
+        use std::time::{Duration, Instant};
+
+        let pane = DaemonPane::spawn(
+            7,
+            None,
+            WinSize {
+                cols: 80,
+                rows: 24,
+                cell_w: 8,
+                cell_h: 17,
+            },
+            Some(ShellSpec {
+                program: "sh".into(),
+                args: vec!["-c".into(), "exec cat".into()],
+                args_are_tty7_defaults: false,
+            }),
+            None,
+            None,
+            None,
+            false,
+            || {},
+        )
+        .expect("spawn a pane");
+        let weak = Arc::downgrade(&pane);
+        let registry = Arc::new(Registry::new());
+        registry.insert(Arc::clone(&pane));
+
+        let (client, server) = UnixStream::pair().expect("socket pair");
+        let read_stream = server.try_clone().expect("clone the read half");
+        let registry_for_stream = Arc::clone(&registry);
+        let stream = std::thread::spawn(move || {
+            let _ = stream_pane(pane, 7, read_stream, server, registry_for_stream, false);
+        });
+
+        // Attach and the blocking read happen on that thread. Draining before
+        // either one lets the thread attach afterwards and park again.
+        std::thread::sleep(Duration::from_millis(200));
+
+        let started = Instant::now();
+        registry.drain_and_kill();
+        let elapsed = started.elapsed();
+        drop(client);
+
+        assert!(
+            elapsed < Duration::from_millis(100),
+            "drain_and_kill took {elapsed:?} with a client still attached"
+        );
+        assert!(
+            weak.upgrade().is_none(),
+            "DaemonPane was not dropped; a client stream still holds it"
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !stream.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(stream.is_finished(), "the client stream did not leave read");
+        let _ = stream.join();
     }
 }

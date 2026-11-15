@@ -573,7 +573,7 @@ impl WindowViews {
     }
 
     fn path() -> Option<PathBuf> {
-        crate::core::config::config_path("views.json")
+        crate::core::config::runtime_path("views.json")
     }
 }
 

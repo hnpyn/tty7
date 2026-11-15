@@ -1,15 +1,4 @@
-use gpui::{Corners, Pixels, Styled, px};
-
-pub(crate) trait RoundedCorners: Styled + Sized {
-    fn rounded_corners(self, corners: Corners<Pixels>) -> Self {
-        self.rounded_tl(corners.top_left)
-            .rounded_tr(corners.top_right)
-            .rounded_bl(corners.bottom_left)
-            .rounded_br(corners.bottom_right)
-    }
-}
-
-impl<T: Styled + Sized> RoundedCorners for T {}
+use gpui::{Corners, Pixels, px};
 
 #[allow(dead_code)]
 pub(crate) const TRACK_RADIUS: Pixels = px(8.);
@@ -17,7 +6,6 @@ pub(crate) const TRACK_RADIUS: Pixels = px(8.);
 /// Inset cards, interactive rows, and floating panels share the A style scale.
 #[allow(dead_code)]
 pub(crate) const CARD_RADIUS: Pixels = px(10.);
-pub(crate) const ROW_RADIUS: Pixels = px(7.);
 pub(crate) const POPOVER_RADIUS: Pixels = px(10.);
 
 pub(crate) const HAIRLINE: Pixels = px(1.);

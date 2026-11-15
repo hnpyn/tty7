@@ -162,7 +162,7 @@ fn take<'a>(cur: &mut &'a [u8], n: usize) -> Option<&'a [u8]> {
 }
 
 fn dir() -> Option<PathBuf> {
-    crate::core::config::config_path("scrollback")
+    crate::core::config::runtime_path("scrollback")
 }
 
 fn path_for(pane_id: u64) -> Option<PathBuf> {

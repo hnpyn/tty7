@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use crate::core::config;
 
 pub fn path() -> Option<PathBuf> {
-    config::config_path("daemon.pid")
+    config::runtime_path("daemon.pid")
 }
 
 pub fn write_current() {

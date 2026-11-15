@@ -21,22 +21,17 @@ if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then
   echo "bundle-linux: could not read a version from Cargo.toml (got '$VERSION')" >&2
   exit 1
 fi
-NAME="tty7-${VERSION}-linux-${ARCH}"
+NAME="ntty7-${VERSION}-linux-${ARCH}"
 STAGE="dist/${NAME}"
 
 rm -rf dist
 mkdir -p "$STAGE"
 
-cp "target/${TARGET}/release/tty7-app" "$STAGE/tty7-app"
-chmod +x "$STAGE/tty7-app"
-# The CLI ships beside the GUI, which symlinks it onto PATH at launch (see
-# core::cli_install) by resolving it relative to its own executable.
-cp "target/${TARGET}/release/tty7" "$STAGE/tty7"
-chmod +x "$STAGE/tty7"
+cp "target/${TARGET}/release/ntty7" "$STAGE/ntty7"
+chmod +x "$STAGE/ntty7"
 # Release builds keep symbols (thin LTO, no profile strip); drop them here so
 # the archive isn't ~100 MB of debug info.
-strip "$STAGE/tty7-app" || echo "⚠️  strip unavailable — shipping unstripped binary"
-strip "$STAGE/tty7" || echo "⚠️  strip unavailable — shipping unstripped CLI"
+strip "$STAGE/ntty7" || echo "⚠️  strip unavailable — shipping unstripped binary"
 mkdir -p "$STAGE/completions"
 cp assets/completions/*.json "$STAGE/completions/"
 cp LICENSE "$STAGE/LICENSE"

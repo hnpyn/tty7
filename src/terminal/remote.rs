@@ -657,7 +657,7 @@ pub struct RemoteTerminal {
     color_scheme_updates: Arc<AtomicBool>,
 }
 
-/// The workspace id a spawn carries, so the pane's shell gets `$TTY7_WS` and a
+/// The workspace id a spawn carries, so the pane's shell gets `$NTTY7_WS` and a
 /// CLI running in it can use workspace-scoped verbs with no argument.
 ///
 /// This is the same id as `owner`, but decided separately: `owner` is also
@@ -1292,7 +1292,7 @@ impl RemoteTerminal {
                 };
                 let mut scratch = vec![0u8; 256 * 1024];
 
-                let trace = std::env::var("TTY7_TRACE").is_ok_and(|v| !v.is_empty() && v != "0");
+                let trace = std::env::var("NTTY7_TRACE").is_ok_and(|v| !v.is_empty() && v != "0");
                 let mut tr_last = std::time::Instant::now();
                 let mut tr_bytes: u64 = 0;
                 let mut tr_reads: u32 = 0;
@@ -2873,7 +2873,7 @@ pub(crate) fn notify_desktop(title: Option<&str>, body: &str) {
 /// back to the plain `notify-rust` path below, which is why
 /// `try_clickable_notification` reports whether it took the job.
 pub(crate) fn notify_desktop_for_pane(title: Option<&str>, body: &str, pane: Option<EntityId>) {
-    let summary = sanitize_notification_text(title.unwrap_or("tty7"), NOTIFY_TITLE_MAX);
+    let summary = sanitize_notification_text(title.unwrap_or("ntty7"), NOTIFY_TITLE_MAX);
     let body = sanitize_notification_text(body, NOTIFY_BODY_MAX);
 
     #[cfg(target_os = "macos")]
@@ -3047,12 +3047,14 @@ mod macos_notify {
             // touched: the center drops requests from a process with no bundle
             // identity, which is what a bare `cargo run` binary is. This
             // swizzles `-[NSBundle bundleIdentifier]` for the main bundle to
-            // `com.github.tty7` when LaunchServices knows that id (a bundled
-            // tty7.app, or a machine that has one installed); when it does not,
-            // the swizzle's own default, `com.apple.Terminal`, is what the
+            // `com.github.ntty7` when LaunchServices knows that id (a bundled
+            // ntty7.app). It is not tty7's id: a machine that also has
+            // tty7.app installed must not have this process's notifications
+            // claimed by that bundle. When LaunchServices does not know the
+            // id, the swizzle's own default, `com.apple.Terminal`, is what the
             // center sees. It can only be called once per process, so there is
             // no second chance to pass a different name.
-            let _ = notify_rust::set_application("com.github.tty7");
+            let _ = notify_rust::set_application("com.github.ntty7");
             // SAFETY: `NSObject`'s `init` takes nothing and returns the object.
             let delegate: Retained<Delegate> = unsafe { msg_send![Delegate::alloc(), init] };
             let center = NSUserNotificationCenter::defaultUserNotificationCenter();
@@ -3253,12 +3255,21 @@ fn show_windows_toast(
 /// about is revealed; anything else — a toast from an earlier tty7, one
 /// without a pane, a launch string we do not recognize — still brings tty7
 /// forward, which is what the user clicked a tty7 toast for.
+/// What a toast click used to ask the tray to do. The tray is gone, so a
+/// click is recorded and otherwise ignored; the variants stay so the launch
+/// string is still parsed.
 #[cfg(any(target_os = "windows", test))]
-fn toast_click_action(launch: &str) -> crate::ui::tray::TrayAction {
-    use crate::ui::tray::TrayAction;
+#[derive(Debug, PartialEq, Eq)]
+enum ToastClick {
+    RevealPane { leaf_id: u64 },
+    ShowWindow,
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn toast_click_action(launch: &str) -> ToastClick {
     match leaf_id_in_identifier(launch) {
-        Some(leaf_id) => TrayAction::RevealPane { leaf_id },
-        None => TrayAction::ShowWindow,
+        Some(leaf_id) => ToastClick::RevealPane { leaf_id },
+        None => ToastClick::ShowWindow,
     }
 }
 
@@ -3303,7 +3314,7 @@ pub(crate) fn toast_activated(launch: &str) {
         .map(|mut recent| recent.first_time(launch))
         .unwrap_or(true);
     if first {
-        crate::ui::tray::send_or_queue(toast_click_action(launch));
+        let _ = toast_click_action(launch);
     }
 }
 
@@ -3311,7 +3322,8 @@ pub(crate) fn toast_activated(launch: &str) {
 /// thread the platform hands the activation to, so it only touches the channel.
 #[cfg(target_os = "macos")]
 fn reveal_pane(leaf_id: u64) {
-    crate::ui::tray::send_or_queue(crate::ui::tray::TrayAction::RevealPane { leaf_id });
+    // Click-to-reveal went with the tray. The banner still dismisses.
+    let _ = leaf_id;
 }
 
 #[cfg(not(any(target_os = "macos", all(target_os = "windows", not(test)))))]
@@ -3406,7 +3418,7 @@ mod notification_tests {
         let xml = toast_xml("title", "body", &notification_identifier(42));
         assert_eq!(
             toast_click_action(&launch_attribute(&xml)),
-            crate::ui::tray::TrayAction::RevealPane { leaf_id: 42 }
+            ToastClick::RevealPane { leaf_id: 42 }
         );
     }
 
@@ -3417,12 +3429,9 @@ mod notification_tests {
         let xml = toast_xml("title", "body", &stale);
         assert_eq!(
             toast_click_action(&launch_attribute(&xml)),
-            crate::ui::tray::TrayAction::ShowWindow
+            ToastClick::ShowWindow
         );
-        assert_eq!(
-            toast_click_action(""),
-            crate::ui::tray::TrayAction::ShowWindow
-        );
+        assert_eq!(toast_click_action(""), ToastClick::ShowWindow);
     }
 
     #[test]
@@ -5507,7 +5516,7 @@ mod tests {
         assert_eq!(
             spawn_workspace(Some(ws), &PaneRoute::Local).as_deref(),
             Some(ws),
-            "without this the pane's shell has no $TTY7_WS and every \
+            "without this the pane's shell has no $NTTY7_WS and every \
              workspace-scoped CLI verb in it needs an explicit address"
         );
 

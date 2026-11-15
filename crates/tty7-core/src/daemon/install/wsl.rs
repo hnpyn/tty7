@@ -449,7 +449,7 @@ impl RemoteOps for WslRemoteOps {
     }
 }
 
-pub const BUNDLED_DIR_ENV: &str = "TTY7_BUNDLED_SERVER_DIR";
+pub const BUNDLED_DIR_ENV: &str = "NTTY7_BUNDLED_SERVER_DIR";
 
 pub const BUNDLED_SUBDIR: &str = "server";
 

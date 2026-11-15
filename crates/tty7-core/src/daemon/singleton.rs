@@ -49,7 +49,7 @@ pub enum Claim {
 }
 
 fn lock_path() -> Option<PathBuf> {
-    crate::core::config::config_path("daemon.lock")
+    crate::core::config::runtime_path("daemon.lock")
 }
 
 /// The descriptor the seat is held on, for the one caller that needs it after

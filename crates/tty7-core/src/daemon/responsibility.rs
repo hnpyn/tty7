@@ -45,6 +45,14 @@ use std::os::unix::ffi::OsStrExt as _;
 /// once; after a handoff that is one more `exec`, and it is cheap.
 pub const DISCLAIMED_FLAG: &str = "--responsibility-disclaimed";
 
+static SKIP_DISCLAIM: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The window and the terminal server share one process. Disclaiming would
+/// re-exec that process and replace the window with a second copy of `main`.
+pub fn skip_disclaim() {
+    SKIP_DISCLAIM.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
 #[cfg(test)]
 type ResponsibleFor = unsafe extern "C" fn(libc::pid_t) -> libc::pid_t;
 type SetDisclaim = unsafe extern "C" fn(*mut libc::posix_spawnattr_t, libc::c_int) -> libc::c_int;
@@ -53,6 +61,9 @@ type SetDisclaim = unsafe extern "C" fn(*mut libc::posix_spawnattr_t, libc::c_in
 /// unless this image is already the result of that. Returns only when no
 /// re-exec happened; on success this process is already the new image.
 pub fn disclaim_inherited() {
+    if SKIP_DISCLAIM.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
     let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
     if args.iter().any(|arg| arg == DISCLAIMED_FLAG) {
         log::info!("the daemon disclaimed its launcher's responsibility");

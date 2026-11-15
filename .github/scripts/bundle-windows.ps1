@@ -5,7 +5,7 @@
 #     (Program Files or per-user, Start Menu shortcut, "Apps" uninstall entry)
 #
 # Fonts are embedded via include_bytes! and the app icon is compiled into the
-# executable as a resource (see build.rs). So the payload is tty7-app.exe plus a
+# executable as a resource (see build.rs). So the payload is ntty7.exe plus a
 # sibling completions\ dir (loaded at runtime — see terminal::signature), the
 # bundled ConPTY pair (loaded by the DLL search path — see below) and the
 # license/readme. Windows release artifacts are intentionally unsigned. The
@@ -21,32 +21,22 @@ $Version = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"').
 # other prerelease builds retain their display version without breaking ISCC.
 $VersionCore = ($Version -split '[-+]', 2)[0]
 $VersionInfoVersion = "${VersionCore}.0"
-$Name  = "tty7-$Version-windows-$Arch"
+$Name  = "ntty7-$Version-windows-$Arch"
 $Stage = "dist/$Name"
 $PackageUpdater = $env:TTY7_PACKAGE_UPDATE_HELPER -ne '0'
 
 Remove-Item -Recurse -Force dist -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force -Path $Stage | Out-Null
 
-Copy-Item "target/$Target/release/tty7-app.exe" "$Stage/tty7-app.exe"
-# The CLI, staged beside the GUI so both the zip and the installer carry it.
-# `core::cli_install` resolves it relative to tty7-app.exe and puts that
-# directory on the user's PATH.
-Copy-Item "target/$Target/release/tty7.exe" "$Stage/tty7.exe"
-if ($PackageUpdater) {
-    # The installed copy is never executed in place during an update. The GUI
-    # first copies it to a private staging directory so Inno can replace every
-    # installed executable without colliding with Windows image locks.
-    Copy-Item "target/$Target/release/tty7-updater.exe" "$Stage/tty7-updater.exe"
-}
+Copy-Item "target/$Target/release/ntty7.exe" "$Stage/ntty7.exe"
 New-Item -ItemType Directory -Force -Path "$Stage/completions" | Out-Null
 Copy-Item "assets/completions/*.json" "$Stage/completions/"
 Copy-Item LICENSE "$Stage/LICENSE.txt"
 Copy-Item README.md "$Stage/README.md"
 
 # Microsoft's redistributable ConPTY, which `portable-pty` prefers over the
-# in-box conhost when it sits beside the running executable — and the daemon is
-# `tty7-app.exe --daemon`, so beside it is exactly here. The in-box host
+# in-box conhost when it sits beside the running executable. The daemon runs
+# inside ntty7.exe, so beside that binary is exactly here. The in-box host
 # swallows a pane's OSC 11 background query (#345); this pair forwards it. The
 # two files are one unit, so a missing half is an error rather than a warning.
 # See assets/windows/conpty/README.md.
@@ -62,7 +52,7 @@ Copy-Item "assets/windows/conpty/LICENSE.txt" "$Stage/LICENSE-ConPTY.txt"
 # The Linux musl `tty7-server`, staged at server/ so a WSL distro can be handed
 # the binary this client shipped with (WSL downloads nothing). The
 # lookup path is a contract with `daemon::install::wsl` — it searches
-# <dir of tty7-app.exe>/server/<asset> first — so this directory name is not free to
+# <dir of ntty7.exe>/server/<asset> first — so this directory name is not free to
 # change on its own. Missing is a warning, not an error, matching `server-musl`'s
 # own skip-don't-fail probe; WSL then fails at connect time with a message
 # naming the directories it searched.

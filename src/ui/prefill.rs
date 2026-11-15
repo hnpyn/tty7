@@ -9,7 +9,7 @@
 //! replacing, and every find bar and rename box on the platform answers the
 //! same way: select it.
 
-use gpui::{AppContext as _, Context, Entity, Window};
+use gpui::{Context, Entity, Window};
 use gpui_component::input::{InputState, SelectAll};
 
 /// How many frames to keep trying for. One is not enough — see below — and
@@ -58,20 +58,4 @@ fn try_select(input: Entity<InputState>, left: u8, window: &mut Window) {
     // Registering a callback does not by itself ask for a frame, and a panel
     // that has finished drawing has no other reason to produce one.
     window.refresh();
-}
-
-/// A new box holding `value`, with the value selected.
-///
-/// Focusing is left to the caller: a form opens with one of its boxes focused
-/// and the rest merely filled, and tabbing into one of those selects it the
-/// same way.
-pub(crate) fn filled_box<T: 'static>(
-    value: impl Into<String>,
-    window: &mut Window,
-    cx: &mut Context<T>,
-) -> Entity<InputState> {
-    let input = cx.new(|cx| InputState::new(window, cx));
-    input.update(cx, |state, cx| state.set_value(value.into(), window, cx));
-    select_all_when_drawn(&input, window, cx);
-    input
 }

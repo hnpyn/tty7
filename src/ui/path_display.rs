@@ -15,17 +15,8 @@
 //! Info panel's Copy Path and Reveal both carry the untouched `PathBuf`, and
 //! the tab strip and picker only ever draw it.
 //!
-//! *Which* home a path is measured against is the caller's to say, because
-//! only the caller knows which machine the path is on. A pane, a workspace
-//! row or a tab title can name a directory on another host, and this
-//! machine's `$HOME` answers for nothing over there: `/home/deploy/app` on a
-//! server shortened to `~/app` on a laptop that happens to log in as
-//! `deploy`, and stayed long on one that does not, so the `~` meant the
-//! wrong machine either way (#580). [`home_for_host`] is where that question
-//! is answered — the same borrow #568 took out of the file-link resolver.
+//! A path on another machine is not shortened against this machine's home.
 
-use crate::ui::host_ops::HostId;
-use gpui::App;
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 
@@ -40,21 +31,6 @@ pub(crate) fn local_home() -> Option<PathBuf> {
         .filter(|h| !h.is_empty())
         .or_else(|| std::env::var_os("USERPROFILE").filter(|h| !h.is_empty()))
         .map(PathBuf::from)
-}
-
-/// The directory `~` stands for in a path that lives on `host`.
-///
-/// A remote host reports its home during the control handshake and it is
-/// kept per host in [`HostLinks`](crate::ui::remote_connect::HostLinks), so
-/// this costs a map lookup and never a round trip. `None` means nothing here
-/// can say — no link to that host yet — and a path measured against nothing
-/// is shown whole, which is the honest answer and the one #568 settled on
-/// for the same question about file links.
-pub(crate) fn home_for_host(cx: &App, host: HostId) -> Option<PathBuf> {
-    match host.is_local() {
-        true => local_home(),
-        false => crate::ui::remote_connect::HostLinks::home(cx, host),
-    }
 }
 
 /// `/`-spelled, case-folded, trailing separators dropped — the form two

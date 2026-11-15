@@ -1505,7 +1505,7 @@ fn worker(inner: Arc<PoolInner>) {
     }
 }
 
-pub const CONTROL_SOCK_ENV: &str = "TTY7_CONTROL_SOCK";
+pub const CONTROL_SOCK_ENV: &str = "NTTY7_CONTROL_SOCK";
 
 #[cfg(unix)]
 mod sock {
@@ -1532,8 +1532,8 @@ mod sock {
             return Ok(PathBuf::from(explicit));
         }
 
-        let dir = crate::core::config::config_dir_path().ok_or_else(|| {
-            io::Error::other("no config directory to place the control socket in")
+        let dir = crate::core::config::runtime_dir_path().ok_or_else(|| {
+            io::Error::other("no runtime directory to place the control socket in")
         })?;
 
         let fallbacks: Vec<PathBuf> = [runtime_dir(), Some(std::env::temp_dir())]

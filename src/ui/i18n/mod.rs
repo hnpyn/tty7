@@ -12,7 +12,6 @@ use zh::{translate_variant_zh, translate_zh};
 
 pub struct LanguageInfo {
     pub code: &'static str,
-    pub label_key: L10nKey,
     pub translate_fn: fn(L10nKey) -> Option<&'static str>,
     pub translate_variant_fn: fn(L10nKey, &'static str) -> Option<&'static str>,
 }
@@ -20,33 +19,25 @@ pub struct LanguageInfo {
 pub const SUPPORTED_LANGUAGES: &[LanguageInfo] = &[
     LanguageInfo {
         code: "en",
-        label_key: L10nKey::SettingsLanguageEnglish,
         translate_fn: |k| Some(translate_en(k)),
         translate_variant_fn: translate_variant_en,
     },
     LanguageInfo {
         code: "zh-CN",
-        label_key: L10nKey::SettingsLanguageChinese,
         translate_fn: translate_zh,
         translate_variant_fn: translate_variant_zh,
     },
     LanguageInfo {
         code: "ja-JP",
-        label_key: L10nKey::SettingsLanguageJapanese,
         translate_fn: translate_ja,
         translate_variant_fn: translate_variant_ja,
     },
     LanguageInfo {
         code: "ru-RU",
-        label_key: L10nKey::SettingsLanguageRussian,
         translate_fn: translate_ru,
         translate_variant_fn: translate_variant_ru,
     },
 ];
-
-pub fn find_language(code: &str) -> Option<&'static LanguageInfo> {
-    SUPPORTED_LANGUAGES.iter().find(|lang| lang.code == code)
-}
 
 pub fn default_language_code() -> &'static str {
     SUPPORTED_LANGUAGES[0].code
@@ -1261,6 +1252,9 @@ l10n_keys! {
     AppMenuFile,
     AppMenuEdit,
     AppMenuView,
+    AppMenuTheme,
+    AppMenuFollowSystemAppearance,
+    AppMenuOpenConfigFile,
     AppMenuWindow,
     AppMenuHelp,
     AppMenuNewTab,
@@ -1906,25 +1900,6 @@ pub fn t(key: L10nKey) -> &'static str {
 
 pub fn t_fmt(key: L10nKey, args: &[(&str, &str)]) -> String {
     apply_template(t(key), args, None)
-}
-
-/// The same key as every *other* locale words it.
-///
-/// Fingers learn a command's name once. Someone running the UI in Chinese who
-/// picked the habit up in English still types `theme`, and until this existed
-/// the palette answered "no matching commands" — the label it was matching
-/// against was the only one that existed. Callers keep these as hidden search
-/// aliases; nothing renders them, so the wording on screen never changes.
-pub fn alias_translations(key: L10nKey) -> Vec<&'static str> {
-    let shown = t(key);
-    let mut out = Vec::with_capacity(SUPPORTED_LANGUAGES.len() - 1);
-    for idx in 0..SUPPORTED_LANGUAGES.len() {
-        let text = translate(idx, key);
-        if text != shown && !out.contains(&text) {
-            out.push(text);
-        }
-    }
-    out
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

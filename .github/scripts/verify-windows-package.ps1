@@ -6,12 +6,10 @@
 # fact it checks there is checked here instead, so a packaging mistake fails
 # the release build rather than every user's next update.
 #
-# Mirrors, in order:
-#   core::update::windows_update_layout_for      — the install marker
-#   core::update::package_for_current_install    — tty7-updater.exe beside the app
-#   tty7-updater `windows::verify_portable_payload`  — portable layout + versions
-#   tty7-updater `windows::extract_portable_archive` — ZIP entry rules
-#   tty7-updater `windows::verify_file_version`      — setup.exe PE version
+# Checks, in order:
+#   the install marker and the portable marker
+#   the portable archive layout (ntty7.exe, license, readme, completions)
+#   ProductVersion on ntty7.exe and the setup.exe file version
 #
 # Usage: verify-windows-package.ps1 <arch> [version]
 # `version` defaults to the version in Cargo.toml, which is what the bundle
@@ -28,7 +26,7 @@ if (-not $Version) {
 # compares the release version's numeric core against it. Keep the same split.
 $VersionCore = ($Version -split '[-+]', 2)[0]
 
-$Name  = "tty7-$Version-windows-$Arch"
+$Name  = "ntty7-$Version-windows-$Arch"
 $Zip   = "dist/$Name.zip"
 $Setup = "dist/$Name-setup.exe"
 $Stage = "dist/$Name"
@@ -115,7 +113,7 @@ if (-not (Test-Path -LiteralPath $Zip)) {
 
     # `validate_portable_relative_path` allows only these top-level names.
     $managed = @(
-        'tty7-app.exe', 'tty7.exe', 'tty7-updater.exe', '.tty7-portable',
+        'ntty7.exe', '.tty7-portable',
         'completions', 'server', 'LICENSE.txt', 'README.md',
         'conpty.dll', 'OpenConsole.exe', 'LICENSE-ConPTY.txt'
     )
@@ -140,10 +138,9 @@ if (-not (Test-Path -LiteralPath $Zip)) {
         [System.IO.Compression.ZipFile]::ExtractToDirectory(
             (Resolve-Path $Zip).Path, $unzipped)
 
-        # `verify_portable_payload`: every required member, then the marker
-        # content, then the complete version of both executables.
-        foreach ($required in @('tty7-app.exe', 'tty7.exe', 'tty7-updater.exe',
-                                '.tty7-portable', 'LICENSE.txt', 'README.md')) {
+        # Every required member, then the marker content, then ntty7.exe's
+        # ProductVersion.
+        foreach ($required in @('ntty7.exe', '.tty7-portable', 'LICENSE.txt', 'README.md')) {
             if (-not (Test-Path -LiteralPath (Join-Path $unzipped $required) -PathType Leaf)) {
                 Fail "the portable archive is missing the required file $required"
             }
@@ -161,8 +158,7 @@ if (-not (Test-Path -LiteralPath $Zip)) {
             }
         }
 
-        Assert-BinaryVersion (Join-Path $unzipped 'tty7-app.exe') 'the portable tty7-app.exe'
-        Assert-BinaryVersion (Join-Path $unzipped 'tty7-updater.exe') 'the portable tty7-updater.exe'
+        Assert-BinaryVersion (Join-Path $unzipped 'ntty7.exe') 'the portable ntty7.exe'
         Assert-ConptyPair $unzipped 'the portable archive'
         Assert-NoVcRuntime $unzipped 'the portable archive'
     } finally {
@@ -183,11 +179,7 @@ if (-not (Test-Path -LiteralPath $Stage -PathType Container)) {
     if (Test-Path -LiteralPath (Join-Path $Stage '.tty7-portable')) {
         Fail "the Inno payload carries the portable marker, which would misroute the updater"
     }
-    if (-not (Test-Path -LiteralPath (Join-Path $Stage 'tty7-updater.exe') -PathType Leaf)) {
-        Fail "the Inno payload is missing tty7-updater.exe"
-    }
-    Assert-BinaryVersion (Join-Path $Stage 'tty7-app.exe') 'the installed tty7-app.exe'
-    Assert-BinaryVersion (Join-Path $Stage 'tty7-updater.exe') 'the installed tty7-updater.exe'
+    Assert-BinaryVersion (Join-Path $Stage 'ntty7.exe') 'the installed ntty7.exe'
     Assert-ConptyPair $Stage 'the Inno payload'
     Assert-NoVcRuntime $Stage 'the Inno payload'
 }
@@ -211,4 +203,4 @@ if ($failures.Count -gt 0) {
     throw "the Windows release package would not be updatable in place ($($failures.Count) problem(s))"
 }
 
-Write-Output "Windows package verified: markers, tty7-updater.exe and versions match $Version"
+Write-Output "Windows package verified: markers and ntty7.exe versions match $Version"

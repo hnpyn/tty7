@@ -43,6 +43,10 @@ pub struct Theme {
     pub blur: bool,
     pub image: Option<Image>,
     pub ansi16: [(u8, u8, u8); 16],
+    /// Which file a user theme was loaded from. The editor that wrote it back
+    /// is gone; the path stays so a reload can still tell a file-backed theme
+    /// from a built-in.
+    #[allow(dead_code)]
     pub path: Option<PathBuf>,
 }
 
@@ -170,7 +174,7 @@ pub struct Lanes {
     pub overflow: u32,
 }
 
-pub struct ActiveLanes(pub Lanes);
+pub struct ActiveLanes(#[allow(dead_code)] pub Lanes);
 
 impl Global for ActiveLanes {}
 
@@ -590,22 +594,6 @@ pub(crate) fn caret_ink(caret: Hsla, background: Hsla, foreground: Hsla) -> Hsla
     }
 }
 
-/// Whether a filled shape needs a hairline to stay a shape. A brand colour is a
-/// fixed value; a theme background is not, and pure black on a dark window is
-/// no shape at all.
-pub(crate) fn needs_edge(fill: u32, surface: Hsla) -> bool {
-    let rgb = crate::terminal::palette::hsla_to_rgb(surface);
-    let packed = (rgb.r as u32) << 16 | (rgb.g as u32) << 8 | rgb.b as u32;
-    contrast(fill, packed) < 1.25
-}
-
-/// Whether a surface is dark enough that a halo cut in its own colour stops
-/// reading as a ring and starts reading as a hole.
-pub(crate) fn surface_is_dark(surface: Hsla) -> bool {
-    let rgb = crate::terminal::palette::hsla_to_rgb(surface);
-    is_dark((rgb.r as u32) << 16 | (rgb.g as u32) << 8 | rgb.b as u32)
-}
-
 pub(crate) fn mix(a: u32, b: u32, t: f32) -> u32 {
     let (ar, ag, ab) = (a >> 16 & 0xff, a >> 8 & 0xff, a & 0xff);
     let (br, bg, bb) = (b >> 16 & 0xff, b >> 8 & 0xff, b & 0xff);
@@ -843,31 +831,18 @@ pub struct Themes(pub Vec<Theme>);
 
 impl Global for Themes {}
 
-/// Files in the themes folder that could not be read, and why. A malformed
-/// theme used to log a warning and then simply not be in the list — the folder
-/// is one the user opens and drops files into, so "it isn't there" needs a
-/// reason attached to it.
-#[derive(Default)]
-pub struct RejectedThemes(pub Vec<(String, String)>);
-
-impl Global for RejectedThemes {}
-
 pub fn load_registry(cx: &mut App) {
     let (themes, rejected) = load_all();
+    for (name, why) in &rejected {
+        log::warn!("theme {name} was not loaded: {why}");
+    }
     cx.set_global(Themes(themes));
-    cx.set_global(RejectedThemes(rejected));
 }
 
 pub fn all(cx: &App) -> Vec<Theme> {
     cx.try_global::<Themes>()
         .map(|t| t.0.clone())
         .unwrap_or_else(builtins)
-}
-
-pub fn rejected(cx: &App) -> Vec<(String, String)> {
-    cx.try_global::<RejectedThemes>()
-        .map(|r| r.0.clone())
-        .unwrap_or_default()
 }
 
 pub fn by_id(cx: &App, id: &str) -> Theme {
@@ -878,16 +853,6 @@ pub fn by_id(cx: &App, id: &str) -> Theme {
         .or_else(|| themes.iter().find(|t| t.id == DEFAULT_ID))
         .cloned()
         .unwrap_or_else(|| themes.into_iter().next().expect("at least the built-ins"))
-}
-
-impl Theme {
-    pub fn editable(&self) -> bool {
-        self.path
-            .as_ref()
-            .and_then(|p| p.extension())
-            .and_then(|e| e.to_str())
-            .is_some_and(|e| e.eq_ignore_ascii_case("yaml") || e.eq_ignore_ascii_case("yml"))
-    }
 }
 
 pub fn to_yaml(t: &Theme) -> String {
@@ -943,36 +908,6 @@ pub fn to_yaml(t: &Theme) -> String {
     s.push_str(&format!("  normal: [{}]\n", row(0..8)));
     s.push_str(&format!("  bright: [{}]\n", row(8..16)));
     s
-}
-
-pub fn fork_to_file(t: &Theme) -> std::io::Result<String> {
-    let dir = themes_dir()
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no themes directory"))?;
-    std::fs::create_dir_all(&dir)?;
-    let base = format!("{}-custom", t.id.trim_end_matches("-custom"));
-    let mut stem = base.clone();
-    let mut n = 2;
-    while dir.join(format!("{stem}.yaml")).exists() {
-        stem = format!("{base}-{n}");
-        n += 1;
-    }
-    let mut copy = t.clone();
-    // The name lands in the YAML on disk and is matched back with
-    // `trim_end_matches(" (custom)")`, so it stays English in every locale —
-    // a translated suffix would survive a language switch and stack up.
-    copy.name = format!("{} (custom)", t.name.trim_end_matches(" (custom)"));
-    crate::core::config::write_atomic(
-        &dir.join(format!("{stem}.yaml")),
-        to_yaml(&copy).as_bytes(),
-    )?;
-    Ok(stem)
-}
-
-pub fn write_theme_file(t: &Theme) -> std::io::Result<()> {
-    let path = t.path.clone().ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, "theme is not file-backed")
-    })?;
-    crate::core::config::write_atomic(&path, to_yaml(t).as_bytes())
 }
 
 fn load_all() -> (Vec<Theme>, Vec<(String, String)>) {

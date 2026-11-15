@@ -1,5 +1,5 @@
 pub fn promote_to_user_interactive() {
-    if std::env::var("TTY7_NO_QOS").is_ok_and(|v| !v.is_empty() && v != "0") {
+    if std::env::var("NTTY7_NO_QOS").is_ok_and(|v| !v.is_empty() && v != "0") {
         return;
     }
     #[cfg(target_os = "macos")]

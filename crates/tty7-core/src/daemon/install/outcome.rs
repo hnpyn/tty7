@@ -16,7 +16,7 @@ use std::path::Path;
 
 /// The filename under the config directory. The full path crosses to the
 /// updater as a command-line argument — an elevated child does not inherit
-/// the caller's `TTY7_CONFIG_DIR` — so this constant is only for the side
+/// the caller's `NTTY7_CONFIG_DIR` — so this constant is only for the side
 /// that reads and deletes the file.
 pub const OUTCOME_FILE_NAME: &str = "update-outcome.json";
 

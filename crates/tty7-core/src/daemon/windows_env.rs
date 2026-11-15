@@ -664,13 +664,13 @@ mod tests {
             &proc(&[
                 ("SystemRoot", r"C:\Windows"),
                 ("NUMBER_OF_PROCESSORS", "16"),
-                ("TTY7_PANE", "7"),
+                ("NTTY7_PANE", "7"),
             ]),
             &HashMap::new(),
         );
         assert_eq!(lookup(&env, "SystemRoot").as_deref(), Some(r"C:\Windows"));
         assert_eq!(lookup(&env, "NUMBER_OF_PROCESSORS").as_deref(), Some("16"));
-        assert_eq!(lookup(&env, "TTY7_PANE").as_deref(), Some("7"));
+        assert_eq!(lookup(&env, "NTTY7_PANE").as_deref(), Some("7"));
     }
 
     #[test]

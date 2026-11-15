@@ -167,6 +167,10 @@ pub struct Config {
     pub ui_font_family: Option<String>,
     pub theme: String,
     pub theme_preset: String,
+    /// When set, the live theme is `theme_preset_dark` or `theme_preset_light`
+    /// according to the OS appearance. On for a new config: a missing key used
+    /// to mean off, and a file that says `false` still does.
+    #[serde(default = "default_true")]
     pub theme_follow_system: bool,
     pub theme_preset_light: String,
     pub theme_preset_dark: String,
@@ -306,7 +310,7 @@ pub struct Config {
     ///
     /// Worth turning off on a metered connection: the packages run 25–30 MB and
     /// a check happens every six hours.
-    #[serde(default = "default_true")]
+    #[serde(default)]
     pub auto_download_updates: bool,
     /// Whether the local daemon runs the mobile gateway, so phones paired in
     /// Settings → Mobile can reach this machine's panes. Off by default: it
@@ -318,7 +322,7 @@ pub struct Config {
     /// this product and is worth nothing sitting unreachable inside the bundle.
     /// Off is for people who keep their own `tty7` — a `cargo install` build, a
     /// package manager's copy — and do not want it shadowed.
-    #[serde(default = "default_true")]
+    #[serde(default)]
     pub install_cli_on_path: bool,
     /// GUI-only locale selection. See `SUPPORTED_GUI_LANGUAGES`.
     /// CLI output stays English so agent/script integrations are stable.
@@ -326,12 +330,12 @@ pub struct Config {
     pub gui_language: String,
     #[serde(default = "default_notify_threshold_secs")]
     pub notify_threshold_secs: u64,
-    #[serde(default = "default_true")]
+    #[serde(default)]
     pub restore_session: bool,
     /// When closing a tab or a pane asks first — see [`ConfirmClose`].
     #[serde(default, deserialize_with = "de_lenient")]
     pub confirm_close: ConfirmClose,
-    #[serde(default = "default_true")]
+    #[serde(default)]
     pub show_tray_icon: bool,
     #[serde(default, deserialize_with = "de_lenient")]
     pub bell: BellMode,
@@ -797,7 +801,7 @@ impl Default for Config {
             ui_font_family: None,
             theme: "light".to_string(),
             theme_preset: "light".to_string(),
-            theme_follow_system: false,
+            theme_follow_system: true,
             theme_preset_light: "light".to_string(),
             theme_preset_dark: "dark".to_string(),
             theme_legible_palette: true,
@@ -835,16 +839,16 @@ impl Default for Config {
             editor_git_gutter: true,
             sidebar_auto_grouping: true,
             notify_on_command_finish: NotifyMode::Unfocused,
-            check_for_updates: true,
+            check_for_updates: false,
             mobile_access: false,
             update_channel: UpdateChannel::default(),
-            auto_download_updates: true,
-            install_cli_on_path: true,
+            auto_download_updates: false,
+            install_cli_on_path: false,
             gui_language: default_gui_language(),
             notify_threshold_secs: default_notify_threshold_secs(),
-            restore_session: true,
+            restore_session: false,
             confirm_close: ConfirmClose::WhenBusy,
-            show_tray_icon: true,
+            show_tray_icon: false,
             bell: BellMode::Visual,
             prompt_editor: true,
             tab_completion: true,
@@ -1220,12 +1224,45 @@ impl Config {
     fn path() -> Option<PathBuf> {
         config_path("config.json")
     }
+
+    /// `config.json`, written from `self` when the file is not there yet.
+    ///
+    /// [`Config::try_save_to`] creates the parent directory, so a caller that
+    /// only has to hand the path to an opener never touches the filesystem
+    /// itself. An existing file is left as it is.
+    pub fn ensure_config_file_exists(&self) -> Option<PathBuf> {
+        let path = Self::path()?;
+        if !path.exists() {
+            self.save();
+        }
+        Some(path)
+    }
 }
 
 static CONFIG_DIR_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
+static RUNTIME_DIR_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
 
 pub fn set_config_dir(dir: PathBuf) {
     let _ = CONFIG_DIR_OVERRIDE.set(dir);
+}
+
+/// Pins the directory transient daemon files live in for this process.
+///
+/// Set once, at startup, to a private directory the process deletes on exit.
+/// A second call is ignored. When it has never been called, [`runtime_dir_path`]
+/// falls back to [`config_dir_path`] so existing tests keep finding their
+/// sockets beside the config they pinned.
+pub fn set_runtime_dir(dir: PathBuf) {
+    let _ = RUNTIME_DIR_OVERRIDE.set(dir);
+}
+
+/// Whether this process pinned a runtime directory of its own.
+///
+/// The machine-tree migration must not run in that case: the runtime directory
+/// is ephemeral, and adopting the legacy tree into it would move the user's
+/// real `machine.json` into a folder that is deleted on exit.
+pub fn runtime_dir_overridden() -> bool {
+    RUNTIME_DIR_OVERRIDE.get().is_some()
 }
 
 fn config_dir() -> Option<PathBuf> {
@@ -1238,9 +1275,13 @@ fn config_dir() -> Option<PathBuf> {
 }
 
 /// Where the config directory comes from, first match wins: `--config-dir`,
-/// then `$TTY7_CONFIG_DIR`, then a portable install's own data folder, then
+/// then `$NTTY7_CONFIG_DIR`, then a portable install's own data folder, then
 /// the platform default. Explicit beats implicit, so a portable copy can still
 /// be pointed somewhere else for one launch or one session.
+///
+/// `$NTTY7_CONFIG_DIR` is the only environment override. A parent `tty7`
+/// exports `TTY7_CONFIG_DIR` for its own shells; this process leaves that
+/// variable unread so each app keeps its own directory.
 ///
 /// `default` is a closure because the answer rarely gets that far and the
 /// default reads the environment again.
@@ -1254,9 +1295,11 @@ fn resolve_config_dir(
 }
 
 fn env_config_dir() -> Option<PathBuf> {
-    std::env::var_os("TTY7_CONFIG_DIR")
-        .filter(|d| !d.is_empty())
-        .map(PathBuf::from)
+    env_config_dir_from(std::env::var_os("NTTY7_CONFIG_DIR").map(PathBuf::from))
+}
+
+fn env_config_dir_from(dir: Option<PathBuf>) -> Option<PathBuf> {
+    dir.filter(|dir| !dir.as_os_str().is_empty())
 }
 
 /// The marker the Windows portable ZIP ships beside its executables. The
@@ -1312,8 +1355,8 @@ pub fn portable_data_dir(exe_dir: &Path) -> Option<PathBuf> {
 }
 
 /// The config directory this machine resolves to when no single invocation
-/// redirects it — `$TTY7_CONFIG_DIR` where the box names one, the default under
-/// `$HOME` otherwise.
+/// redirects it — `$NTTY7_CONFIG_DIR` where the box names one, the default
+/// under `$HOME` otherwise.
 ///
 /// [`config_dir`] with the `--config-dir` override left off, which is the
 /// question "is this the machine's tty7 or a second one somebody pointed
@@ -1331,20 +1374,39 @@ pub fn machine_config_dir() -> Option<PathBuf> {
 #[cfg(not(windows))]
 pub fn default_config_dir() -> Option<PathBuf> {
     let home = std::env::var_os("HOME").filter(|h| !h.is_empty())?;
-    Some(PathBuf::from(home).join(".config/tty7"))
+    Some(PathBuf::from(home).join(".config/ntty7"))
 }
 
 #[cfg(windows)]
 pub fn default_config_dir() -> Option<PathBuf> {
     if let Some(appdata) = std::env::var_os("APPDATA").filter(|d| !d.is_empty()) {
-        return Some(PathBuf::from(appdata).join("tty7"));
+        return Some(PathBuf::from(appdata).join("ntty7"));
     }
     let profile = std::env::var_os("USERPROFILE").filter(|d| !d.is_empty())?;
-    Some(PathBuf::from(profile).join(".config").join("tty7"))
+    Some(PathBuf::from(profile).join(".config").join("ntty7"))
 }
 
 pub fn config_path(file: &str) -> Option<PathBuf> {
     Some(config_dir()?.join(file))
+}
+
+/// Transient daemon and session files: the pinned runtime directory when this
+/// process set one, otherwise the config directory.
+pub fn runtime_dir_path() -> Option<PathBuf> {
+    resolve_runtime_dir(
+        RUNTIME_DIR_OVERRIDE.get().map(PathBuf::as_path),
+        config_dir_path().as_deref(),
+    )
+}
+
+fn resolve_runtime_dir(override_dir: Option<&Path>, config_dir: Option<&Path>) -> Option<PathBuf> {
+    override_dir
+        .map(Path::to_path_buf)
+        .or_else(|| config_dir.map(Path::to_path_buf))
+}
+
+pub fn runtime_path(file: &str) -> Option<PathBuf> {
+    runtime_dir_path().map(|dir| dir.join(file))
 }
 
 pub fn strip_bom(text: &str) -> &str {
@@ -1959,16 +2021,25 @@ mod tests {
 
     #[test]
     fn theme_follow_system_defaults_and_round_trips() {
+        assert!(Config::default().theme_follow_system);
+
+        // A file written before the key existed follows the system. One that
+        // says false still does not.
         let cfg: Config = serde_json::from_str(r#"{"theme_preset":"dracula"}"#).unwrap();
-        assert!(!cfg.theme_follow_system);
+        assert!(cfg.theme_follow_system);
         assert_eq!(cfg.theme_preset_light, "light");
         assert_eq!(cfg.theme_preset_dark, "dark");
         assert_eq!(cfg.theme_preset, "dracula");
         // The palette rescue defaults on, and survives a round trip either way.
         assert!(cfg.theme_legible_palette);
 
+        let off: Config = serde_json::from_str(r#"{"theme_follow_system":false}"#).unwrap();
+        assert!(!off.theme_follow_system);
+        let json = serde_json::to_string(&off).unwrap();
+        let back: Config = serde_json::from_str(&json).unwrap();
+        assert!(!back.theme_follow_system);
+
         let mut cfg = Config::default();
-        cfg.theme_follow_system = true;
         cfg.theme_preset_light = "one_light".to_string();
         cfg.theme_preset_dark = "dracula".to_string();
         let json = serde_json::to_string(&cfg).unwrap();
@@ -2415,7 +2486,11 @@ mod tests {
     #[test]
     fn new_terminal_prefs_default_and_parse_leniently() {
         let cfg = Config::default();
-        assert!(cfg.restore_session);
+        assert!(!cfg.restore_session);
+        assert!(!cfg.show_tray_icon);
+        assert!(!cfg.install_cli_on_path);
+        assert!(!cfg.auto_download_updates);
+        assert!(!cfg.check_for_updates);
         assert!(cfg.mouse_reporting);
         assert!(cfg.prompt_editor);
         assert!(cfg.tab_completion);
@@ -2424,7 +2499,7 @@ mod tests {
         assert_eq!(cfg.bell, BellMode::Visual);
 
         let cfg: Config = serde_json::from_str(r#"{"font_size": 15.0}"#).unwrap();
-        assert!(cfg.restore_session);
+        assert!(!cfg.restore_session);
         assert!(cfg.mouse_reporting);
         assert!(cfg.prompt_editor);
         assert!(cfg.tab_completion);
@@ -2647,6 +2722,37 @@ mod tests {
 
     fn lock_config_file() -> std::sync::MutexGuard<'static, ()> {
         CONFIG_FILE.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[test]
+    fn a_missing_config_file_is_written_before_it_is_opened() {
+        let _guard = lock_config_file();
+        pin_config_dir();
+        let path = config_path("config.json").expect("the pinned dir has a config path");
+        std::fs::remove_file(&path).ok();
+        assert!(!path.exists());
+
+        let cfg = Config {
+            font_size: 19.0,
+            ..Config::default()
+        };
+        let written = cfg
+            .ensure_config_file_exists()
+            .expect("the pinned dir is available");
+        assert_eq!(written, path);
+        let back = Config::load();
+        assert_eq!(back.font_size, 19.0);
+        assert!(back.theme_follow_system);
+
+        // A file that is already there is the user's. Opening it must not
+        // overwrite what they wrote.
+        std::fs::write(&path, r#"{"font_size": 21.0}"#).unwrap();
+        let again = Config::default()
+            .ensure_config_file_exists()
+            .expect("still available");
+        assert_eq!(again, path);
+        let kept: Config = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(kept.font_size, 21.0);
     }
 
     #[test]
@@ -2931,7 +3037,7 @@ mod tests {
         assert_eq!(
             resolve_config_dir(None, dir("env"), dir("portable"), default),
             dir("env"),
-            "$TTY7_CONFIG_DIR still redirects a portable copy"
+            "$NTTY7_CONFIG_DIR still redirects a portable copy"
         );
         assert_eq!(
             resolve_config_dir(None, None, dir("portable"), default),
@@ -2943,6 +3049,33 @@ mod tests {
             dir("default")
         );
         assert_eq!(resolve_config_dir(None, None, None, || None), None);
+    }
+
+    #[test]
+    fn config_env_reads_only_ntty7_config_dir() {
+        let ntty7 = PathBuf::from("/tmp/ntty7-cfg");
+        assert_eq!(env_config_dir_from(Some(ntty7.clone())), Some(ntty7));
+        assert_eq!(env_config_dir_from(Some(PathBuf::new())), None);
+        assert_eq!(env_config_dir_from(None), None);
+    }
+
+    #[test]
+    fn runtime_dir_falls_back_to_the_config_dir_until_pinned() {
+        let config = PathBuf::from("/cfg");
+        let runtime = PathBuf::from("/tmp/ntty7-9");
+        assert_eq!(
+            resolve_runtime_dir(None, Some(&config)),
+            Some(config.clone())
+        );
+        assert_eq!(
+            resolve_runtime_dir(Some(&runtime), Some(&config)),
+            Some(runtime.clone())
+        );
+        assert_eq!(resolve_runtime_dir(None, None), None);
+        assert_eq!(
+            resolve_runtime_dir(Some(&runtime), Some(&config)).map(|dir| dir.join("daemon.sock")),
+            Some(runtime.join("daemon.sock"))
+        );
     }
 
     #[test]

@@ -15,7 +15,7 @@ pub const MACHINE_FILE: &str = "machine.json";
 
 pub const APPEARANCE_FILE: &str = "appearance.json";
 
-pub const DATA_DIR_ENV: &str = "TTY7_DATA_DIR";
+pub const DATA_DIR_ENV: &str = "NTTY7_DATA_DIR";
 
 pub const MAX_WORKSPACES: usize = 1024;
 
@@ -1848,18 +1848,20 @@ fn data_dir() -> io::Result<PathBuf> {
     if let Some(explicit) = std::env::var_os(DATA_DIR_ENV).filter(|v| !v.is_empty()) {
         return Ok(PathBuf::from(explicit));
     }
-    crate::core::config::config_dir_path().ok_or_else(|| {
+    crate::core::config::runtime_dir_path().ok_or_else(|| {
         io::Error::other(format!(
-            "no config directory to place {MACHINE_FILE} in; set {DATA_DIR_ENV}"
+            "no runtime directory to place {MACHINE_FILE} in; set {DATA_DIR_ENV}"
         ))
     })
 }
 
 /// Where [`data_dir`] pointed before it followed the config directory.
 ///
-/// Deliberately still resolved the old way, `TTY7_DATA_DIR` included: this
+/// Deliberately still resolved the old way, `NTTY7_DATA_DIR` included: this
 /// answers "where would the build the user just upgraded from have put it",
-/// and that build read the environment, not the config directory.
+/// and that build read the environment, not the config directory. The folder
+/// is `ntty7`, so a live `tty7` tree under `share/tty7` stays where that app
+/// left it.
 fn legacy_data_dir() -> Option<PathBuf> {
     if let Some(explicit) = std::env::var_os(DATA_DIR_ENV).filter(|v| !v.is_empty()) {
         return Some(PathBuf::from(explicit));
@@ -1871,7 +1873,7 @@ fn legacy_data_dir() -> Option<PathBuf> {
     let base = env_dir("LOCALAPPDATA")
         .or_else(|| env_dir("USERPROFILE").map(|h| h.join(".local").join("share")));
 
-    base.map(|b| b.join("tty7"))
+    base.map(|b| b.join("ntty7"))
 }
 
 /// Carry an upgrading install's tree and appearance hint over to the config
@@ -1892,6 +1894,11 @@ fn legacy_data_dir() -> Option<PathBuf> {
 /// land their file with a rename, so the worst a collision costs is one of two
 /// booleans, and the next theme the GUI applies overwrites it either way.
 pub fn adopt_legacy_data_dir() {
+    // An ephemeral runtime directory is deleted with the process. Moving the
+    // legacy tree into it would take the user's real machine.json with it.
+    if crate::core::config::runtime_dir_overridden() {
+        return;
+    }
     adopt_into(
         data_dir().ok().as_deref(),
         legacy_data_dir().as_deref(),
@@ -1906,7 +1913,7 @@ fn adopt_into(current: Option<&Path>, legacy: Option<&Path>, machines_instance: 
         return;
     };
     // The same directory under two names is not a migration. This is also what
-    // makes `TTY7_DATA_DIR` a no-op: both getters answer with it.
+    // makes `NTTY7_DATA_DIR` a no-op: both getters answer with it.
     if legacy == current {
         return;
     }
@@ -1928,7 +1935,7 @@ fn adopt_into(current: Option<&Path>, legacy: Option<&Path>, machines_instance: 
 /// [`legacy_data_dir`] names, so the instance entitled to it is the one still
 /// running out of the config directory this machine resolves to on its own
 /// ([`config::machine_config_dir`](crate::core::config::machine_config_dir)) —
-/// `$TTY7_CONFIG_DIR` when the box sets one, `$HOME`'s otherwise. Anything
+/// `$NTTY7_CONFIG_DIR` when the box sets one, `$HOME`'s otherwise. Anything
 /// aimed elsewhere is a second tty7 by definition, and a second tty7 starts on
 /// an empty tree.
 ///
@@ -1946,7 +1953,7 @@ fn adopt_into(current: Option<&Path>, legacy: Option<&Path>, machines_instance: 
 /// `HOME`: a start-order rule moves the developer's real `machine.json` into a
 /// scratch directory and deletes it with the `TempDir`.
 ///
-/// Counting `$TTY7_CONFIG_DIR` as the machine's is what keeps remote hosts
+/// Counting `$NTTY7_CONFIG_DIR` as the machine's is what keeps remote hosts
 /// upgrading: a remote `tty7-server` is launched with no `--config-dir` and
 /// finds its config directory exactly this way (see
 /// `daemon::remote_link::remote_control_socket`), so a rule written against
@@ -2885,7 +2892,7 @@ mod tests {
         }
     }
 
-    /// `TTY7_DATA_DIR` answers both getters, so the sandboxes every test
+    /// `NTTY7_DATA_DIR` answers both getters, so the sandboxes every test
     /// harness pins with it must come out the far side untouched.
     #[test]
     fn one_directory_under_two_names_is_not_a_migration() {

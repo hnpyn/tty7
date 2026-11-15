@@ -94,7 +94,7 @@ mod imp_unix {
     }
 
     fn socket_path() -> Option<PathBuf> {
-        Some(socket_path_for(&config::config_dir_path()?))
+        Some(socket_path_for(&config::runtime_dir_path()?))
     }
 
     pub fn connect() -> io::Result<Stream> {
@@ -148,7 +148,7 @@ mod imp_unix {
         })?;
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
-            let owns_parent = config::config_dir_path().is_some_and(|c| c.as_path() == parent);
+            let owns_parent = config::runtime_dir_path().is_some_and(|c| c.as_path() == parent);
             if owns_parent {
                 if let Err(e) =
                     std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
@@ -428,7 +428,7 @@ mod imp_windows {
     }
 
     pub fn port_path_named(file: &str) -> Option<PathBuf> {
-        config::config_path(file)
+        config::runtime_path(file)
     }
 
     fn read_port_file() -> Option<(u16, Token)> {

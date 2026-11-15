@@ -109,7 +109,7 @@ pub fn install(role: &'static str) {
 }
 
 fn level_from_env() -> LevelFilter {
-    let raw = std::env::var("TTY7_LOG")
+    let raw = std::env::var("NTTY7_LOG")
         .or_else(|_| std::env::var("RUST_LOG"))
         .unwrap_or_default();
     parse_level(&raw)
@@ -295,7 +295,7 @@ pub fn capture_stderr() -> std::io::Result<()> {
 }
 
 fn log_path() -> Option<PathBuf> {
-    crate::core::config::config_path("tty7.log")
+    crate::core::config::config_path("ntty7.log")
 }
 
 fn timestamp() -> String {
@@ -491,7 +491,7 @@ mod tests {
                 "--nocapture",
             ])
             .env(VAR, dir.path())
-            .env("TTY7_LOG", "info")
+            .env("NTTY7_LOG", "info")
             .output()
             .unwrap();
         assert!(output.status.success(), "{output:?}");

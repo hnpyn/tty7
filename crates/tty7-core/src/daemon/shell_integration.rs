@@ -3,15 +3,15 @@ use std::path::{Path, PathBuf};
 
 const ZSH_INTEGRATION: &str = r#"
 # --- tty7 shell integration (zsh) ---
-if [[ -o interactive ]] && [[ -z "$TTY7_SHELL_INTEGRATION" ]]; then
-  export TTY7_SHELL_INTEGRATION=1
+if [[ -o interactive ]] && [[ -z "$NTTY7_SHELL_INTEGRATION" ]]; then
+  export NTTY7_SHELL_INTEGRATION=1
 
   # Tell the app where this shell keeps its history. $HISTFILE is set by the
   # rc file just run and is never exported, so the history menu, which reads
   # the file directly, would otherwise only know the default ~/.zsh_history.
   # One line per distinct path, written once.
-  if [[ -n "$HISTFILE" && "$HISTFILE" == /* && -n "$TTY7_CONFIG_DIR" ]]; then
-    __tty7_hf_list="$TTY7_CONFIG_DIR/shell-histfiles"
+  if [[ -n "$HISTFILE" && "$HISTFILE" == /* && -n "$NTTY7_CONFIG_DIR" ]]; then
+    __tty7_hf_list="$NTTY7_CONFIG_DIR/shell-histfiles"
     __tty7_hf_known=
     [[ -r "$__tty7_hf_list" ]] && __tty7_hf_known="$(<"$__tty7_hf_list")"
     if [[ $'\n'"$__tty7_hf_known"$'\n' != *$'\n'"$HISTFILE"$'\n'* ]]; then
@@ -28,22 +28,22 @@ if [[ -o interactive ]] && [[ -z "$TTY7_SHELL_INTEGRATION" ]]; then
   # pane adds, and is what goes home when it closes — and only then repoint.
   # zsh loads the history file after .zshrc, so the switch lands before the
   # first line is read.
-  if [[ -n "$TTY7_HISTFILE" ]]; then
-    if [[ ! -e "$TTY7_HISTFILE" ]]; then
+  if [[ -n "$NTTY7_HISTFILE" ]]; then
+    if [[ ! -e "$NTTY7_HISTFILE" ]]; then
       # The origin is recorded even when there is nothing to copy from it yet:
       # a first-ever shell has no history file, and it is exactly that user
       # whose commands would otherwise have nowhere to go when the pane closes.
       if [[ -n "$HISTFILE" ]]; then
-        builtin printf '%s\n' "$HISTFILE" > "$TTY7_HISTFILE.origin" 2>/dev/null
+        builtin printf '%s\n' "$HISTFILE" > "$NTTY7_HISTFILE.origin" 2>/dev/null
         if [[ -r "$HISTFILE" ]]; then
-          command tail -n 5000 "$HISTFILE" > "$TTY7_HISTFILE" 2>/dev/null
+          command tail -n 5000 "$HISTFILE" > "$NTTY7_HISTFILE" 2>/dev/null
         fi
       fi
-      [[ -e "$TTY7_HISTFILE" ]] || : > "$TTY7_HISTFILE" 2>/dev/null
-      command wc -c < "$TTY7_HISTFILE" 2>/dev/null | command tr -d ' \n' \
-        > "$TTY7_HISTFILE.seed" 2>/dev/null
+      [[ -e "$NTTY7_HISTFILE" ]] || : > "$NTTY7_HISTFILE" 2>/dev/null
+      command wc -c < "$NTTY7_HISTFILE" 2>/dev/null | command tr -d ' \n' \
+        > "$NTTY7_HISTFILE.seed" 2>/dev/null
     fi
-    HISTFILE="$TTY7_HISTFILE"
+    HISTFILE="$NTTY7_HISTFILE"
     # The exit rewrite keeps at most SAVEHIST entries, from a memory capped at
     # HISTSIZE. Smaller than the seed, that rewrite leaves the pane's file
     # shorter than its own seed mark — which the merge on close reads as "the
@@ -144,7 +144,7 @@ if [[ -o interactive ]] && [[ -z "$TTY7_SHELL_INTEGRATION" ]]; then
   # caches) — and a nested plain `zsh` — must land in the user's dir, not our
   # empty temp one. One-shot: fires on the first precmd, then removes itself.
   __tty7_restore_zdotdir() {
-    ZDOTDIR=${TTY7_USER_ZDOTDIR:-$HOME}
+    ZDOTDIR=${NTTY7_USER_ZDOTDIR:-$HOME}
     add-zsh-hook -d precmd __tty7_restore_zdotdir
     unfunction __tty7_restore_zdotdir
   }
@@ -160,8 +160,8 @@ const FISH_INTEGRATION: &str = r#"
 # empty exported var as *set*, so `not set -q` would skip the install on every fish
 # launch (OSC 133 never arms). `-z` matches the zsh/bash guards and the empty reset —
 # it installs once for a fresh top-level shell while an inherited `1` still blocks it.
-if status is-interactive; and test -z "$TTY7_SHELL_INTEGRATION"
-  set -gx TTY7_SHELL_INTEGRATION 1
+if status is-interactive; and test -z "$NTTY7_SHELL_INTEGRATION"
+  set -gx NTTY7_SHELL_INTEGRATION 1
 
   function __tty7_osc
     printf '\e]%s\a' $argv[1]
@@ -219,15 +219,15 @@ end
 
 const BASH_INTEGRATION: &str = r#"
 # --- tty7 shell integration (bash) ---
-if [[ $- == *i* ]] && [[ -z "$TTY7_SHELL_INTEGRATION" ]]; then
-  export TTY7_SHELL_INTEGRATION=1
+if [[ $- == *i* ]] && [[ -z "$NTTY7_SHELL_INTEGRATION" ]]; then
+  export NTTY7_SHELL_INTEGRATION=1
 
   # Tell the app where this shell keeps its history. $HISTFILE is set by the
   # rc file just run and is never exported, so the history menu, which reads
   # the file directly, would otherwise only know the default ~/.bash_history.
   # One line per distinct path, written once.
-  if [[ -n "$HISTFILE" && "$HISTFILE" == /* && -n "$TTY7_CONFIG_DIR" ]]; then
-    __tty7_hf_list="$TTY7_CONFIG_DIR/shell-histfiles"
+  if [[ -n "$HISTFILE" && "$HISTFILE" == /* && -n "$NTTY7_CONFIG_DIR" ]]; then
+    __tty7_hf_list="$NTTY7_CONFIG_DIR/shell-histfiles"
     __tty7_hf_known=
     [[ -r "$__tty7_hf_list" ]] && __tty7_hf_known="$(<"$__tty7_hf_list")"
     if [[ $'\n'"$__tty7_hf_known"$'\n' != *$'\n'"$HISTFILE"$'\n'* ]]; then
@@ -240,22 +240,22 @@ if [[ $- == *i* ]] && [[ -z "$TTY7_SHELL_INTEGRATION" ]]; then
   # after the user's rc has decided where their history lives. bash loads the
   # file after the startup files too, so repointing here still precedes the
   # load.
-  if [[ -n "$TTY7_HISTFILE" ]]; then
-    if [[ ! -e "$TTY7_HISTFILE" ]]; then
+  if [[ -n "$NTTY7_HISTFILE" ]]; then
+    if [[ ! -e "$NTTY7_HISTFILE" ]]; then
       # The origin is recorded even when there is nothing to copy from it yet:
       # a first-ever shell has no history file, and it is exactly that user
       # whose commands would otherwise have nowhere to go when the pane closes.
       if [[ -n "$HISTFILE" ]]; then
-        builtin printf '%s\n' "$HISTFILE" > "$TTY7_HISTFILE.origin" 2>/dev/null
+        builtin printf '%s\n' "$HISTFILE" > "$NTTY7_HISTFILE.origin" 2>/dev/null
         if [[ -r "$HISTFILE" ]]; then
-          command tail -n 5000 "$HISTFILE" > "$TTY7_HISTFILE" 2>/dev/null
+          command tail -n 5000 "$HISTFILE" > "$NTTY7_HISTFILE" 2>/dev/null
         fi
       fi
-      [[ -e "$TTY7_HISTFILE" ]] || : > "$TTY7_HISTFILE" 2>/dev/null
-      command wc -c < "$TTY7_HISTFILE" 2>/dev/null | command tr -d ' \n' \
-        > "$TTY7_HISTFILE.seed" 2>/dev/null
+      [[ -e "$NTTY7_HISTFILE" ]] || : > "$NTTY7_HISTFILE" 2>/dev/null
+      command wc -c < "$NTTY7_HISTFILE" 2>/dev/null | command tr -d ' \n' \
+        > "$NTTY7_HISTFILE.seed" 2>/dev/null
     fi
-    HISTFILE="$TTY7_HISTFILE"
+    HISTFILE="$NTTY7_HISTFILE"
     # On exit bash rewrites the file from a memory capped at HISTSIZE, then
     # truncates it to HISTFILESIZE lines — both default to 500, which is
     # smaller than the seed. The result would be a file shorter than its own
@@ -539,8 +539,8 @@ fi
 
 const POWERSHELL_INTEGRATION: &str = r#"
 # --- tty7 shell integration (PowerShell) ---
-if (-not $env:TTY7_SHELL_INTEGRATION) {
-  $env:TTY7_SHELL_INTEGRATION = '1'
+if (-not $env:NTTY7_SHELL_INTEGRATION) {
+  $env:NTTY7_SHELL_INTEGRATION = '1'
 
   $global:__Tty7Esc = [char]0x1b
   $global:__Tty7Bel = [char]0x07
@@ -657,8 +657,8 @@ const NUSHELL_INTEGRATION: &str = r#"
 # Guard on emptiness (`== ""`), not mere definedness, exactly like the other
 # shells: setup() resets the sentinel to an empty-but-exported value at each
 # spawn boundary, and a nested `nu` inherits the set `1` without re-installing.
-if (($env.TTY7_SHELL_INTEGRATION? | default "") == "") {
-  $env.TTY7_SHELL_INTEGRATION = "1"
+if (($env.NTTY7_SHELL_INTEGRATION? | default "") == "") {
+  $env.NTTY7_SHELL_INTEGRATION = "1"
 
   # tty7 restores the user's own config.nu at this placeholder — `source` is
   # evaluated at parse time, so the wrapper can only name a file that provably
@@ -732,7 +732,7 @@ fn zsh_redirectors() -> [(&'static str, String); 4] {
     let redirect = |name: &str, tail: &str| {
         format!(
             "__tty7_ztmp=$ZDOTDIR\n\
-             if [[ -n \"$TTY7_USER_ZDOTDIR\" ]]; then ZDOTDIR=$TTY7_USER_ZDOTDIR; else unset ZDOTDIR; fi\n\
+             if [[ -n \"$NTTY7_USER_ZDOTDIR\" ]]; then ZDOTDIR=$NTTY7_USER_ZDOTDIR; else unset ZDOTDIR; fi\n\
              [[ -f \"${{ZDOTDIR:-$HOME}}/{name}\" ]] && source \"${{ZDOTDIR:-$HOME}}/{name}\"\n\
              {tail}ZDOTDIR=$__tty7_ztmp\n\
              unset __tty7_ztmp\n"
@@ -741,7 +741,7 @@ fn zsh_redirectors() -> [(&'static str, String); 4] {
     [
         (
             ".zshenv",
-            redirect(".zshenv", "export TTY7_USER_ZDOTDIR=${ZDOTDIR:-$HOME}\n"),
+            redirect(".zshenv", "export NTTY7_USER_ZDOTDIR=${ZDOTDIR:-$HOME}\n"),
         ),
         (".zprofile", redirect(".zprofile", "")),
         (
@@ -769,8 +769,11 @@ pub(crate) fn is_our_zdotdir(path: &str) -> bool {
 }
 
 fn real_user_zdotdir() -> Option<String> {
-    if let Ok(z) = std::env::var("TTY7_USER_ZDOTDIR") {
-        if !z.is_empty() {
+    if let Ok(z) = std::env::var("NTTY7_USER_ZDOTDIR") {
+        // A throwaway `tty7-zdotdir-*` is the redirector, whether it came from
+        // this process or from an outer tty7. Adopting it would source that
+        // redirector as the user's zsh config.
+        if !z.is_empty() && !is_our_zdotdir(&z) {
             return Some(z);
         }
     }
@@ -873,7 +876,7 @@ fn setup_zsh() -> Option<Injection> {
 
     let mut env = HashMap::new();
     if let Some(user_zdotdir) = real_user_zdotdir() {
-        env.insert("TTY7_USER_ZDOTDIR".to_string(), user_zdotdir);
+        env.insert("NTTY7_USER_ZDOTDIR".to_string(), user_zdotdir);
     }
     env.insert("ZDOTDIR".to_string(), dir.to_string_lossy().into_owned());
 
@@ -1117,7 +1120,7 @@ fn setup_bash() -> Option<Injection> {
     })
 }
 
-const WSL_RCFILE_ENV: &str = "TTY7_RC";
+const WSL_RCFILE_ENV: &str = "NTTY7_RC";
 
 /// Where the zsh redirectors landed, in the Windows spelling `WSLENV`'s `/p`
 /// translates for the distro.
@@ -1126,7 +1129,7 @@ const WSL_RCFILE_ENV: &str = "TTY7_RC";
 /// pane, and a bash or fish distro that found a `ZDOTDIR` in its environment
 /// would carry it into any `zsh` started inside it. The bootstrap decides
 /// whether this becomes `ZDOTDIR`, and it only decides that for a zsh distro.
-const WSL_ZDOTDIR_ENV: &str = "TTY7_ZDOTDIR";
+const WSL_ZDOTDIR_ENV: &str = "NTTY7_ZDOTDIR";
 
 /// POSIX single-quoting, for a body some other shell has to re-parse.
 fn shell_quote(s: &str) -> String {
@@ -1160,10 +1163,10 @@ fn wsl_exec_script() -> String {
     format!(
         concat!(
             r#"case "${{SHELL:-}}" in "#,
-            r#"*/bash) [ -r "${{TTY7_RC:-}}" ] && exec "$SHELL" --rcfile "$TTY7_RC" -i; "#,
+            r#"*/bash) [ -r "${{NTTY7_RC:-}}" ] && exec "$SHELL" --rcfile "$NTTY7_RC" -i; "#,
             r#"exec "$SHELL" -l ;; "#,
-            r#"*/zsh) [ -n "${{TTY7_ZDOTDIR:-}}" ] && [ -r "$TTY7_ZDOTDIR/.zshrc" ] "#,
-            r#"&& export ZDOTDIR="$TTY7_ZDOTDIR"; exec "$SHELL" -l ;; "#,
+            r#"*/zsh) [ -n "${{NTTY7_ZDOTDIR:-}}" ] && [ -r "$NTTY7_ZDOTDIR/.zshrc" ] "#,
+            r#"&& export ZDOTDIR="$NTTY7_ZDOTDIR"; exec "$SHELL" -l ;; "#,
             r#"*/fish) exec "$SHELL" -C {} -l ;; "#,
             r#"*) exec "${{SHELL:-/bin/sh}}" -l ;; "#,
             "esac"
@@ -1179,7 +1182,7 @@ fn wsl_exec_script() -> String {
 /// and tested on every platform; what stays behind the `#[cfg(windows)]` is the
 /// argv and a call to this.
 ///
-/// `TTY7_USER_ZDOTDIR` is conspicuously absent, and that is the point.
+/// `NTTY7_USER_ZDOTDIR` is conspicuously absent, and that is the point.
 /// `real_user_zdotdir` answers from this process's own environment, and this
 /// process is on the Windows side of the boundary — the `ZDOTDIR` the user
 /// actually set lives inside the distro and is a Linux path nothing out here
@@ -1298,7 +1301,7 @@ pub fn setup(program: Option<&str>, args: &[String], has_custom_args: bool) -> O
 
     injection
         .env
-        .insert("TTY7_SHELL_INTEGRATION".to_string(), String::new());
+        .insert("NTTY7_SHELL_INTEGRATION".to_string(), String::new());
 
     Some(injection)
 }
@@ -1636,7 +1639,7 @@ pub mod remote {
             guard.push_str(&format!("[ -s \"$__tty7_d/{name}\" ] && "));
         }
         out.push_str(&format!(
-            "{guard}export ZDOTDIR=\"$__tty7_d\" TTY7_RM_DIR=\"$__tty7_d\"\n"
+            "{guard}export ZDOTDIR=\"$__tty7_d\" NTTY7_RM_DIR=\"$__tty7_d\"\n"
         ));
         out.push_str(&format!("exec {} -l\n", shell_quote(shell_path)));
         out
@@ -1653,7 +1656,7 @@ pub mod remote {
             &format!("{}{BASH_CLEANUP_HOOK}", bash_rcfile()),
         );
         out.push_str("if [ -s \"$__tty7_d/bashrc\" ]; then\n");
-        out.push_str("export TTY7_RM_DIR=\"$__tty7_d\"\n");
+        out.push_str("export NTTY7_RM_DIR=\"$__tty7_d\"\n");
         out.push_str(&format!("exec {quoted} --rcfile \"$__tty7_d/bashrc\" -i\n"));
         out.push_str("fi\n");
         out.push_str(&format!("exec {quoted} -l\n"));
@@ -1670,9 +1673,9 @@ pub mod remote {
 
     const ZSH_CLEANUP_HOOK: &str = r#"
 # --- tty7 remote cleanup (zsh) ---
-if [[ -n "$TTY7_RM_DIR" ]]; then
-  typeset -g __tty7_rm_dir=$TTY7_RM_DIR
-  unset TTY7_RM_DIR
+if [[ -n "$NTTY7_RM_DIR" ]]; then
+  typeset -g __tty7_rm_dir=$NTTY7_RM_DIR
+  unset NTTY7_RM_DIR
   __tty7_rm_rcdir() {
     [[ -n "$__tty7_rm_dir" ]] || return 0
     command rm -rf -- "$__tty7_rm_dir"
@@ -1686,9 +1689,9 @@ fi
 
     const BASH_CLEANUP_HOOK: &str = r#"
 # --- tty7 remote cleanup (bash) ---
-if [[ -n "$TTY7_RM_DIR" ]]; then
-  __tty7_rm_dir=$TTY7_RM_DIR
-  unset TTY7_RM_DIR
+if [[ -n "$NTTY7_RM_DIR" ]]; then
+  __tty7_rm_dir=$NTTY7_RM_DIR
+  unset NTTY7_RM_DIR
   __tty7_rm_rcdir() {
     [[ -n "$__tty7_rm_dir" ]] || return 0
     command rm -rf -- "$__tty7_rm_dir"
@@ -2240,7 +2243,7 @@ fi
                 .env("XDG_CONFIG_HOME", home.join(".config"))
                 .env("XDG_DATA_HOME", home.join(".local/share"))
                 .env("XDG_CACHE_HOME", home.join(".cache"))
-                .env_remove("TTY7_SHELL_INTEGRATION");
+                .env_remove("NTTY7_SHELL_INTEGRATION");
             cmd
         }
 
@@ -2275,7 +2278,7 @@ fi
                 .take()
                 .unwrap()
                 .write_all(
-                    b"Write-Output \"integrated=$env:TTY7_SHELL_INTEGRATION\"\n\
+                    b"Write-Output \"integrated=$env:NTTY7_SHELL_INTEGRATION\"\n\
                       Write-Output \"prompt=$((Get-Command prompt).ScriptBlock -match '133;A')\"\n\
                       exit 7\n",
                 )
@@ -2715,7 +2718,7 @@ mod tests {
         let script = wsl_exec_script();
 
         assert!(script.contains(
-            r#"*/bash) [ -r "${TTY7_RC:-}" ] && exec "$SHELL" --rcfile "$TTY7_RC" -i; exec "$SHELL" -l ;;"#
+            r#"*/bash) [ -r "${NTTY7_RC:-}" ] && exec "$SHELL" --rcfile "$NTTY7_RC" -i; exec "$SHELL" -l ;;"#
         ));
         assert!(script.contains(&format!(
             r#"*/fish) exec "$SHELL" -C {} -l ;;"#,
@@ -2734,16 +2737,17 @@ mod tests {
         let script = wsl_exec_script();
 
         assert!(
-            script
-                .contains(r#"*/zsh) [ -n "${TTY7_ZDOTDIR:-}" ] && [ -r "$TTY7_ZDOTDIR/.zshrc" ] "#)
+            script.contains(
+                r#"*/zsh) [ -n "${NTTY7_ZDOTDIR:-}" ] && [ -r "$NTTY7_ZDOTDIR/.zshrc" ] "#
+            )
         );
-        assert!(script.contains(r#"&& export ZDOTDIR="$TTY7_ZDOTDIR"; exec "$SHELL" -l ;;"#));
+        assert!(script.contains(r#"&& export ZDOTDIR="$NTTY7_ZDOTDIR"; exec "$SHELL" -l ;;"#));
 
         // The redirectors read this to find the user's own startup files, and
         // only the distro can answer it. Naming it out here would aim them at a
         // Windows path no distro has.
         assert!(
-            !script.contains("TTY7_USER_ZDOTDIR"),
+            !script.contains("NTTY7_USER_ZDOTDIR"),
             "the bootstrap must not carry a ZDOTDIR this side made up"
         );
     }
@@ -2753,10 +2757,10 @@ mod tests {
         let dir = throwaway_dir("tty7-wsltest-").expect("temp dir");
         let env = wsl_integration_env(&dir, None).expect("integration files");
 
-        let rcfile = PathBuf::from(env.get(WSL_RCFILE_ENV).expect("TTY7_RC"));
+        let rcfile = PathBuf::from(env.get(WSL_RCFILE_ENV).expect("NTTY7_RC"));
         assert_eq!(std::fs::read_to_string(&rcfile).unwrap(), bash_rcfile());
 
-        let zdotdir = PathBuf::from(env.get(WSL_ZDOTDIR_ENV).expect("TTY7_ZDOTDIR"));
+        let zdotdir = PathBuf::from(env.get(WSL_ZDOTDIR_ENV).expect("NTTY7_ZDOTDIR"));
         for (name, contents) in zsh_redirectors() {
             assert_eq!(
                 std::fs::read_to_string(zdotdir.join(name)).unwrap(),
@@ -2766,8 +2770,8 @@ mod tests {
 
         // Both are Windows paths — `/p` is what turns them into the distro's
         // view of themselves, so neither may be pre-translated here.
-        assert_eq!(env.get("WSLENV").unwrap(), "TTY7_RC/p:TTY7_ZDOTDIR/p");
-        assert!(!env.contains_key("TTY7_USER_ZDOTDIR"));
+        assert_eq!(env.get("WSLENV").unwrap(), "NTTY7_RC/p:NTTY7_ZDOTDIR/p");
+        assert!(!env.contains_key("NTTY7_USER_ZDOTDIR"));
         assert!(!env.contains_key("ZDOTDIR"));
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -2804,8 +2808,8 @@ mod tests {
                 .arg(wsl_exec_script())
                 .env_clear()
                 .env("SHELL", dir.join(shell).to_string_lossy().into_owned())
-                .env("TTY7_RC", rc)
-                .env("TTY7_ZDOTDIR", zdot)
+                .env("NTTY7_RC", rc)
+                .env("NTTY7_ZDOTDIR", zdot)
                 .output()
                 .expect("run the bootstrap");
             assert!(out.status.success(), "the bootstrap exited non-zero");
@@ -2896,19 +2900,22 @@ mod tests {
     #[test]
     fn wslenv_preserves_the_users_own_entries() {
         assert_eq!(
-            wslenv_with(Some("MYVAR/p:OTHER"), &["TTY7_RC/p"]),
-            "MYVAR/p:OTHER:TTY7_RC/p"
+            wslenv_with(Some("MYVAR/p:OTHER"), &["NTTY7_RC/p"]),
+            "MYVAR/p:OTHER:NTTY7_RC/p"
         );
-        assert_eq!(wslenv_with(None, &["TTY7_RC/p"]), "TTY7_RC/p");
-        assert_eq!(wslenv_with(Some(""), &["TTY7_RC/p"]), "TTY7_RC/p");
-        assert_eq!(wslenv_with(Some("TTY7_RC/l"), &["TTY7_RC/p"]), "TTY7_RC/l");
+        assert_eq!(wslenv_with(None, &["NTTY7_RC/p"]), "NTTY7_RC/p");
+        assert_eq!(wslenv_with(Some(""), &["NTTY7_RC/p"]), "NTTY7_RC/p");
         assert_eq!(
-            wslenv_with(None, &["TTY7_RC/p", "TTY7_ZDOTDIR/p"]),
-            "TTY7_RC/p:TTY7_ZDOTDIR/p"
+            wslenv_with(Some("NTTY7_RC/l"), &["NTTY7_RC/p"]),
+            "NTTY7_RC/l"
         );
         assert_eq!(
-            wslenv_with(Some("TTY7_ZDOTDIR/l"), &["TTY7_RC/p", "TTY7_ZDOTDIR/p"]),
-            "TTY7_ZDOTDIR/l:TTY7_RC/p"
+            wslenv_with(None, &["NTTY7_RC/p", "NTTY7_ZDOTDIR/p"]),
+            "NTTY7_RC/p:NTTY7_ZDOTDIR/p"
+        );
+        assert_eq!(
+            wslenv_with(Some("NTTY7_ZDOTDIR/l"), &["NTTY7_RC/p", "NTTY7_ZDOTDIR/p"]),
+            "NTTY7_ZDOTDIR/l:NTTY7_RC/p"
         );
     }
 
@@ -2978,7 +2985,7 @@ mod tests {
         assert_eq!(names, [".zshenv", ".zprofile", ".zshrc", ".zlogin"]);
         for (name, body) in &files {
             assert!(
-                body.contains("$TTY7_USER_ZDOTDIR"),
+                body.contains("$NTTY7_USER_ZDOTDIR"),
                 "{name} should reference the user's real ZDOTDIR"
             );
             assert!(body.contains(name), "{name} should source its own name");
@@ -2995,7 +3002,7 @@ mod tests {
         for (name, body) in zsh_redirectors() {
             let save = body.find("__tty7_ztmp=$ZDOTDIR").expect("stashes our dir");
             let aim = body
-                .find("ZDOTDIR=$TTY7_USER_ZDOTDIR")
+                .find("ZDOTDIR=$NTTY7_USER_ZDOTDIR")
                 .expect("aims at the real dir");
             let source = body
                 .find(&format!("source \"${{ZDOTDIR:-$HOME}}/{name}\""))
@@ -3019,7 +3026,7 @@ mod tests {
         let zshenv = &files[0].1;
         let source = zshenv.find("source \"${ZDOTDIR:-$HOME}/.zshenv\"").unwrap();
         let recapture = zshenv
-            .find("export TTY7_USER_ZDOTDIR=${ZDOTDIR:-$HOME}")
+            .find("export NTTY7_USER_ZDOTDIR=${ZDOTDIR:-$HOME}")
             .unwrap();
         let restore = zshenv.rfind("ZDOTDIR=$__tty7_ztmp").unwrap();
         assert!(
@@ -3028,8 +3035,8 @@ mod tests {
         );
         for (name, body) in &files[1..] {
             assert!(
-                !body.contains("export TTY7_USER_ZDOTDIR"),
-                "{name} must not re-export TTY7_USER_ZDOTDIR"
+                !body.contains("export NTTY7_USER_ZDOTDIR"),
+                "{name} must not re-export NTTY7_USER_ZDOTDIR"
             );
         }
     }
@@ -3037,7 +3044,7 @@ mod tests {
     #[test]
     fn zsh_integration_restores_real_zdotdir_after_startup() {
         assert!(ZSH_INTEGRATION.contains("__tty7_restore_zdotdir"));
-        assert!(ZSH_INTEGRATION.contains("ZDOTDIR=${TTY7_USER_ZDOTDIR:-$HOME}"));
+        assert!(ZSH_INTEGRATION.contains("ZDOTDIR=${NTTY7_USER_ZDOTDIR:-$HOME}"));
         assert!(
             ZSH_INTEGRATION.contains("add-zsh-hook -d precmd __tty7_restore_zdotdir"),
             "the restore hook must deregister itself so it runs exactly once"
@@ -3140,13 +3147,13 @@ mod tests {
             ("fish", FISH_INTEGRATION),
         ] {
             assert!(
-                body.contains(r#"-z "$TTY7_SHELL_INTEGRATION""#),
+                body.contains(r#"-z "$NTTY7_SHELL_INTEGRATION""#),
                 "{shell} integration must guard install on the sentinel being empty \
                  (matching setup()'s empty-string reset), not on its mere definedness",
             );
         }
         assert!(
-            !FISH_INTEGRATION.contains("set -q TTY7_SHELL_INTEGRATION"),
+            !FISH_INTEGRATION.contains("set -q NTTY7_SHELL_INTEGRATION"),
             "fish must guard on emptiness (`test -z`), never `set -q`",
         );
     }
@@ -3303,7 +3310,7 @@ mod tests {
     fn setup_dispatches_by_shell_and_sets_sentinel() {
         let inj = setup(Some("zsh"), &[], false).expect("zsh setup");
         assert_eq!(
-            inj.env.get("TTY7_SHELL_INTEGRATION").map(String::as_str),
+            inj.env.get("NTTY7_SHELL_INTEGRATION").map(String::as_str),
             Some("")
         );
         if let Some(d) = inj.dir {
@@ -3313,7 +3320,7 @@ mod tests {
         assert!(setup(Some("zsh"), &[], true).is_none());
 
         let inj = setup(Some("fish"), &[], false).expect("fish setup");
-        assert!(inj.env.contains_key("TTY7_SHELL_INTEGRATION"));
+        assert!(inj.env.contains_key("NTTY7_SHELL_INTEGRATION"));
 
         assert!(setup(Some("fish"), &[], true).is_none());
 
@@ -3324,7 +3331,7 @@ mod tests {
         };
         let inj = setup(Some(bash), &[], false).expect("bash setup");
         assert!(inj.replaces_argv);
-        assert!(inj.env.contains_key("TTY7_SHELL_INTEGRATION"));
+        assert!(inj.env.contains_key("NTTY7_SHELL_INTEGRATION"));
         if let Some(d) = inj.dir {
             let _ = std::fs::remove_dir_all(d);
         }
@@ -3332,14 +3339,14 @@ mod tests {
         assert!(setup(Some(bash), &[], true).is_none());
 
         let inj = setup(Some("powershell.exe"), &[], false).expect("powershell setup");
-        assert!(inj.env.contains_key("TTY7_SHELL_INTEGRATION"));
+        assert!(inj.env.contains_key("NTTY7_SHELL_INTEGRATION"));
         assert!(inj.dir.is_none());
         assert!(!inj.replaces_argv);
 
         assert!(setup(Some("pwsh"), &[], true).is_none());
 
         let inj = setup(Some("nu.exe"), &[], false).expect("nushell setup");
-        assert!(inj.env.contains_key("TTY7_SHELL_INTEGRATION"));
+        assert!(inj.env.contains_key("NTTY7_SHELL_INTEGRATION"));
         assert_eq!(inj.args[0], "--config");
         assert!(!inj.replaces_argv);
         if let Some(d) = inj.dir {
@@ -3378,7 +3385,7 @@ mod tests {
         assert!(s.contains("]133;C"));
         assert!(s.contains("]133;D;$code"));
         assert!(s.contains("]7;file://"));
-        assert!(s.contains("if (-not $env:TTY7_SHELL_INTEGRATION)"));
+        assert!(s.contains("if (-not $env:NTTY7_SHELL_INTEGRATION)"));
         let ok_at = s.find("$ok = $?").expect("captures $?");
         let exit_at = s.find("$lastExit = $LASTEXITCODE").expect("captures exit");
         assert!(ok_at < exit_at, "$? must be read before the exit code");
@@ -3527,7 +3534,7 @@ mod tests {
         assert!(s.contains("hide-env __tty7_cmd_active"));
         assert!(s.contains("prompt_indicator?"));
         assert!(
-            s.contains(r##"($env.TTY7_SHELL_INTEGRATION? | default "") == """##),
+            s.contains(r##"($env.NTTY7_SHELL_INTEGRATION? | default "") == """##),
             "must guard install on the sentinel being empty, like the other shells"
         );
     }
@@ -3705,7 +3712,7 @@ mod tests {
         // whole block, and the marks in the transcript are then Nushell's own.
         injection
             .env
-            .insert("TTY7_SHELL_INTEGRATION".to_string(), String::new());
+            .insert("NTTY7_SHELL_INTEGRATION".to_string(), String::new());
         let text = prompt_cycle_over_pty(
             &nu,
             &injection,
@@ -3783,7 +3790,7 @@ mod tests {
         std::fs::write(&rcfile, format!("{prelude}{BASH_INTEGRATION}")).expect("write rcfile");
         let injection = Injection {
             env: HashMap::from([
-                ("TTY7_SHELL_INTEGRATION".to_string(), String::new()),
+                ("NTTY7_SHELL_INTEGRATION".to_string(), String::new()),
                 (
                     "HOME".to_string(),
                     dir.path().to_string_lossy().into_owned(),

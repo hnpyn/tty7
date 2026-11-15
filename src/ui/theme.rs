@@ -1,6 +1,6 @@
 use gpui::{
-    App, Background, Hsla, Menu, MenuItem, OsAction, Pixels, Point, Styled, SystemMenuType, Window,
-    WindowBackgroundAppearance, linear_color_stop, linear_gradient, point, px, rgb,
+    App, Background, Hsla, Menu, MenuItem, OsAction, Pixels, Styled, SystemMenuType, Window,
+    WindowBackgroundAppearance, linear_color_stop, linear_gradient, px, rgb,
 };
 use gpui_component::scroll::ScrollbarShow;
 use gpui_component::{ActiveTheme, Theme, ThemeMode};
@@ -17,91 +17,10 @@ use crate::ui::presets::Fill;
 #[cfg(target_os = "windows")]
 use std::sync::OnceLock;
 
-/// Where macOS puts the window's traffic lights over the tab strip: centred on
-/// the row of chrome tiles they share the bar with. `x` matches `y`, as AppKit's
-/// unified toolbar does (19 and 19 in a 52-point bar).
-///
-/// `y` is the gap between the window's top edge and the *top* of the button
-/// frame, and macOS draws those buttons [`TRAFFIC_LIGHT_BUTTON_H`] tall — so the
-/// lights' centre falls half that below it. Deriving the number from
-/// [`crate::ui::app::title_strip_centre`], the line every title-bar row puts its
-/// contents on, is what keeps the lights on the tile line: the value the 40-point bar needed was
-/// rewritten by hand when the bar grew to 48, without the border in it, and left
-/// the lights half a point — one device pixel on a Retina panel — below
-/// everything beside them.
-pub(crate) fn traffic_light_position() -> Point<Pixels> {
-    point(px(TRAFFIC_LIGHT_INSET), px(TRAFFIC_LIGHT_INSET))
-}
-
-/// The height of AppKit's own standard-window-button frame, which is what the
-/// lights are drawn inside. It does not move with the bar's height.
-pub(crate) const TRAFFIC_LIGHT_BUTTON_H: f32 = 14.;
-
-// The same content centre drives both the native buttons and the rows beside
-// them. Keep the inset const so the leading reserve can follow it at compile
-// time instead of maintaining a second copy of the bar's border arithmetic.
-const TRAFFIC_LIGHT_INSET: f32 = crate::ui::app::TITLE_STRIP_CENTRE - TRAFFIC_LIGHT_BUTTON_H / 2.;
-
-/// Close to zoom: three 14-point buttons on a 20-point pitch.
-const TRAFFIC_LIGHTS_W: f32 = 54.;
-
-/// The room the lights take at the bar's leading edge on macOS: their span,
-/// with the inset they sit at on either side.
-pub(crate) const TRAFFIC_LIGHTS_LEAD: f32 =
-    TRAFFIC_LIGHT_INSET + TRAFFIC_LIGHTS_W + TRAFFIC_LIGHT_INSET;
-
 pub(crate) fn set_menus(cx: &mut App) {
     cx.set_menus([
-        Menu::new("tty7").items([
-            MenuItem::action(t(L10nKey::AppMenuAbout), About),
-            MenuItem::action(t(L10nKey::AppMenuCheckForUpdates), CheckForUpdates),
-            MenuItem::separator(),
-            MenuItem::action(t(L10nKey::AppMenuSettings), OpenSettings),
-            MenuItem::separator(),
-            MenuItem::os_submenu(t(L10nKey::AppMenuServices), SystemMenuType::Services),
-            MenuItem::separator(),
-            MenuItem::action(t(L10nKey::AppMenuHideApp), HideApp),
-            MenuItem::action(t(L10nKey::AppMenuHideOthers), HideOthers),
-            MenuItem::action(t(L10nKey::AppMenuShowAll), ShowAll),
-            MenuItem::separator(),
-            MenuItem::action(t(L10nKey::AppMenuQuit), Quit),
-        ]),
-        Menu::new(t(L10nKey::AppMenuFile)).items([
-            MenuItem::action(t(L10nKey::AppMenuNewTab), NewTab),
-            MenuItem::action(t(L10nKey::AppMenuNewWorkspace), NewWorkspace),
-            MenuItem::action(t(L10nKey::AppMenuNewWorktreeTab), NewWorktreeTab),
-            MenuItem::separator(),
-            // SSH is one of the reasons to pick tty7 and it had no entry in the
-            // menu bar at all — the only routes were ⌘P and Settings, both of
-            // which you have to already know about. Same labels as the palette,
-            // so there is still one name per thing.
-            MenuItem::action(t(L10nKey::CmdSshManageProfiles), OpenSshProfiles),
-            MenuItem::action(t(L10nKey::CmdSshReconnect), RestartSshSession),
-            MenuItem::separator(),
-            MenuItem::action(t(L10nKey::AppMenuSplitRight), SplitRight),
-            MenuItem::action(t(L10nKey::AppMenuSplitDown), SplitDown),
-            MenuItem::separator(),
-            MenuItem::action(t(L10nKey::AppMenuRenameTab), RenameTab),
-            MenuItem::action(
-                t(L10nKey::AppMenuCopyWorkingDirectory),
-                CopyWorkingDirectory,
-            ),
-            MenuItem::action(t(L10nKey::AppMenuCopySessionId), CopyAgentSessionId),
-            MenuItem::action(t(L10nKey::AppMenuForkSession), ForkAgentSession),
-            MenuItem::separator(),
-            MenuItem::action(t(L10nKey::AppMenuClosePaneTab), CloseActiveTab),
-            // Where a Mac user looks for the way to put the window away; it
-            // is also the one path that works when another app has taken ⇧⌘W.
-            MenuItem::action(t(L10nKey::CmdCloseWindow), CloseWindow),
-            MenuItem::action(t(L10nKey::AppMenuCloseOtherTabs), CloseOtherTabs),
-            MenuItem::action(t(L10nKey::AppMenuCloseTabsRight), CloseTabsToTheRight),
-            MenuItem::action(t(L10nKey::AppMenuReopenClosedTab), ReopenClosedTab),
-            MenuItem::separator(),
-            MenuItem::action(t(L10nKey::AppMenuRenameWorkspace), RenameWorkspace),
-            MenuItem::action(t(L10nKey::AppMenuStopWorkspace), StopWorkspace),
-            MenuItem::separator(),
-            MenuItem::action(t(L10nKey::AppMenuDeleteWorkspace), DeleteWorkspace),
-        ]),
+        application_menu(cx),
+        file_menu(cx),
         Menu::new(t(L10nKey::AppMenuEdit)).items([
             MenuItem::os_action(t(L10nKey::AppMenuUndo), UndoEdit, OsAction::Undo),
             MenuItem::os_action(t(L10nKey::AppMenuRedo), RedoEdit, OsAction::Redo),
@@ -116,117 +35,119 @@ pub(crate) fn set_menus(cx: &mut App) {
             MenuItem::action(t(L10nKey::AppMenuFindPrevious), FindPrevious),
         ]),
         Menu::new(t(L10nKey::AppMenuView)).items([
-            MenuItem::action(t(L10nKey::AppMenuSearchEverywhere), TogglePalette),
-            MenuItem::action(t(L10nKey::CmdGoToFile), QuickOpenFile),
-            MenuItem::action(t(L10nKey::EditorGoToSymbolAction), EditorGoToSymbol),
-            MenuItem::action(t(L10nKey::EditorNavigateBack), EditorNavigateBack),
-            MenuItem::action(t(L10nKey::EditorNavigateForward), EditorNavigateForward),
-            MenuItem::action(t(L10nKey::EditorSplitRight), EditorSplitRight),
-            MenuItem::separator(),
             MenuItem::action(t(L10nKey::AppMenuIncreaseFontSize), IncreaseFontSize),
             MenuItem::action(t(L10nKey::AppMenuDecreaseFontSize), DecreaseFontSize),
             MenuItem::action(t(L10nKey::AppMenuResetFontSize), ResetFontSize),
             MenuItem::separator(),
-            MenuItem::action(t(L10nKey::AppMenuLeftSidebar), ToggleLeftPanel),
-            MenuItem::action(t(L10nKey::AppMenuRightPanel), ToggleRightPanel),
-            MenuItem::action(t(L10nKey::AppMenuCodePanel), ToggleCodePanel),
-            MenuItem::action(t(L10nKey::AppMenuTabBarPosition), ToggleTabSidebar),
-            MenuItem::separator(),
-            MenuItem::action(t(L10nKey::CmdSshRemoteFiles), ToggleSftp),
-            MenuItem::action(t(L10nKey::CmdSshPortForwarding), ShowSshForwards),
-            MenuItem::separator(),
-            MenuItem::action(t(L10nKey::AppMenuFocusNextPane), FocusNextPane),
-            MenuItem::action(t(L10nKey::AppMenuFocusPreviousPane), FocusPrevPane),
-            // No "Zoom Pane" here. It is bound to ⇧⌘↵, and gpui's macOS menu
-            // builder has no key equivalent for `enter`: it hands AppKit the
-            // literal string "enter", which takes the "e" — so the item drew
-            // itself as ⇧⌘E, which is Code Panel's chord, and pressing it
-            // opened the code panel. A menu item that teaches the wrong key and
-            // points at another command is worse than no menu item. Zoom Pane
-            // keeps its place in ⌘P, in a pane's own menu (drawn by us, with
-            // the right chord), and on the Keybindings page.
-            MenuItem::separator(),
             MenuItem::action(t(L10nKey::AppMenuClearScrollback), ClearScrollback),
-            // No "Enter Full Screen" here: AppKit puts its own at the bottom of
-            // any menu named View, so ours sat directly above it — the same
-            // command twice, under two different shortcuts. ⌘↵ still works and
-            // is listed on the Keybindings page.
         ]),
-        Menu::new(t(L10nKey::AppMenuWindow)).items(window_menu_items(cx)),
-        Menu::new(t(L10nKey::AppMenuHelp)).items([
-            MenuItem::action(t(L10nKey::AppMenuDocumentation), OpenDocumentation),
-            MenuItem::action(t(L10nKey::AppMenuKeyboardShortcuts), ShowKeyboardShortcuts),
-            MenuItem::separator(),
-            MenuItem::action(t(L10nKey::AppMenuJoinDiscord), OpenDiscord),
-            MenuItem::action(t(L10nKey::AppMenuReportIssue), ReportIssue),
-            MenuItem::separator(),
-            MenuItem::action(t(L10nKey::AppMenuRestartServer), RestartDaemon),
+        Menu::new(t(L10nKey::AppMenuWindow)).items([
+            MenuItem::action(t(L10nKey::AppMenuMinimize), MinimizeWindow),
+            MenuItem::action(t(L10nKey::AppMenuZoom), ZoomWindow),
         ]),
     ]);
 }
 
-fn window_menu_items(cx: &App) -> Vec<MenuItem> {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let order = crate::ui::windows::menu_order(cx);
-    let store = crate::core::session::WorkspaceStore::all(cx);
-
-    let slot_action = crate::ui::tab_strip::select_workspace_action;
-
-    let mut items = vec![
-        MenuItem::action(t(L10nKey::AppMenuMinimize), MinimizeWindow),
-        MenuItem::action(t(L10nKey::AppMenuZoom), ZoomWindow),
-        MenuItem::separator(),
-    ];
-    let workspace_start = items.len();
-    // Slot order, open and closed interleaved: the item's position is its
-    // number and its shortcut, so it cannot move when a window closes (#760).
-    // A closed one says so with its age instead.
-    for (i, (id, open)) in order.iter().enumerate() {
-        let Some(workspace) = store.get(*id) else {
-            continue;
-        };
-        let Some(action) = slot_action(i) else { break };
-        let name = crate::ui::machine_mirror::display_name(cx, workspace)
-            .unwrap_or_else(|| t(L10nKey::WindowUntitled).to_string());
-        let label = if *open {
-            name
-        } else {
-            format!(
-                "{}  —  {}",
-                name,
-                crate::ui::home::relative_time(now, workspace.last_active)
-            )
-        };
-        items.push(MenuItem::Action {
-            name: label.into(),
-            action,
-            os_action: None,
-            checked: false,
-            disabled: false,
-        });
-    }
-    if items.len() == workspace_start {
+/// Theme and Open Config live in the application menu on macOS and in File
+/// everywhere else. On macOS the application menu also carries Services.
+fn application_menu(cx: &App) -> Menu {
+    let mut items = Vec::new();
+    if cfg!(target_os = "macos") {
+        items.push(MenuItem::submenu(theme_menu(cx)));
         items.push(MenuItem::action(
-            t(L10nKey::AppMenuNewWorkspace),
-            NewWorkspace,
+            t(L10nKey::AppMenuOpenConfigFile),
+            OpenConfigFile,
+        ));
+        items.push(MenuItem::separator());
+        items.push(MenuItem::os_submenu(
+            t(L10nKey::AppMenuServices),
+            SystemMenuType::Services,
+        ));
+        items.push(MenuItem::separator());
+    }
+    items.extend([
+        MenuItem::action(t(L10nKey::AppMenuHideApp), HideApp),
+        MenuItem::action(t(L10nKey::AppMenuHideOthers), HideOthers),
+        MenuItem::action(t(L10nKey::AppMenuShowAll), ShowAll),
+        MenuItem::separator(),
+        MenuItem::action(t(L10nKey::AppMenuQuit), Quit),
+    ]);
+    Menu::new("ntty7").items(items)
+}
+
+fn file_menu(cx: &App) -> Menu {
+    let mut items = vec![
+        MenuItem::action(t(L10nKey::CmdNewWindow), NewWindow),
+        MenuItem::separator(),
+        MenuItem::action(t(L10nKey::CmdCloseWindow), CloseWindow),
+    ];
+    if !cfg!(target_os = "macos") {
+        items.push(MenuItem::separator());
+        items.push(MenuItem::submenu(theme_menu(cx)));
+        items.push(MenuItem::action(
+            t(L10nKey::AppMenuOpenConfigFile),
+            OpenConfigFile,
         ));
     }
-    items
+    items.push(MenuItem::separator());
+    items.push(MenuItem::action(t(L10nKey::AppMenuQuit), Quit));
+    Menu::new(t(L10nKey::AppMenuFile)).items(items)
+}
+
+fn theme_menu(cx: &App) -> Menu {
+    let config = cx.global::<Config>();
+    let active = effective_preset_id(cx);
+    let themes = presets::all(cx);
+    let light = theme_rows(&themes, false, &active);
+    let dark = theme_rows(&themes, true, &active);
+    let mut items = vec![
+        MenuItem::action(
+            t(L10nKey::AppMenuFollowSystemAppearance),
+            ToggleThemeFollowSystem,
+        )
+        .checked(config.theme_follow_system),
+        MenuItem::separator(),
+    ];
+    if !light.is_empty() && !dark.is_empty() {
+        items.extend(light);
+        items.push(MenuItem::separator());
+        items.extend(dark);
+    } else {
+        items.extend(light);
+        items.extend(dark);
+    }
+    Menu::new(t(L10nKey::AppMenuTheme)).items(items)
+}
+
+/// Built-ins first, then themes loaded from the themes directory, with a
+/// separator between them when both are present. `presets::all` already
+/// returns that order; this only splits one polarity out of it.
+fn theme_rows(themes: &[presets::Theme], dark: bool, active: &str) -> Vec<MenuItem> {
+    let mut builtin = Vec::new();
+    let mut custom = Vec::new();
+    for theme in themes.iter().filter(|theme| theme.dark == dark) {
+        let item = MenuItem::action(
+            theme.name.clone(),
+            SelectTheme {
+                id: theme.id.clone(),
+            },
+        )
+        .checked(theme.id == active);
+        if theme.path.is_some() {
+            custom.push(item);
+        } else {
+            builtin.push(item);
+        }
+    }
+    if !builtin.is_empty() && !custom.is_empty() {
+        builtin.push(MenuItem::separator());
+    }
+    builtin.extend(custom);
+    builtin
 }
 
 pub(crate) fn window_background(bg: &presets::ActiveBackground) -> Background {
     window_background_with_alpha(bg, bg.opacity.unwrap_or(1.0))
-}
-
-/// The same preset fill with the alpha channel forced to 1 — used by the
-/// settings overlay, which must stay opaque (workspace translucency must
-/// never show through it) while still rendering the preset's gradient
-/// design instead of collapsing to a flat solid color.
-pub(crate) fn window_background_opaque(bg: &presets::ActiveBackground) -> Background {
-    window_background_with_alpha(bg, 1.0)
 }
 
 /// The workspace's own fill: the preset at whatever alpha the window opacity
@@ -238,17 +159,23 @@ pub(crate) fn workspace_background(cx: &App) -> Background {
     }
 }
 
-/// The fill for a full-window overlay (settings, the opened file, the diff
-/// view). Always opaque: the overlay covers the whole workspace, so window
-/// translucency and the backdrop material must stop at it instead of showing
-/// desktop through its text. Overlays pair this with
-/// `app::overlay_surface_layers`, because their own opaque fill hides the
-/// theme background image the workspace root paints beneath them.
-pub(crate) fn overlay_background(cx: &App) -> Background {
-    match cx.try_global::<presets::ActiveBackground>() {
-        Some(bg) => window_background_opaque(bg),
-        None => cx.theme().background.alpha(1.0).into(),
-    }
+/// The theme's background image as a full-bleed layer.
+pub(crate) fn window_background_image_layer(cx: &App) -> Option<gpui::Div> {
+    use gpui::prelude::*;
+    use gpui::{ObjectFit, div, img};
+
+    let image = cx
+        .try_global::<crate::ui::presets::ActiveBackground>()?
+        .image
+        .clone()?;
+    Some(
+        div()
+            .absolute()
+            .inset_0()
+            .overflow_hidden()
+            .opacity(image.opacity)
+            .child(img(image.path).size_full().object_fit(ObjectFit::Cover)),
+    )
 }
 
 fn window_background_with_alpha(bg: &presets::ActiveBackground, alpha: f32) -> Background {
@@ -302,13 +229,81 @@ pub(crate) fn system_dark(cx: &App) -> bool {
 }
 
 pub(crate) fn effective_preset_id(cx: &App) -> String {
-    let config = cx.global::<Config>();
+    effective_preset_id_from(cx.global::<Config>(), system_dark(cx))
+}
+
+pub(crate) fn effective_preset_id_from(config: &Config, system_dark: bool) -> String {
     if !config.theme_follow_system {
         config.theme_preset.clone()
-    } else if system_dark(cx) {
+    } else if system_dark {
         config.theme_preset_dark.clone()
     } else {
         config.theme_preset_light.clone()
+    }
+}
+
+/// Record an explicit theme pick.
+///
+/// `theme_preset` is what shows while follow-system is off, so it always
+/// becomes `id` — the theme just clicked, of either polarity. While
+/// follow-system is on, the live theme is the slot for the *current* OS
+/// appearance, and that slot may hold any preset id. Writing `id` there is
+/// what makes the click show up immediately without turning follow-system off.
+pub(crate) fn select_theme_preset(config: &mut Config, system_dark: bool, id: &str) {
+    if id.is_empty() {
+        return;
+    }
+    config.theme_preset = id.to_string();
+    if !config.theme_follow_system {
+        return;
+    }
+    if system_dark {
+        config.theme_preset_dark = id.to_string();
+    } else {
+        config.theme_preset_light = id.to_string();
+    }
+}
+
+pub(crate) fn toggle_theme_follow(config: &mut Config) {
+    config.theme_follow_system = !config.theme_follow_system;
+}
+
+fn apply_theme_config_change(cx: &mut App, mutate: impl FnOnce(&mut Config)) {
+    {
+        let config = cx.global_mut::<Config>();
+        mutate(config);
+        config.save();
+    }
+    apply_theme(None, cx);
+    set_menus(cx);
+    cx.refresh_windows();
+}
+
+pub(crate) fn toggle_theme_follow_system(_: &ToggleThemeFollowSystem, cx: &mut App) {
+    apply_theme_config_change(cx, toggle_theme_follow);
+}
+
+pub(crate) fn select_theme(action: &SelectTheme, cx: &mut App) {
+    if action.id.is_empty() || presets::all(cx).iter().all(|theme| theme.id != action.id) {
+        return;
+    }
+    let dark = system_dark(cx);
+    let id = action.id.clone();
+    apply_theme_config_change(cx, |config| select_theme_preset(config, dark, &id));
+}
+
+/// Open `config.json` with the OS file association.
+///
+/// The file has to exist before the opener runs. Creating the directory and
+/// writing a missing file happen in `Config::ensure_config_file_exists`, which
+/// is outside the UI: a path here is not necessarily on this machine.
+pub(crate) fn open_config_file(_: &OpenConfigFile, cx: &mut App) {
+    let Some(path) = cx.global::<Config>().ensure_config_file_exists() else {
+        log::warn!("configuration directory is unavailable");
+        return;
+    };
+    if let Err(error) = crate::terminal::view::open_file_path(&path) {
+        log::warn!("could not open {}: {error}", path.display());
     }
 }
 
@@ -406,11 +401,6 @@ pub(crate) fn supported_backdrops_for(build: u32) -> &'static [WindowBackdrop] {
 }
 
 #[cfg(target_os = "windows")]
-pub(crate) fn supported_backdrops() -> &'static [WindowBackdrop] {
-    supported_backdrops_for(windows_build_number())
-}
-
-#[cfg(target_os = "windows")]
 pub(crate) fn windows_build_number() -> u32 {
     static BUILD: OnceLock<u32> = OnceLock::new();
     *BUILD.get_or_init(|| {
@@ -495,58 +485,6 @@ pub(crate) fn default_window_opacity(backdrop: WindowBackdrop, blur: bool) -> f3
     } else {
         1.0
     }
-}
-
-/// The fill for the workspace's large translucent surfaces (file sidebar,
-/// right panel, SFTP panel). While a material is active and the window is
-/// translucent, the surface paints on top of the already-alpha window
-/// background, so its own alpha stacks (src-over) and the material would
-/// show through far less than behind the terminal; a constant 0.15 keeps
-/// the backdrop ratio at ~85% of the terminal's at every opacity setting.
-/// `theme.sidebar` itself stays opaque — the settings theme picker paints
-/// with it on top of the opaque settings overlay and must stay legible.
-pub(crate) fn workspace_surface_color(cx: &App) -> Hsla {
-    translucent_surface(cx.theme().sidebar, cx)
-}
-
-/// The left tab rail's fill: the one tinted surface in the workspace (see
-/// `Neutrals::rail`), with the same translucency rule as
-/// [`workspace_surface_color`].
-pub(crate) fn rail_surface_color(cx: &App) -> Hsla {
-    let base: Hsla = rgb(cx.global::<presets::Surfaces>().rail.base).into();
-    translucent_surface(base, cx)
-}
-
-fn translucent_surface(base: Hsla, cx: &App) -> Hsla {
-    let translucent = cx
-        .try_global::<presets::ActiveBackground>()
-        .and_then(|bg| bg.opacity)
-        .is_some_and(|o| o < 1.0);
-    if !translucent {
-        return base;
-    }
-    let config = cx.global::<Config>();
-    let theme = presets::by_id(cx, &effective_preset_id(cx));
-    let blur = config.window_blur.unwrap_or(theme.blur);
-    if material_active(config.window_backdrop, blur) {
-        base.alpha(0.15)
-    } else {
-        base
-    }
-}
-
-/// The backdrop presets offered in the settings dropdown: everything the
-/// current build supports, plus the stored value even if it is not
-/// supported here (e.g. Mica synced from a newer machine) — so the label
-/// always matches what the window actually resolves to instead of quietly
-/// showing "Auto" while a fallback appearance is applied.
-#[cfg(target_os = "windows")]
-pub(crate) fn backdrop_options(current: WindowBackdrop) -> Vec<WindowBackdrop> {
-    let mut list = supported_backdrops().to_vec();
-    if !list.contains(&current) {
-        list.push(current);
-    }
-    list
 }
 
 /// The window's background alpha: the config override, else the theme's,
@@ -654,8 +592,14 @@ pub(crate) fn apply_theme(mut window: Option<&mut Window>, cx: &mut App) {
     let follow = cx.global::<Config>().theme_follow_system;
     if follow {
         sync_native_appearance(None);
-        #[cfg(target_os = "macos")]
-        refresh_system_appearance(cx);
+        // The appearance observer just recorded `window.appearance()`.
+        // `cx.window_appearance()` can still be the previous value on that
+        // same turn, so a window we were handed wins over the app-level query.
+        if let Some(win) = window.as_deref() {
+            note_system_appearance(win, cx);
+        } else {
+            refresh_system_appearance(cx);
+        }
     }
     let theme = presets::by_id(cx, &effective_preset_id(cx));
     // Cache the mode beside the machine tree: the daemon is a separate process
@@ -688,22 +632,21 @@ pub(crate) fn apply_theme(mut window: Option<&mut Window>, cx: &mut App) {
     let backdrop = config.window_backdrop;
     let ui_font_family = config.ui_font_family.clone();
 
+    // Computed before the window borrow so a reload with no window of its own
+    // still pushes the appearance. The window passed in refuses a nested
+    // update, so it is handled directly and the loop covers the rest.
+    let appearance = window_appearance(backdrop, blur, fill_opacity);
     if let Some(window) = window.as_deref_mut() {
-        let appearance = window_appearance(backdrop, blur, fill_opacity);
         if take_appearance_change(window, appearance, cx) {
             window.set_background_appearance(appearance);
         }
-        // Opacity, blur and backdrop are app-wide settings, but they are
-        // changed from whichever window the settings page is in — its own,
-        // now. Hand the same appearance to every other window too. The one
-        // being updated refuses a nested update, and was handled above.
-        for other in cx.windows() {
-            let _ = other.update(cx, |_, window, cx| {
-                if take_appearance_change(window, appearance, cx) {
-                    window.set_background_appearance(appearance);
-                }
-            });
-        }
+    }
+    for other in cx.windows() {
+        let _ = other.update(cx, |_, window, cx| {
+            if take_appearance_change(window, appearance, cx) {
+                window.set_background_appearance(appearance);
+            }
+        });
     }
 
     Theme::change(mode, window.as_deref_mut(), cx);
@@ -716,9 +659,6 @@ pub(crate) fn apply_theme(mut window: Option<&mut Window>, cx: &mut App) {
     cx.set_global(surfaces.clone());
     cx.set_global(interaction);
     cx.set_global(presets::ActiveAccent(m.accent));
-    // Same treatment as `Surfaces`: derived once here rather than recomputed
-    // in `render`, because the graph reads it once per visible row per frame
-    // and each entry costs a contrast bisection on three surfaces.
     cx.set_global(presets::ActiveLanes(theme.lanes()));
 
     if !cx.has_global::<StockUiFont>() {
@@ -1012,11 +952,9 @@ pub(crate) fn apply_theme(mut window: Option<&mut Window>, cx: &mut App) {
     highlight.style.editor_active_line_number = Some(ink);
     highlight.style.editor_invisible = Some(ink.opacity(0.25));
     t.highlight_theme = std::sync::Arc::new(highlight);
-
-    #[cfg(target_os = "macos")]
-    if let Some(window) = window.as_deref_mut() {
-        window.set_traffic_light_position(traffic_light_position());
-    }
+    // Checkmarks read the preset this call just settled on, including an OS
+    // appearance flip and a config reload, both of which land here.
+    set_menus(cx);
 }
 
 /// Shared opaque floating surface. In-window GPUI layers cannot blur the
@@ -1037,29 +975,6 @@ pub(crate) fn floating_surface<T: Styled>(element: T, cx: &App) -> T {
 /// its ink on a 1x display, under the contrast floor `divider` is held to.
 pub(crate) fn hairline(window: &Window) -> Pixels {
     px(1. / window.scale_factor().max(1.))
-}
-
-/// Tabular figures, so a column of counts, sizes and positions keeps its
-/// digits on one grid while the numbers change under it.
-pub(crate) fn tabular_figures() -> gpui::FontFeatures {
-    gpui::FontFeatures(std::sync::Arc::new(vec![("tnum".to_string(), 1)]))
-}
-
-/// The v4 primary button: an inverted neutral — body ink as the fill, the
-/// surface it sits on as the label — rather than the accent, which stays with
-/// focus and the things that are on. `surface` is the opaque fill under the
-/// button, so the label reads as cut out of it. Disabled, gpui-component
-/// drops the fill to 15% of itself, the faint well the rest of v4 uses.
-pub(crate) fn inverted_button(
-    surface: Hsla,
-    cx: &App,
-) -> gpui_component::button::ButtonCustomVariant {
-    let ink = cx.theme().foreground;
-    gpui_component::button::ButtonCustomVariant::new(cx)
-        .color(ink)
-        .foreground(surface)
-        .hover(ink.blend(surface.opacity(0.14)))
-        .active(ink.blend(surface.opacity(0.24)))
 }
 
 pub(crate) fn apply_cursor_hide_mode(cx: &mut App) {
@@ -1102,30 +1017,6 @@ mod tests {
     use super::*;
     use gpui::TestAppContext;
 
-    /// The lights share a line with the chrome tiles they sit beside. gpui
-    /// hangs the top of the button frame `y` below the window's top edge, so
-    /// their centre falls half a frame under that, and `title_strip_centre` is
-    /// where every title-bar row puts its contents. Sixteen and a half points
-    /// today, out of the 48pt bar.
-    #[test]
-    fn the_traffic_lights_sit_on_the_chrome_rows_centre() {
-        let position = traffic_light_position();
-        assert_eq!(position.x, position.y);
-        assert_eq!(
-            position.y + px(TRAFFIC_LIGHT_BUTTON_H / 2.),
-            crate::ui::app::title_strip_centre()
-        );
-    }
-
-    /// The strip, editor header and search band start at the lead, so the
-    /// lights have to end, with their inset after them, before it does.
-    #[test]
-    #[cfg(target_os = "macos")]
-    fn the_title_bar_lead_clears_the_traffic_lights() {
-        let right = traffic_light_position().x + px(TRAFFIC_LIGHTS_W);
-        assert!(right + px(TRAFFIC_LIGHT_INSET) <= px(crate::ui::app::TITLE_BAR_LEAD));
-    }
-
     #[gpui::test]
     fn effective_preset_follows_the_cached_system_appearance(cx: &mut TestAppContext) {
         cx.update(|cx| {
@@ -1147,6 +1038,126 @@ mod tests {
             cx.global_mut::<Config>().theme_follow_system = false;
             assert_eq!(effective_preset_id(cx), Config::default().theme_preset);
         });
+    }
+
+    #[test]
+    fn follow_system_is_the_default_and_a_pick_lands_in_the_live_slot() {
+        let cfg = Config::default();
+        assert!(cfg.theme_follow_system);
+        assert_eq!(effective_preset_id_from(&cfg, true), "dark");
+        assert_eq!(effective_preset_id_from(&cfg, false), "light");
+
+        let mut cfg = cfg;
+        select_theme_preset(&mut cfg, true, "one_light");
+        assert!(cfg.theme_follow_system);
+        assert_eq!(cfg.theme_preset, "one_light");
+        assert_eq!(cfg.theme_preset_dark, "one_light");
+        assert_eq!(cfg.theme_preset_light, "light");
+        assert_eq!(effective_preset_id_from(&cfg, true), "one_light");
+
+        select_theme_preset(&mut cfg, false, "dracula");
+        assert_eq!(cfg.theme_preset, "dracula");
+        assert_eq!(cfg.theme_preset_light, "dracula");
+        assert_eq!(cfg.theme_preset_dark, "one_light");
+        assert_eq!(effective_preset_id_from(&cfg, false), "dracula");
+    }
+
+    #[test]
+    fn a_pick_while_not_following_keeps_the_appearance_slots() {
+        let mut cfg = Config::default();
+        cfg.theme_follow_system = false;
+        cfg.theme_preset = "dark".into();
+        select_theme_preset(&mut cfg, true, "harbor");
+        assert!(!cfg.theme_follow_system);
+        assert_eq!(cfg.theme_preset, "harbor");
+        assert_eq!(cfg.theme_preset_dark, "dark");
+        assert_eq!(cfg.theme_preset_light, "light");
+        assert_eq!(effective_preset_id_from(&cfg, true), "harbor");
+
+        select_theme_preset(&mut cfg, false, "");
+        assert_eq!(cfg.theme_preset, "harbor");
+    }
+
+    #[test]
+    fn toggling_follow_switches_which_field_is_live() {
+        let mut cfg = Config::default();
+        cfg.theme_preset = "harbor".into();
+        cfg.theme_preset_light = "one_light".into();
+        cfg.theme_preset_dark = "dracula".into();
+        assert_eq!(effective_preset_id_from(&cfg, true), "dracula");
+
+        toggle_theme_follow(&mut cfg);
+        assert!(!cfg.theme_follow_system);
+        assert_eq!(cfg.theme_preset, "harbor");
+        assert_eq!(cfg.theme_preset_dark, "dracula");
+        assert_eq!(cfg.theme_preset_light, "one_light");
+        assert_eq!(effective_preset_id_from(&cfg, true), "harbor");
+
+        toggle_theme_follow(&mut cfg);
+        assert!(cfg.theme_follow_system);
+        assert_eq!(effective_preset_id_from(&cfg, false), "one_light");
+        assert_eq!(effective_preset_id_from(&cfg, true), "dracula");
+    }
+
+    #[gpui::test]
+    fn the_theme_menu_checks_follow_and_the_effective_preset(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let mut cfg = Config::default();
+            cfg.theme_preset_dark = "dracula".into();
+            cfg.theme_preset_light = "one_light".into();
+            cx.set_global(cfg);
+            cx.set_global(SystemAppearance { dark: true });
+
+            let menu = theme_menu(cx);
+            assert!(follow_item_checked(&menu.items));
+            assert_eq!(checked_theme_ids(&menu.items), vec!["dracula".to_string()]);
+
+            toggle_theme_follow(cx.global_mut::<Config>());
+            cx.global_mut::<Config>().theme_preset = "harbor".into();
+            let menu = theme_menu(cx);
+            assert!(!follow_item_checked(&menu.items));
+            assert_eq!(checked_theme_ids(&menu.items), vec!["harbor".to_string()]);
+        });
+    }
+
+    fn checked_theme_ids(items: &[MenuItem]) -> Vec<String> {
+        let mut ids = Vec::new();
+        collect_checked_themes(items, &mut ids);
+        ids
+    }
+
+    fn collect_checked_themes(items: &[MenuItem], ids: &mut Vec<String>) {
+        for item in items {
+            match item {
+                MenuItem::Submenu(menu) => collect_checked_themes(&menu.items, ids),
+                MenuItem::Action {
+                    action,
+                    checked: true,
+                    ..
+                } => {
+                    if let Some(select) = action.as_any().downcast_ref::<SelectTheme>() {
+                        ids.push(select.id.clone());
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn follow_item_checked(items: &[MenuItem]) -> bool {
+        items.iter().any(|item| match item {
+            MenuItem::Submenu(menu) => follow_item_checked(&menu.items),
+            MenuItem::Action {
+                action, checked, ..
+            } => {
+                *checked
+                    && action
+                        .as_any()
+                        .downcast_ref::<ToggleThemeFollowSystem>()
+                        .is_some()
+            }
+            _ => false,
+        })
     }
 
     #[test]
@@ -1400,14 +1411,4 @@ mod tests {
             &[WindowBackdrop::Auto, WindowBackdrop::Off]
         );
     }
-}
-
-/// The text view's style for rendered Markdown, wherever tty7 shows it.
-///
-/// Inline `code` gets a faint neutral fill. The text view's own default is the
-/// theme's `accent`, which tty7 also paints selection with, so every code span
-/// read as selected text.
-pub(crate) fn markdown_style(cx: &gpui::App) -> gpui_component::text::TextViewStyle {
-    gpui_component::text::TextViewStyle::default()
-        .inline_code_background(cx.theme().foreground.opacity(0.08))
 }

@@ -2,45 +2,22 @@
 name = "tty7"
 version.workspace = true
 edition = "2024"
-description = "A terminal workbench: shells, persistent sessions, SSH, coding agents — GPU-rendered on Zed's gpui, pure Rust"
+description = "One process, one window. A GPU terminal on Zed's gpui."
 repository = "https://github.com/l0ng-ai/tty7"
 license = "Apache-2.0"
 readme = "README.md"
 publish = false
-default-run = "tty7-app"
+default-run = "ntty7"
 
 [[bin]]
-name = "tty7-app"
+name = "ntty7"
 path = "src/main.rs"
 
-[[bin]]
-name = "tty7-updater"
-path = "src/bin/tty7-updater.rs"
-required-features = ["updater"]
-
 [dependencies]
-# The framework-free half of tty7: wire protocol, session daemon, PTY, the
-# native SSH engine, and the domain model the headless `tty7-server` shares with
-# this GUI. Everything that does *not* need gpui lives there.
-# `gssapi` is off in tty7-core's defaults (a static musl `tty7-server` cannot
-# link the system krb5 it binds); the GUI, which builds against a real desktop
-# toolchain, turns it on so managed SSH connections keep offering
-# `gssapi-with-mic` exactly as before.
-#
-# `remote-install` is off there for the same shape of reason: it pulls an HTTPS
-# client used only to *download* a `tty7-server` onto a remote machine
-# (decision D5). The server binary is the thing being downloaded, so it can
-# never take that path; the GUI, which is the client that pushes it, can.
-#
-# `github` is the right panel's GitHub tab: the same HTTPS client, pointed at
-# api.github.com.
-tty7-core = { path = "crates/tty7-core", features = ["gssapi", "remote-install", "github"] }
-# The mobile gateway, run by the local daemon while mobile access is on
-# (`core::mobile`). Lives in the GUI binary only: tty7-server is the lean static
-# binary pushed to remote machines, and must not grow iroh.
-tty7-gateway = { path = "crates/tty7-gateway" }
-# Draws the pairing code in Settings → Mobile.
-qrcode = { version = "0.14", default-features = false }
+# The framework-free half: wire protocol, the in-process terminal server, and
+# the PTY. A solo window does not enable the GSSAPI, remote-install, or GitHub
+# features.
+tty7-core = { path = "crates/tty7-core" }
 
 gpui = { workspace = true }
 gpui_platform = { workspace = true }
@@ -58,12 +35,6 @@ regex = "1"
 # tokenizers in `tty7-core` already use. Already in the tree via `tty7-core`,
 # so this pins no new code.
 memchr = "2"
-# Grapheme-cluster boundaries for the sidebar's label elision
-# (`ui::tab_strip`). Cutting a label by `char` tears emoji apart: a ZWJ
-# sequence loses its joiner, `❤️` loses the variation selector that makes it an
-# emoji, and half a flag renders as a bare letter. Already in the tree via
-# gpui, so this pins no new code.
-unicode-segmentation = "1"
 # Column widths for the input bar (`terminal::view`). The bar has to lay text
 # out the way the terminal grid will, and the grid gets its widths from this
 # same crate by way of `alacritty_terminal` — a hand-rolled code-point table
@@ -74,46 +45,14 @@ smol.workspace = true
 smallvec.workspace = true
 serde = { workspace = true }
 serde_json.workspace = true
+# `SelectTheme` is a parameterized gpui action, and the derive needs
+# `JsonSchema` from the same schemars 1.x gpui re-exports.
+schemars = { version = "1.0", features = ["indexmap2"] }
 tempfile = "3"
-# LaunchServices sends files and custom URL schemes through gpui's unified
-# open-URL callback. `url` keeps the decoding and SSH authority parsing here
-# standards-compliant rather than treating percent escapes as literal paths,
-# and `percent-encoding` — already in the tree under `url` — spells the
-# userinfo and man-page names back out.
-url = "2"
-percent-encoding = "2"
-# The code editor's language-server client (`ui::lsp`). The same version
-# gpui-component's LSP hooks take their types from.
-lsp-types = { version = "0.97.0", features = ["proposed"] }
-
-# The code editor's file loading and saving (`ui::editor_text`). `encoding_rs`
-# decodes legacy-encoded text (GB18030, Windows-1252) and writes it back in the
-# same encoding, and `globset` matches `.editorconfig` section globs. Both are
-# already in the tree (via gpui's HTTP stack and its `ignore` walker), so they
-# pin no new code.
-encoding_rs = "0.8.35"
-globset = "0.4.20"
-
-# SSH profile ids in the connection manager UI (`ui::ssh_connect`,
-# `ui::settings`, the command palette). The profiles themselves — and the
-# secret-free `CredentialRef` they carry — live in `tty7-core`, which `Config`
-# needs to parse `config.json` without gpui.
+# Pane ids. Already used by the terminal view.
 uuid = { version = "1", features = ["v4", "serde"] }
 
-# The credential vault's storage half (`core::keychain`). `keyring` 4.x's default
-# `v1` feature auto-selects the platform store (macOS Keychain / Windows
-# Credential Manager / Linux Secret Service), so no per-platform guards are
-# needed.
-#
-# It sits here rather than in `tty7-core` on purpose: every caller is in `ui::`
-# (`ssh_prompt`, `ssh_connect`, `settings`, `app`), and leaving it downstairs made
-# the headless `tty7-server` — a static binary pushed onto machines that have no
-# keychain at all — link `zbus`/`secret-service` and thirty-odd crates behind them
-# for code it can never reach. Only the secret-free naming half (`CredentialRef`,
-# the account scheme) stays in core, where `config.json` parsing needs it.
-keyring = "4"
-
-# Theme files. tty7 themes are authored as YAML (`~/.config/tty7/themes/*.yaml`,
+# Theme files. Themes are authored as YAML (`~/.config/ntty7/themes/*.yaml`,
 # our own schema); `plist` parses imported iTerm2 `.itermcolors` schemes (XML
 # plist) so the large iTerm color-scheme ecosystem drops straight in. serde_yaml
 # is already in the tree transitively, so it pins no new code; plist is pure Rust.
@@ -128,17 +67,7 @@ plist = "1"
 # gpui's own clipboard code, so pinning it here adds no new native code.
 image = "0.25"
 
-# HTTP client for the startup update check (`core::update`): one GET to the
-# GitHub releases API to see if a newer version has shipped. `reqwest_client`
-# wraps Zed's `zed-reqwest` fork behind gpui's `http_client` trait (re-exported
-# as `gpui::http_client`) and manages its own tokio runtime. That reqwest+rustls
-# stack is *already* compiled into the tree via `gpui-component-assets`, so this
-# pins no new native code — it only exposes what we're already building. Pinned
-# to gpui's rev so the shared `http_client`/`zed-reqwest` versions stay aligned.
-reqwest_client = { git = "https://github.com/zed-industries/zed", rev = "1d217ee39d381ac101b7cf49d3d22451ac1093fe" }
-
-# See `[workspace.dependencies]`: the pin is shared with tty7-cli, which parses
-# `capture` output through the same grid.
+# The VT parser and grid the live terminal mirror renders.
 alacritty_terminal.workspace = true
 
 # Desktop notifications driven by OSC 9 / OSC 777 escape sequences, on Linux and
@@ -147,24 +76,8 @@ alacritty_terminal.workspace = true
 notify-rust = "4"
 
 # Filesystem watcher for live config reload: watches `config.json` and reloads
-# `Config` + re-applies the theme without a restart. The code panel (file tree /
-# editor, `ui::code`) reuses it to refresh the tree and detect external edits.
+# `Config` + re-applies the theme without a restart.
 notify = "8"
-
-# System tray / menu bar status item (`ui::tray`). Rasterizes the bundled SVG
-# logo into the tray bitmap at runtime — gpui's own SVG path only yields a
-# tinted alpha mask, not raw RGBA. The gpui and gpui-component forks both pin
-# the same 0.47, so the whole tree shares a single resvg/usvg/tiny-skia stack;
-# default features off drops the text/font machinery our icon SVGs don't use.
-resvg = { version = "0.47", default-features = false }
-
-# The tray icon itself, macOS + Windows: tauri's `tray-icon` (NSStatusItem /
-# Shell_NotifyIcon via objc2 / windows-sys, both already in the tree). Linux is
-# deliberately NOT on this crate — its Linux backend needs GTK + libappindicator,
-# which tty7's AppImage doesn't bundle and the x11/wayland gpui backends don't
-# pull. Linux instead uses `ksni` below.
-[target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
-tray-icon = "0.24"
 
 # The pty-size ioctl in `terminal::generator` is the only libc user left in the
 # GUI (the daemon's own libc calls went to tty7-core), and it is Unix-only — so
@@ -172,10 +85,7 @@ tray-icon = "0.24"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
-# `core::cli_install` edits HKCU\Environment to put the bundled CLI on PATH.
-# `setx` is not an option there: it truncates at 1024 characters, so a long user
-# PATH comes back mangled. 0.61 is already in the tree (tray-icon pulls it), so
-# this pins no new code.
+# Windows toasts and the terminal bell. 0.61 is already in the tree via gpui.
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
@@ -196,10 +106,6 @@ windows-sys = { version = "0.61", features = [
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }
-# The standalone updater extracts only Windows release ZIPs. Reuse the async
-# reader already present in Cargo.lock and enable only the Deflate codec emitted
-# by PowerShell's Compress-Archive.
-async_zip = { version = "0.0.19", default-features = false, features = ["deflate"], optional = true }
 
 # COM for toast branding (`core::aumid`): IShellLinkW + IPropertyStore stamp
 # System.AppUserModel.ID onto the Start Menu shortcut, which Windows requires
@@ -270,38 +176,24 @@ jieba-rs = "0.10"
 # itself via `cfg`, so no feature is needed for them.
 [target.'cfg(target_os = "linux")'.dependencies]
 gpui_platform = { workspace = true, features = ["x11", "wayland"] }
-# Linux tray (`ui::tray`): pure-Rust StatusNotifierItem over DBus (zbus — already
-# in the tree). `blocking` + `async-io` gives a synchronous handle without
-# requiring the app to own a tokio runtime; ksni runs its own service thread. On
-# desktops without an SNI host (bare GNOME without the AppIndicator extension)
-# spawning fails and the tray is silently absent — the app is unaffected.
-ksni = { version = "0.3.6", default-features = false, features = ["blocking", "async-io"] }
 
 # gpui's `test-support` unlocks `#[gpui::test]` + `TestAppContext`, the headless
 # App/Window harness the view/event tests run on. Dev-only: the feature merges
 # into test builds and never reaches a release binary.
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }
-# tests/edns_z_flag.rs drives iroh's resolver, so the simple-dns patch below is
-# checked by the default `cargo test` CI runs, which skips tty7-gateway.
-iroh = "1.2"
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 
 [lints]
 workspace = true
 
 [features]
 default = []
-updater = ["dep:async_zip"]
 
 # ---- Standalone workspace mirroring gpui-component's pins so the git/source
 # ---- caches are shared and versions stay aligned. ----
 [workspace]
-members = ["crates/*"]
-# The root `tty7` package is a member implicitly; naming every crate here is
-# what makes a bare `cargo build` / `cargo test` at the root cover the whole
-# workspace, which is how CI invokes them.
-default-members = [".", "crates/tty7-core", "crates/tty7-server", "crates/tty7-cli"]
+members = [".", "crates/tty7-core"]
+default-members = ["."]
 
 [workspace.package]
 edition = "2024"
@@ -322,9 +214,7 @@ version = "26.10.0"
 # that, since a path dependency can't resolve on CI.
 #
 # `tree-sitter-languages` compiles the grammars the code editor highlights with.
-gpui-component = { git = "https://github.com/l0ng-ai/gpui-component", branch = "tty7", version = "0.5.2", features = [
-    "tree-sitter-languages",
-] }
+gpui-component = { git = "https://github.com/l0ng-ai/gpui-component", branch = "tty7", version = "0.5.2", features = [] }
 gpui-component-assets = { git = "https://github.com/l0ng-ai/gpui-component", branch = "tty7", version = "0.5.1" }
 
 gpui = { git = "https://github.com/zed-industries/zed", rev = "1d217ee39d381ac101b7cf49d3d22451ac1093fe" }
@@ -391,11 +281,6 @@ smol = "2"
 # to an exact rev (never a branch): russh is the SSH protocol layer handling
 # user credentials, and `cargo update` must not change what it builds.
 russh = { git = "https://github.com/l0ng-ai/russh", rev = "34f73e68d875b6fc2529654102ee65bafc691c59" }
-# simple-dns 0.12.0 with the EDNS OPT TTL read at RFC 6891's offsets: upstream
-# takes the extended RCODE from the low byte, where the DO/Z flags live, so a
-# resolver that sets a Z bit (Clash-style fake-IP DNS does) turns every answer
-# into RCODE 16 and iroh resolves nothing — no relay, no phone off the LAN.
-simple-dns = { path = "vendor/simple-dns" }
 
 [workspace.lints.clippy]
 dbg_macro = "deny"
@@ -492,4 +377,3 @@ gpui = { git = "https://github.com/l0ng-ai/zed", branch = "tty7" }
 gpui_platform = { git = "https://github.com/l0ng-ai/zed", branch = "tty7" }
 gpui_macros = { git = "https://github.com/l0ng-ai/zed", branch = "tty7" }
 gpui_web = { git = "https://github.com/l0ng-ai/zed", branch = "tty7" }
-reqwest_client = { git = "https://github.com/l0ng-ai/zed", branch = "tty7" }

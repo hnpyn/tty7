@@ -386,12 +386,15 @@ const TERM_PROGRAM_NAME: &str = "tty7";
 /// second, independent derivation that can and did disagree with the first.
 /// Publishing the directory instead means a CLI in this shell resolves both
 /// endpoints with the very same functions the server used to open them.
-const TTY7_CONFIG_DIR_ENV: &str = "TTY7_CONFIG_DIR";
-pub(crate) const TTY7_PANE_ENV: &str = "TTY7_PANE";
-const TTY7_WS_ENV: &str = "TTY7_WS";
+const NTTY7_CONFIG_DIR_ENV: &str = "NTTY7_CONFIG_DIR";
+pub(crate) const NTTY7_PANE_ENV: &str = "NTTY7_PANE";
+const NTTY7_WS_ENV: &str = "NTTY7_WS";
 
 fn config_dir_env() -> Option<String> {
-    crate::core::config::config_dir_path().map(|p| p.display().to_string())
+    // The directory the shell's CLI uses to reconstruct both sockets. That is
+    // the runtime directory when this process pinned one, so a pane talks to
+    // the daemon that spawned it rather than to a shared install.
+    crate::core::config::runtime_dir_path().map(|p| p.display().to_string())
 }
 
 /// The shell the pane is running, not the one the passwd entry names.
@@ -485,7 +488,7 @@ fn pane_environment(
         // `> file` and `| less` too. `FORCE_HYPERLINK=0` in the `env` config
         // or the shell's rc turns it back off.
         ("FORCE_HYPERLINK".to_string(), "1".to_string()),
-        (TTY7_PANE_ENV.to_string(), pane.to_string()),
+        (NTTY7_PANE_ENV.to_string(), pane.to_string()),
     ];
     #[cfg(windows)]
     if !extra_env
@@ -502,10 +505,10 @@ fn pane_environment(
         env.push(("COLORFGBG".to_string(), colorfgbg.to_string()));
     }
     if let Some(ws) = workspace {
-        env.push((TTY7_WS_ENV.to_string(), ws.to_string()));
+        env.push((NTTY7_WS_ENV.to_string(), ws.to_string()));
     }
     if let Some(dir) = config_dir_env() {
-        env.push((TTY7_CONFIG_DIR_ENV.to_string(), dir));
+        env.push((NTTY7_CONFIG_DIR_ENV.to_string(), dir));
     }
     // Names the pane's own history file; the integration snippet is what
     // decides to use it, once the user's rc has said where their history was.
@@ -549,7 +552,7 @@ fn pane_environment(
 }
 
 /// zsh integration works by pointing `ZDOTDIR` at tty7's redirector dir, which
-/// then sources the user's own startup files from `TTY7_USER_ZDOTDIR`. A
+/// then sources the user's own startup files from `NTTY7_USER_ZDOTDIR`. A
 /// `ZDOTDIR` in the configured `env` block is applied after that and used to
 /// win outright: zsh read the user's files directly and the pane came up with
 /// no prompt marks, no editor, no suggestions. When the redirector is in
@@ -565,7 +568,7 @@ fn reroute_configured_zdotdir(
     env.into_iter()
         .map(|(k, v)| {
             if k == "ZDOTDIR" {
-                ("TTY7_USER_ZDOTDIR".to_string(), v)
+                ("NTTY7_USER_ZDOTDIR".to_string(), v)
             } else {
                 (k, v)
             }
@@ -2324,7 +2327,7 @@ impl DaemonPane {
                 let mut graphics = GraphicsSniffer::new_local(starts_local);
                 let mut buf = [0u8; 65536];
 
-                let trace = std::env::var("TTY7_TRACE").is_ok_and(|v| !v.is_empty() && v != "0");
+                let trace = std::env::var("NTTY7_TRACE").is_ok_and(|v| !v.is_empty() && v != "0");
                 let mut tr_last = std::time::Instant::now();
                 let mut tr_bytes: u64 = 0;
                 let mut tr_reads: u32 = 0;
@@ -2873,8 +2876,23 @@ impl DaemonPane {
         self.hangup();
     }
 
+    /// Drop every attached client. Their writers see the channel close, shut
+    /// the socket's read side, and the parked `read` in `stream_pane` returns.
+    ///
+    /// `DeathReporter::report` does not do this once `shutting_down` is set, so
+    /// a kill that only signals the shell leaves `spawn_writer` blocked in
+    /// `recv` and the stream task holding this pane's `Arc` until process exit.
+    fn disconnect_clients(&self) {
+        let mut st = self.state.lock().unwrap();
+        st.subscriber = None;
+        st.observers.clear();
+        set_clipboard_permission(&mut st, false);
+        self.gate.reset();
+    }
+
     fn hangup(&self) {
         self.shutting_down.store(true, Ordering::SeqCst);
+        self.disconnect_clients();
         match &self.backend {
             PaneBackend::Pty(p) => {
                 #[cfg(unix)]
@@ -3960,7 +3978,7 @@ fn apply_probed_cwd(st: &mut PaneState, probed: Option<PathBuf>) {
 /// Prime Agent's TUI hands each session to a background daemon — started by
 /// the first session, detached, and outliving it — which runs that session's
 /// extensions, tty7's bridge among them, with the environment of the TUI that
-/// asked for it. The report's `$TTY7_PANE` is therefore right while the
+/// asked for it. The report's `$NTTY7_PANE` is therefore right while the
 /// process is never under the pane's shell. Taking it on the pane's word is
 /// safe as long as that pane is running Prime Agent itself.
 fn owns_detached_report(
@@ -3986,7 +4004,7 @@ pub struct CodexCandidate {
 /// Codex runs its hooks in its app-server: one background process that every
 /// Codex session on the machine talks to, started by whichever session came
 /// first and outliving it. A hook therefore carries that first session's
-/// environment — its `$TTY7_PANE` — and runs under that pane's shell only for
+/// environment — its `$NTTY7_PANE` — and runs under that pane's shell only for
 /// as long as that session lasts, so neither says which pane the report is
 /// about. The report does: its session, then its directory. A pane that has
 /// already reported the session owns it; otherwise it is the one pane running
@@ -4970,7 +4988,7 @@ mod tests {
             rerouted,
             vec![
                 (
-                    "TTY7_USER_ZDOTDIR".to_string(),
+                    "NTTY7_USER_ZDOTDIR".to_string(),
                     "/home/a/.config/zsh".to_string()
                 ),
                 ("EDITOR".to_string(), "vi".to_string()),
@@ -8644,25 +8662,25 @@ mod tests {
         .collect();
 
         assert_eq!(
-            env.get(TTY7_PANE_ENV).map(String::as_str),
+            env.get(NTTY7_PANE_ENV).map(String::as_str),
             Some("42"),
             "a CLI inside the pane needs its own pane id for address-free verbs"
         );
         assert_eq!(
-            env.get(TTY7_WS_ENV).map(String::as_str),
+            env.get(NTTY7_WS_ENV).map(String::as_str),
             Some("ws-main"),
             "the workspace the spawn was filed under rides into the shell"
         );
         match config_dir_env() {
             Some(dir) => assert_eq!(
-                env.get(TTY7_CONFIG_DIR_ENV),
+                env.get(NTTY7_CONFIG_DIR_ENV),
                 Some(&dir),
                 "the shell is told which config dir this server runs on, so a CLI \
                  there resolves both endpoints the same way the server opened them"
             ),
             None => assert!(
-                !env.contains_key(TTY7_CONFIG_DIR_ENV),
-                "no resolvable config dir must not inject an empty TTY7_CONFIG_DIR"
+                !env.contains_key(NTTY7_CONFIG_DIR_ENV),
+                "no resolvable config dir must not inject an empty NTTY7_CONFIG_DIR"
             ),
         }
 
@@ -8676,7 +8694,7 @@ mod tests {
         .into_iter()
         .collect();
         assert!(
-            !unfiled.contains_key(TTY7_WS_ENV),
+            !unfiled.contains_key(NTTY7_WS_ENV),
             "a pane outside any workspace must not claim one"
         );
     }
@@ -9039,18 +9057,18 @@ mod tests {
             "the daemon must inject TTY7 into every spawned shell"
         );
         assert_eq!(
-            cmd.get_env(TTY7_PANE_ENV).and_then(|v| v.to_str()),
+            cmd.get_env(NTTY7_PANE_ENV).and_then(|v| v.to_str()),
             Some("42"),
             "the daemon must tell every spawned shell which pane it is"
         );
         assert_eq!(
-            cmd.get_env(TTY7_WS_ENV).and_then(|v| v.to_str()),
+            cmd.get_env(NTTY7_WS_ENV).and_then(|v| v.to_str()),
             Some("ws-main"),
             "the daemon must tell every spawned shell which workspace filed it"
         );
         if let Some(dir) = config_dir_env() {
             assert_eq!(
-                cmd.get_env(TTY7_CONFIG_DIR_ENV).and_then(|v| v.to_str()),
+                cmd.get_env(NTTY7_CONFIG_DIR_ENV).and_then(|v| v.to_str()),
                 Some(dir.as_str()),
                 "the daemon must tell every spawned shell which config dir it serves"
             );

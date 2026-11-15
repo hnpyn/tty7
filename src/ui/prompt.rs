@@ -24,8 +24,7 @@ use gpui::{
 };
 use gpui_component::{ActiveTheme as _, h_flex, v_flex};
 
-use crate::ui::dialog::{self, Tone};
-use crate::ui::right_panel::{TAB_TEXT, TEXT};
+use crate::ui::dialog::{self, TAB_TEXT, TEXT, Tone};
 
 /// Route every `window.prompt` through [`TextPrompt`].
 pub(crate) fn install(cx: &mut App) {
@@ -266,7 +265,7 @@ impl Render for TextPrompt {
 #[cfg(test)]
 mod tests {
     use super::TextPrompt;
-    use gpui::{AppContext as _, PromptButton, TestAppContext};
+    use gpui::{AppContext as _, PromptButton, Styled as _, TestAppContext};
 
     fn prompt(cx: &mut TestAppContext, answers: &[PromptButton]) -> gpui::Entity<TextPrompt> {
         cx.update(|cx| {
@@ -344,9 +343,40 @@ mod tests {
     fn the_quit_prompt_is_drawn_by_the_app_not_the_platform(cx: &mut TestAppContext) {
         use crate::ui::i18n::{L10nKey, t};
 
-        let (_app, mut vcx) = crate::ui::app::test_window::harness(cx);
-        let mut answer = vcx.update(|window, cx| {
+        crate::core::config::pin_test_config_dir();
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            cx.set_global(crate::core::config::Config::default());
+            crate::ui::presets::load_registry(cx);
+            crate::ui::theme::refresh_system_appearance(cx);
             super::install(cx);
+        });
+        let window = cx.add_window(|window, cx| {
+            crate::ui::theme::apply_theme(Some(window), cx);
+            struct Blank {
+                focus: gpui::FocusHandle,
+            }
+            impl gpui::Focusable for Blank {
+                fn focus_handle(&self, _: &gpui::App) -> gpui::FocusHandle {
+                    self.focus.clone()
+                }
+            }
+            impl gpui::Render for Blank {
+                fn render(
+                    &mut self,
+                    _window: &mut gpui::Window,
+                    _cx: &mut gpui::Context<Self>,
+                ) -> impl gpui::IntoElement {
+                    gpui::div().size_full()
+                }
+            }
+            let blank = cx.new(|cx| Blank {
+                focus: cx.focus_handle(),
+            });
+            gpui_component::Root::new(blank, window, cx)
+        });
+        let mut vcx = gpui::VisualTestContext::from_window(window.into(), cx);
+        let mut answer = vcx.update(|window, cx| {
             window.prompt(
                 gpui::PromptLevel::Warning,
                 t(L10nKey::QuitStopServerTitle),

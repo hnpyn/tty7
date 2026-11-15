@@ -5,7 +5,8 @@ use std::path::{Path, PathBuf};
 use crate::core::cli_agent::{AGENT_EVENT_SENTINEL, CLIAgent};
 use crate::host::Host;
 
-pub const TTY7_ENV_MARKER: &str = "TTY7";
+/// Exported on every pane as `NTTY7`. Agent hooks key off this name.
+pub const TTY7_ENV_MARKER: &str = "NTTY7";
 
 const GROK_HOOK_ENV: &str = "GROK_HOOK_EVENT";
 
@@ -44,7 +45,7 @@ pub fn run_agent_hook(agent: &str, event: &str) {
 /// or at a pane it does not run in (see `DaemonPane::report_agent_event`)
 /// falls back to the tty.
 fn report_to_daemon(body: &str) -> bool {
-    let Some(pane) = std::env::var(crate::daemon::pane::TTY7_PANE_ENV)
+    let Some(pane) = std::env::var(crate::daemon::pane::NTTY7_PANE_ENV)
         .ok()
         .and_then(|p| p.trim().parse::<u64>().ok())
     else {
@@ -2524,7 +2525,7 @@ function presence() {
 
 // OpenCode 1.x: a factory returning hooks, run in the TUI's own process.
 const server = async () => {
-  if (!process.env["TTY7"]) return {}
+  if (!process.env["NTTY7"]) return {}
   const pane = presence()
   return {
     dispose: async () => {
@@ -2546,7 +2547,7 @@ const server = async () => {
 
 // OpenCode 2.x: `setup` subscribes to the event stream and returns cleanup.
 const setup = async (ctx) => {
-  if (!process.env["TTY7"]) return
+  if (!process.env["NTTY7"]) return
   // By default 2.x runs plugins in one background service shared by every
   // opencode on the machine: its sessions are not this pane's, and the
   // emitter it spawns has no way back to the pane's terminal. Only a server
@@ -2626,7 +2627,7 @@ function emit(event: string, ctx?: SessionCtx): void {{
 }}
 
 export default function (pi: ExtensionAPI) {{
-  if (!process.env["TTY7"]) return;
+  if (!process.env["NTTY7"]) return;
   // Extension load = the agent is running in this pane. No context here yet,
   // so the id rides on session_start instead.
   emit("session-start");
@@ -4427,7 +4428,7 @@ mod tests {
         let opencode = opencode_plugin_js(&target).expect("opencode content builds");
         assert!(opencode.contains("agent-hook opencode"));
         assert!(opencode.contains(&format!("const EXE = {exe_json}")));
-        assert!(opencode.contains(r#"process.env["TTY7"]"#));
+        assert!(opencode.contains(r#"process.env["NTTY7"]"#));
         for (needle, message) in [
             (
                 r#"export default { id: "tty7", server, setup }"#,
@@ -4516,7 +4517,7 @@ mod tests {
             assert!(bridge.contains(&format!(r#"["agent-hook", "{slug}", event]"#)));
             assert!(bridge.contains(&format!(r#"from "{package}""#)));
             assert!(bridge.contains(&exe));
-            assert!(bridge.contains(r#"process.env["TTY7"]"#));
+            assert!(bridge.contains(r#"process.env["NTTY7"]"#));
             assert!(bridge.contains("getSessionId"));
             assert!(bridge.contains("session_id"));
             assert!(bridge.contains(r#"stdio: ["pipe", "ignore", "ignore"]"#));

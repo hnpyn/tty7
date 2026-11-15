@@ -25,17 +25,17 @@
 #endif
 
 [Setup]
-; Never change AppId: it is how Windows ties upgrades + the uninstall entry
-; to previous installs of tty7.
-AppId={{9A3F6C1E-4B7D-4E2A-8C5F-D01B92E64A37}
-AppName=tty7
+; ntty7 does not share tty7's AppId. The same id would make this installer
+; an upgrade of an installed tty7, and the uninstaller would remove that app.
+AppId={{7F2C1A94-0E6B-4D58-A3C1-9B84E2D70F15}
+AppName=ntty7
 AppVersion={#AppVersion}
 VersionInfoVersion={#VersionInfoVersion}
 AppPublisher=tty7 contributors
 AppPublisherURL=https://github.com/l0ng-ai/tty7
 AppSupportURL=https://github.com/l0ng-ai/tty7/issues
 AppUpdatesURL=https://github.com/l0ng-ai/tty7/releases
-DefaultDirName={autopf}\tty7
+DefaultDirName={autopf}\ntty7
 DisableProgramGroupPage=yes
 PrivilegesRequired=lowest
 PrivilegesRequiredOverridesAllowed=dialog
@@ -44,31 +44,23 @@ ArchitecturesInstallIn64BitMode={#Architectures}
 MinVersion=10.0
 LicenseFile={#StageDir}\LICENSE.txt
 SetupIconFile=..\..\assets\favicon.ico
-UninstallDisplayIcon={app}\tty7-app.exe
+UninstallDisplayIcon={app}\ntty7.exe
 OutputDir={#OutputDir}
 OutputBaseFilename={#OutputName}
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
-; The persistent daemon (tty7-app.exe --daemon) is a detached background process
-; that outlives the GUI and holds the running image of tty7-app.exe, so Windows
-; locks the file and an upgrade can't replace it. We stop it explicitly in
-; PrepareToInstall below; keep the Restart Manager as a backstop but don't let
-; it relaunch anything (the GUI respawns the daemon itself on next start).
+; Restart Manager closes a running ntty7 before files are replaced. It must
+; not relaunch the app: an upgrade or uninstall that starts the GUI opens a
+; window, and the old daemon flags this binary no longer accepts would do that.
 CloseApplications=yes
 RestartApplications=no
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
-; Writing shell verbs is an install-time decision, the way VS Code and Git for
-; Windows treat theirs — not a runtime preference, so tty7 has no setting for
-; it. Off by default: the registry is user-visible system state. The keys land
-; under HKCU even for an all-users install, so this only ever affects whoever
-; ran the installer. Inno restores the previous choice when upgrading.
-Name: "explorermenu"; Description: "Add ""Open in tty7"" to the folder context menu"; GroupDescription: "Shell integration:"; Flags: unchecked
 
 ; Builds before the tty7/tty7-app split installed the GUI as tty7.exe. Upgrading
-; only *adds* tty7-app.exe, so the old binary would stay on disk — and a taskbar
+; only *adds* ntty7.exe, so the old binary would stay on disk — and a taskbar
 ; pin (which Inno cannot rewrite, unlike the [Icons] shortcuts) still points at
 ; it. The user would keep launching the previous version from their pinned icon,
 ; against the same daemon endpoint as the new one. Delete it on upgrade; a fresh
@@ -85,13 +77,7 @@ Name: "explorermenu"; Description: "Add ""Open in tty7"" to the folder context m
 Type: files; Name: "{app}\tty7.exe"
 
 [Files]
-Source: "{#StageDir}\tty7-app.exe"; DestDir: "{app}"; Flags: ignoreversion
-; The CLI. `core::cli_install` adds {app} to the user's PATH at first launch,
-; so this is not registered as an [Env] change here — the portable zip has no
-; installer to do it, and one code path serving both is one behaviour to debug.
-; The uninstaller takes that entry back out; see RemoveAppDirFromUserPath below.
-Source: "{#StageDir}\tty7.exe"; DestDir: "{app}"; Flags: ignoreversion
-Source: "{#StageDir}\tty7-updater.exe"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
+Source: "{#StageDir}\ntty7.exe"; DestDir: "{app}"; Flags: ignoreversion
 ; This installer-only marker is the authority for enabling automatic Windows
 ; updates. The portable archive is created before the marker enters the stage.
 Source: "{#StageDir}\.tty7-inno-install"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
@@ -99,7 +85,7 @@ Source: "{#StageDir}\completions\*"; DestDir: "{app}\completions"; Flags: ignore
 ; Microsoft's redistributable ConPTY. It has to land in {app} rather than a
 ; subdirectory: `portable-pty` finds it through the DLL search path, which
 ; starts at the directory of the executable that loads it (the daemon is
-; {app}\tty7-app.exe). The two files are a matched pair — never update one
+; {app}\ntty7.exe). The two files are a matched pair — never update one
 ; alone. See assets\windows\conpty\README.md.
 Source: "{#StageDir}\conpty.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#StageDir}\OpenConsole.exe"; DestDir: "{app}"; Flags: ignoreversion
@@ -127,64 +113,15 @@ Source: "{#StageDir}\server\*"; DestDir: "{app}\server"; Flags: ignoreversion re
 ; itself (HKCU, at every launch, so it always names the running exe); the
 ; uninstaller below removes that registration.
 [Icons]
-Name: "{autoprograms}\tty7"; Filename: "{app}\tty7-app.exe"; AppUserModelID: "com.github.tty7"; AppUserModelToastActivatorCLSID: "4E1F6381-E90B-4BED-9156-A9013F718FE6"
-Name: "{autodesktop}\tty7"; Filename: "{app}\tty7-app.exe"; Tasks: desktopicon; AppUserModelID: "com.github.tty7"; AppUserModelToastActivatorCLSID: "4E1F6381-E90B-4BED-9156-A9013F718FE6"
+Name: "{autoprograms}\ntty7"; Filename: "{app}\ntty7.exe"; AppUserModelID: "com.github.ntty7"; AppUserModelToastActivatorCLSID: "4E1F6381-E90B-4BED-9156-A9013F718FE6"
+Name: "{autodesktop}\ntty7"; Filename: "{app}\ntty7.exe"; Tasks: desktopicon; AppUserModelID: "com.github.ntty7"; AppUserModelToastActivatorCLSID: "4E1F6381-E90B-4BED-9156-A9013F718FE6"
 
 [Run]
-; The registry shape lives in core::explorer_context_menu, not here: the app
-; reads those same keys to decide whether an existing registration still points
-; at this install, and two hand-kept copies of the layout would drift. Runs
-; before the launch entry below so a first start already sees the final state.
-; skipifsilent because a silent run *is* the elevated in-place update (#504):
-; launching the app there would run it elevated, and under over-the-shoulder
-; elevation the menu would land in the administrator's hive, not the user's.
-; Skipping loses nothing: an upgrade keeps the install path, so the HKCU keys
-; a ticked first install wrote still point at the right executable.
-Filename: "{app}\tty7-app.exe"; Parameters: "--register-explorer-menu"; Tasks: explorermenu; Flags: runhidden waituntilterminated skipifsilent
-Filename: "{app}\tty7-app.exe"; Description: "{cm:LaunchProgram,tty7}"; Flags: nowait postinstall skipifsilent
-
-[UninstallRun]
-; Stop the daemon before the uninstaller deletes tty7-app.exe — the running daemon
-; is the locked image of that file, so removing it fails otherwise. Naming {app}
-; widens the stop the same way PrepareToInstall's does: ConPTY hosts orphaned by
-; a daemon that never got to shut down keep the installed images open, and their
-; DeleteFile fails an uninstall exactly as it fails an upgrade. (The stop excludes
-; the calling process itself, so the binary running this step is safe.) This runs
-; at the start of uninstallation, before any files are removed. The installed
-; binary is this version, which understands the flags; runhidden suppresses any
-; flash and the call returns without opening a window. RunOnceId keys the entry
-; so a repeated uninstall doesn't run it twice.
-Filename: "{app}\tty7-app.exe"; Parameters: "--stop-daemon --update-install-dir ""{app}"""; Flags: runhidden waituntilterminated; RunOnceId: "StopDaemon"
-; Unconditional, and deliberately not gated on the task: an install that had the
-; menu registered and was later upgraded without the box ticked still holds the
-; keys, and verbs pointing at a deleted exe are worse than a no-op. Removing keys
-; that were never written succeeds silently.
-Filename: "{app}\tty7-app.exe"; Parameters: "--unregister-explorer-menu"; Flags: runhidden waituntilterminated; RunOnceId: "UnregisterExplorerMenu"
+; skipifsilent because a silent run is the elevated in-place update: launching
+; the app there would run it elevated and open a window.
+Filename: "{app}\ntty7.exe"; Description: "{cm:LaunchProgram,ntty7}"; Flags: nowait postinstall skipifsilent
 
 [Code]
-(* Gracefully stop the persistent daemon before we overwrite tty7-app.exe. We can't
-  run the *installed* binary here — on an upgrade from an older build it may not
-  understand --stop-daemon and would launch the GUI instead — so we extract the
-  *new* tty7-app.exe to {tmp} and run that. It connects to the running daemon, hangs
-  up every shell, waits for it to exit (releasing the file lock), then returns
-  without opening a window. Naming {app} widens the stop into "make this directory
-  replaceable": ConPTY hosts (OpenConsole.exe) orphaned by a daemon that never got
-  to shut down keep the installed images open — invisible to the daemon stop, fatal
-  to the DeleteFile below — so anything still running from {app} is terminated and
-  the call waits until the images there actually open for writing. Best effort: any
-  failure falls through to the Restart Manager backstop, and a fresh install simply
-  has nothing to stop. *)
-function PrepareToInstall(var NeedsRestart: Boolean): String;
-var
-  ResultCode: Integer;
-begin
-  ExtractTemporaryFile('tty7-app.exe');
-  Exec(ExpandConstant('{tmp}\tty7-app.exe'),
-       '--stop-daemon --update-install-dir "' + ExpandConstant('{app}') + '"', '',
-       SW_HIDE, ewWaitUntilTerminated, ResultCode);
-  Result := '';
-end;
-
 (* Take {app} back out of the user's PATH.
 
   `core::cli_install` puts it there at first launch rather than the installer

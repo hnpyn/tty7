@@ -28,7 +28,7 @@ pub mod spawn;
 pub mod ssh;
 pub mod transport;
 
-pub(crate) const DETECTED_SHELL_ENV: &str = "TTY7_DETECTED_SHELL";
+pub(crate) const DETECTED_SHELL_ENV: &str = "NTTY7_DETECTED_SHELL";
 
 pub(crate) mod shell_integration;
 

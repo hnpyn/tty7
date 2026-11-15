@@ -2,6 +2,10 @@
     all(target_os = "windows", not(debug_assertions)),
     windows_subsystem = "windows"
 )]
+// The unit tests reach helpers the window itself does not. A non-test build
+// still typechecks them; only the test build is required to prove each one
+// is used.
+#![cfg_attr(not(test), allow(dead_code, unused_imports))]
 
 mod core;
 mod daemon;
@@ -142,23 +146,11 @@ fn apply_reloaded_config(
     // them. Gated on the language actually moving, for the same reason the
     // keymap below is: this watcher fires on every config write, and a sidebar
     // drag has no business touching the registry.
-    let language_changed = cx.global::<Config>().gui_language != config.gui_language;
     crate::ui::i18n::set_locale(&config.gui_language);
     cx.set_global(config);
     reload_themes(cx);
     crate::ui::theme::apply_cursor_hide_mode(cx);
-    // The menu bar is built once from the current locale, so editing
-    // gui_language by hand has to rebuild it the same way the in-app language
-    // picker does.
     crate::ui::theme::set_menus(cx);
-    if language_changed {
-        crate::core::explorer_context_menu::refresh_labels();
-    }
-    crate::ui::windows::WindowRegistry::refresh_locale(cx, None);
-    // `custom_shells` is only ever hand-edited, so this file is the one place
-    // it can change from — and the inventory that carries it to the new-tab
-    // menu is cached per window.
-    crate::ui::windows::WindowRegistry::refresh_shells(cx);
     // A hand-edited keybinding shows up in the settings list off the live
     // global immediately; without this it never reaches the keymap gpui
     // actually dispatches against, so the key looks bound and does nothing
@@ -194,32 +186,11 @@ fn reload_themes(cx: &mut App) {
 /// gone" (startup) or "my edit did nothing" (reload) — both read as data loss,
 /// and neither points at the file that needs fixing.
 fn notify_config_load_failed(
-    cx: &mut App,
+    _cx: &mut App,
     outcome: crate::core::config::LoadOutcome,
     startup: bool,
 ) {
-    use crate::core::config::LoadOutcome;
-    use crate::ui::i18n::L10nKey;
-    use gpui_component::WindowExt as _;
-
-    // Only an unparseable file leaves a copy behind; an unreadable one had
-    // nothing to copy, so it must not send the user after a `.corrupt` file
-    // that was never written.
-    let key = match (outcome, startup) {
-        (LoadOutcome::Unreadable, true) => L10nKey::ConfigUnreadableStartup,
-        (LoadOutcome::Unreadable, false) => L10nKey::ConfigUnreadableReload,
-        (_, true) => L10nKey::ConfigQuarantinedStartup,
-        (_, false) => L10nKey::ConfigQuarantinedReload,
-    };
-    let Some(workspace) = crate::ui::windows::WindowRegistry::most_recent(cx) else {
-        return;
-    };
-    let Some(handle) = crate::ui::windows::WindowRegistry::window_for(cx, workspace) else {
-        return;
-    };
-    let _ = handle.update(cx, |_, window, cx| {
-        window.push_notification(crate::ui::i18n::t(key), cx);
-    });
+    log::warn!("config load failed ({outcome:?}, startup={startup})");
 }
 
 fn strip_os_arg_prefix(arg: &std::ffi::OsStr, prefix: &str) -> Option<std::ffi::OsString> {
@@ -253,6 +224,7 @@ fn apply_config_dir_arg(args: &[std::ffi::OsString]) {
 fn open_path_from(
     mut args: impl Iterator<Item = std::ffi::OsString>,
 ) -> Option<std::path::PathBuf> {
+    let mut positional = None;
     while let Some(arg) = args.next() {
         if let Some(path) = strip_os_arg_prefix(&arg, "--open-path=") {
             return Some(path.into());
@@ -260,126 +232,205 @@ fn open_path_from(
         if arg == std::ffi::OsStr::new("--open-path") {
             return args.next().map(Into::into);
         }
-    }
-    None
-}
-
-/// The directory an installer is about to replace, from
-/// `--stop-daemon --update-install-dir <dir>`. Meaningful only next to
-/// `--stop-daemon`; the caller checks that flag first.
-#[cfg(windows)]
-fn update_install_dir_from(
-    mut args: impl Iterator<Item = std::ffi::OsString>,
-) -> Option<std::path::PathBuf> {
-    while let Some(arg) = args.next() {
-        if arg == std::ffi::OsStr::new("--update-install-dir") {
-            return args.next().map(Into::into);
+        // `--config-dir <path>` is a value, not the directory to open.
+        if arg == std::ffi::OsStr::new("--config-dir") {
+            let _ = args.next();
+            continue;
+        }
+        if arg.as_encoded_bytes().first() == Some(&b'-') {
+            continue;
+        }
+        if positional.is_none() {
+            positional = Some(std::path::PathBuf::from(arg));
         }
     }
-    None
+    positional
 }
 
-/// `Some(true)` to register the Explorer verbs, `Some(false)` to remove them.
-fn explorer_menu_action_from(args: &[std::ffi::OsString]) -> Option<bool> {
-    args.iter().find_map(|arg| match arg.as_os_str() {
-        a if a == std::ffi::OsStr::new("--register-explorer-menu") => Some(true),
-        a if a == std::ffi::OsStr::new("--unregister-explorer-menu") => Some(false),
-        _ => None,
-    })
-}
-
-/// Offers an explicit launch request to an already running local GUI.
-///
-/// The dispatcher is injected so the startup decision can be tested without
-/// opening a real daemon connection. Only an explicit `Bool(true)` means the
-/// request reached a GUI; every other response keeps the current app alive so
-/// it can perform the normal first-window startup. A pathless request asks the
-/// GUI to surface itself — restore its most recent workspace, or activate the
-/// window it already has — which is what lets a second launch hand the tray
-/// its window back instead of opening a second process.
-///
-/// `daemon_gone` reports whether the recorded daemon process is known dead.
-/// The probe connects to that daemon's control listener, so a dead daemon
-/// guarantees the request cannot reach a GUI — and the connect would only pay
-/// the OS's refusal delay on the stale `control.port` that `ensure_running`
-/// clears later. The probe is skipped instead of run.
-fn forward_open_path_with(
-    open_path: Option<&std::path::Path>,
-    daemon_gone: impl FnOnce() -> bool,
-    dispatch: impl FnOnce(Option<String>) -> std::io::Result<tty7_core::daemon::control::ReplyOk>,
-) -> bool {
-    use tty7_core::daemon::control::ReplyOk;
-
-    if daemon_gone() {
-        return false;
+/// A path from `open -a` / Finder: a `file://` URL, or a plain path.
+pub(crate) fn path_from_open_target(raw: &str) -> Option<std::path::PathBuf> {
+    let raw = raw.trim();
+    if raw.is_empty() || raw.starts_with('-') {
+        return None;
     }
+    if let Some(rest) = raw.strip_prefix("file://") {
+        return file_url_to_path(rest);
+    }
+    Some(std::path::PathBuf::from(raw))
+}
 
-    let wire_path = match open_path {
-        None => None,
-        Some(path) => {
-            let path = if path.is_absolute() {
-                path.to_path_buf()
-            } else {
-                match std::env::current_dir() {
-                    Ok(current_dir) => current_dir.join(path),
-                    Err(error) => {
-                        log::debug!("could not resolve the relative GUI open path: {error}");
-                        return false;
-                    }
-                }
-            };
-
-            // Keep the native PathBuf in this process. Returning false
-            // continues normal startup, which opens the path without crossing
-            // the protocol.
-            let Some(wire_path) = path.to_str().map(str::to_owned) else {
-                log::debug!("the explicit GUI open path is not valid UTF-8; opening it locally");
-                return false;
-            };
-            Some(wire_path)
-        }
+fn file_url_to_path(rest: &str) -> Option<std::path::PathBuf> {
+    let rest = rest.strip_prefix("localhost").unwrap_or(rest);
+    let decoded = percent_decode(rest);
+    // `file:///C:/dir` arrives as `/C:/dir`. A leading slash in front of a
+    // drive letter is not part of the path.
+    let path = match decoded.as_bytes() {
+        [b'/', drive, b':', ..] if drive.is_ascii_alphabetic() => decoded[1..].to_string(),
+        _ => decoded,
     };
-
-    match dispatch(wire_path) {
-        Ok(ReplyOk::Bool(true)) => true,
-        Ok(ReplyOk::Bool(false)) => false,
-        Ok(other) => {
-            log::debug!("the daemon answered the early GuiOpen request with {other:?}");
-            false
-        }
-        Err(error) => {
-            log::debug!("the early GuiOpen request was not delivered: {error}");
-            false
-        }
+    if path.is_empty() {
+        None
+    } else {
+        Some(std::path::PathBuf::from(path))
     }
 }
 
-/// Uses a transient host-RPC connection instead of a GUI connection.
-///
-/// A GUI connection is long-lived and registers itself as the daemon's event
-/// target. This short probe must never replace the actual running GUI while it
-/// asks that GUI to open the requested folder.
-fn forward_open_path(open_path: Option<&std::path::Path>) -> bool {
-    use tty7_core::client::ControlClient;
-    use tty7_core::daemon::control::{ControlHello, ControlRequest};
+fn percent_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            let hex = std::str::from_utf8(&bytes[index + 1..index + 3]).unwrap_or("");
+            if let Ok(byte) = u8::from_str_radix(hex, 16) {
+                out.push(byte);
+                index += 3;
+                continue;
+            }
+        }
+        out.push(bytes[index]);
+        index += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
 
-    forward_open_path_with(
-        open_path,
-        crate::daemon::spawn::recorded_daemon_is_dead,
-        |path| {
-            let hello = ControlHello::host_rpc(
-                format!("tty7-app-open-{}", std::process::id()),
-                "this computer",
-            );
-            let client = ControlClient::connect(&hello)?;
-            let reply = client.request(ControlRequest::GuiOpen {
-                path,
-                workspace: None,
-            });
-            client.close();
-            reply
-        },
-    )
+/// A dropped file opens its parent directory. A directory opens itself.
+pub(crate) fn directory_for_open(path: &std::path::Path) -> std::path::PathBuf {
+    if path.is_file() {
+        path.parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| path.to_path_buf())
+    } else {
+        path.to_path_buf()
+    }
+}
+
+static PENDING_OPEN: std::sync::Mutex<Option<std::path::PathBuf>> = std::sync::Mutex::new(None);
+static WINDOW_LIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static OPENED_PATH: std::sync::Mutex<Option<std::path::PathBuf>> = std::sync::Mutex::new(None);
+
+/// How long after a path-less cold launch the first Finder / `open -a` batch
+/// may replace the window instead of starting a second process. The URL
+/// arrives on the main loop just after `applicationDidFinishLaunching`.
+pub(crate) const LAUNCH_URL_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
+
+struct ColdLaunch {
+    opened_at: std::time::Instant,
+    explicit_path: bool,
+    absorbed: std::sync::atomic::AtomicBool,
+}
+
+static COLD_LAUNCH: std::sync::OnceLock<ColdLaunch> = std::sync::OnceLock::new();
+static LAUNCH_RETARGET: std::sync::Mutex<Option<std::path::PathBuf>> = std::sync::Mutex::new(None);
+
+/// The first open-URL batch after a cold launch with no path replaces the
+/// window that already came up in `$HOME`. A later drop, a window that was
+/// opened on a path, or a second batch starts another process.
+pub(crate) fn absorb_cold_open(
+    window_live: bool,
+    explicit_path: bool,
+    absorbed: bool,
+    age: std::time::Duration,
+) -> bool {
+    window_live && !explicit_path && !absorbed && age < LAUNCH_URL_GRACE
+}
+
+fn window_is_live() -> bool {
+    WINDOW_LIVE.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+fn opened_here(path: &std::path::Path) -> bool {
+    OPENED_PATH
+        .lock()
+        .unwrap()
+        .as_deref()
+        .is_some_and(|opened| opened == path)
+}
+
+pub(crate) fn mark_window_live(cwd: Option<&std::path::Path>) {
+    let _ = COLD_LAUNCH.set(ColdLaunch {
+        opened_at: std::time::Instant::now(),
+        explicit_path: cwd.is_some(),
+        absorbed: std::sync::atomic::AtomicBool::new(false),
+    });
+    if let Some(cwd) = cwd {
+        *OPENED_PATH.lock().unwrap() = Some(cwd.to_path_buf());
+    }
+    WINDOW_LIVE.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+pub(crate) fn take_pending_open() -> Option<std::path::PathBuf> {
+    PENDING_OPEN.lock().unwrap().take()
+}
+
+/// The directory a path-less launch window should switch to, if a cold-start
+/// open URL arrived. The window polls this; `on_open_urls` has no `App`.
+pub(crate) fn take_launch_retarget() -> Option<std::path::PathBuf> {
+    LAUNCH_RETARGET.lock().unwrap().take()
+}
+
+pub(crate) fn within_launch_grace() -> bool {
+    COLD_LAUNCH
+        .get()
+        .is_some_and(|launch| launch.opened_at.elapsed() < LAUNCH_URL_GRACE)
+}
+
+/// Finder and `open -a` deliver paths here. The first one, before the window
+/// exists, is this process's directory. The first batch in the launch grace,
+/// when that window had no path, replaces it. Anything later is another
+/// window, which is another process.
+fn note_external_opens(urls: Vec<String>) {
+    let mut dirs = Vec::new();
+    for url in urls {
+        let Some(path) = path_from_open_target(&url) else {
+            continue;
+        };
+        let dir = directory_for_open(&path);
+        if dirs.iter().any(|have: &std::path::PathBuf| have == &dir) || opened_here(&dir) {
+            continue;
+        }
+        dirs.push(dir);
+    }
+    if dirs.is_empty() {
+        return;
+    }
+    if let Some(launch) = COLD_LAUNCH.get()
+        && absorb_cold_open(
+            window_is_live(),
+            launch.explicit_path,
+            launch.absorbed.load(std::sync::atomic::Ordering::SeqCst),
+            launch.opened_at.elapsed(),
+        )
+    {
+        launch
+            .absorbed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut dirs = dirs.into_iter();
+        if let Some(first) = dirs.next() {
+            *LAUNCH_RETARGET.lock().unwrap() = Some(first.clone());
+            *OPENED_PATH.lock().unwrap() = Some(first);
+        }
+        for extra in dirs {
+            spawn_new_instance(Some(&extra));
+        }
+        return;
+    }
+    if window_is_live() {
+        for dir in dirs {
+            spawn_new_instance(Some(&dir));
+        }
+        return;
+    }
+    let mut pending = PENDING_OPEN.lock().unwrap();
+    let mut dirs = dirs.into_iter();
+    if pending.is_none() {
+        *pending = dirs.next();
+    }
+    drop(pending);
+    for dir in dirs {
+        spawn_new_instance(Some(&dir));
+    }
 }
 
 #[cfg(unix)]
@@ -545,258 +596,269 @@ fn apply_font_thicken(thicken: bool) {
     gpui_platform::set_glyph_dilation(thicken);
 }
 
-/// Delivers Finder document opens and LaunchServices URL opens after gpui has
-/// created the application. The native callback queues requests; UI state is
-/// then changed on gpui's application loop.
-fn handle_external_opens(urls: Vec<String>, cx: &mut App) {
-    use crate::core::default_terminal::{ExternalOpen, parse_open_url};
+static EPHEMERAL_RUNTIME: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
 
-    for raw in urls {
-        let request = match parse_open_url(&raw) {
-            Ok(request) => request,
-            Err(error) => {
-                log::warn!("ignored external open request {raw:?}: {error}");
-                continue;
-            }
-        };
-        match request {
-            ExternalOpen::Folder(path) => crate::ui::windows::open_from_cli(cx, Some(path)),
-            ExternalOpen::Runnable(path) => {
-                let Some(parent) = path.parent().map(std::path::Path::to_path_buf) else {
-                    log::warn!(
-                        "ignored runnable without a parent directory: {}",
-                        path.display()
-                    );
-                    continue;
-                };
-                let command =
-                    crate::core::shell_quote::quote_for_shell(&path.to_string_lossy(), None);
-                crate::ui::windows::run_local_command(cx, parent, command);
-            }
-            ExternalOpen::Ssh(ssh) => crate::ui::windows::quick_connect_from_url(cx, ssh),
-            ExternalOpen::ManPage { section, page } => {
-                let mut command = String::from("man");
-                for argument in section.iter().chain(std::iter::once(&page)) {
-                    command.push(' ');
-                    command.push_str(&crate::core::shell_quote::quote_for_shell(argument, None));
-                }
-                crate::ui::windows::run_local_command(cx, std::env::temp_dir(), command);
-            }
+/// Drop the identity a parent terminal exported before this process reads
+/// config or spawns a shell.
+///
+/// `tty7` publishes `TTY7_*` (config dir, pane, workspace, shell integration,
+/// and a hijacked `ZDOTDIR`). A parent `ntty7` pane publishes the same facts
+/// under `NTTY7_*`. Either set would make this window answer as that pane, or
+/// write into the other app's directory. A user-chosen `$NTTY7_CONFIG_DIR`
+/// stays; one whose directory name is `ntty7-<pid>` is the parent's ephemeral
+/// runtime and is not a config directory.
+fn scrub_inherited_terminal_env() {
+    restore_zdotdir_from_outer_tty7();
+    let inherited: Vec<std::ffi::OsString> = std::env::vars_os()
+        .map(|(key, _)| key)
+        .filter(|key| {
+            let name = key.to_string_lossy();
+            name == "TTY7" || name.starts_with("TTY7_")
+        })
+        .collect();
+    for key in inherited {
+        unsafe { std::env::remove_var(key) };
+    }
+    for key in [
+        "NTTY7_PANE",
+        "NTTY7_WS",
+        "NTTY7_SHELL_INTEGRATION",
+        "NTTY7_HISTFILE",
+    ] {
+        unsafe { std::env::remove_var(key) };
+    }
+    if let Some(value) = std::env::var_os("NTTY7_CONFIG_DIR") {
+        let name = std::path::Path::new(&value)
+            .file_name()
+            .and_then(|name| name.to_str());
+        if inherited_runtime_dirname_is_ephemeral(name) {
+            unsafe { std::env::remove_var("NTTY7_CONFIG_DIR") };
         }
     }
 }
 
-fn main() {
-    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
-    {
-        if args.first().map(std::ffi::OsString::as_os_str)
-            == Some(std::ffi::OsStr::new("agent-hook"))
-        {
-            if let (Some(agent), Some(event)) = (
-                args.get(1).and_then(|arg| arg.to_str()),
-                args.get(2).and_then(|arg| arg.to_str()),
-            ) {
-                crate::core::agent_hooks::run_agent_hook(agent, event);
+/// `tty7` points `ZDOTDIR` at a throwaway directory for the duration of zsh
+/// startup and keeps the user's directory in `TTY7_USER_ZDOTDIR`. Copy that
+/// back, then drop the variable. An empty save means the user had no
+/// `ZDOTDIR`. A save whose last component is `tty7-zdotdir-*` is the
+/// redirector itself, so it is cleared rather than adopted — adopting it
+/// would make this process's zsh source the outer app's startup files.
+fn restore_zdotdir_from_outer_tty7() {
+    let saved = std::env::var_os("TTY7_USER_ZDOTDIR");
+    match zdotdir_restore(saved.as_deref()) {
+        ZdotdirRestore::Leave => {
+            if std::env::var_os("ZDOTDIR").is_some_and(|path| zdotdir_is_throwaway(&path)) {
+                unsafe { std::env::remove_var("ZDOTDIR") };
             }
-            return;
         }
+        ZdotdirRestore::Clear => unsafe { std::env::remove_var("ZDOTDIR") },
+        ZdotdirRestore::Set(path) => unsafe { std::env::set_var("ZDOTDIR", path) },
+    }
+    unsafe { std::env::remove_var("TTY7_USER_ZDOTDIR") };
+}
+
+enum ZdotdirRestore {
+    Leave,
+    Clear,
+    Set(std::ffi::OsString),
+}
+
+fn zdotdir_restore(saved: Option<&std::ffi::OsStr>) -> ZdotdirRestore {
+    match saved {
+        None => ZdotdirRestore::Leave,
+        Some(value) if value.is_empty() || zdotdir_is_throwaway(value) => ZdotdirRestore::Clear,
+        Some(value) => ZdotdirRestore::Set(value.to_os_string()),
+    }
+}
+
+fn zdotdir_is_throwaway(path: &std::ffi::OsStr) -> bool {
+    std::path::Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with("tty7-zdotdir-"))
+}
+
+fn strip_inherited_terminal_env(cmd: &mut std::process::Command) {
+    let inherited: Vec<std::ffi::OsString> = std::env::vars_os()
+        .map(|(key, _)| key)
+        .filter(|key| {
+            let name = key.to_string_lossy();
+            name == "TTY7" || name.starts_with("TTY7_")
+        })
+        .collect();
+    for key in inherited {
+        cmd.env_remove(key);
+    }
+    for key in [
+        "NTTY7_PANE",
+        "NTTY7_WS",
+        "NTTY7_SHELL_INTEGRATION",
+        "NTTY7_HISTFILE",
+    ] {
+        cmd.env_remove(key);
+    }
+}
+
+pub(crate) fn inherited_runtime_dirname_is_ephemeral(name: Option<&str>) -> bool {
+    let Some(name) = name else {
+        return false;
+    };
+    let Some(pid) = name.strip_prefix("ntty7-") else {
+        return false;
+    };
+    !pid.is_empty() && pid.chars().all(|c| c.is_ascii_digit())
+}
+
+fn pin_ephemeral_runtime() {
+    let dir = std::env::temp_dir().join(format!("ntty7-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    }
+    let _ = EPHEMERAL_RUNTIME.set(dir.clone());
+    crate::core::config::set_runtime_dir(dir);
+}
+
+pub(crate) fn cleanup_runtime() {
+    // Panes have to drop before the directory they were talking through is
+    // removed: `DaemonPane::drop` merges per-pane history back first.
+    crate::daemon::server::shutdown_in_process();
+    if let Some(dir) = EPHEMERAL_RUNTIME.get() {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+pub(crate) fn cleanup_and_quit(cx: &mut App) {
+    cleanup_runtime();
+    cx.quit();
+}
+
+pub(crate) fn new_instance_args(
+    cwd: Option<&std::path::Path>,
+    config_dir: Option<&std::path::Path>,
+) -> Vec<std::ffi::OsString> {
+    let mut args = Vec::new();
+    if let Some(cwd) = cwd {
+        args.push("--open-path".into());
+        args.push(cwd.as_os_str().to_os_string());
+    }
+    if let Some(dir) = config_dir {
+        args.push("--config-dir".into());
+        args.push(dir.as_os_str().to_os_string());
+    }
+    args
+}
+
+#[cfg(unix)]
+fn detach(cmd: &mut std::process::Command) {
+    use std::os::unix::process::CommandExt as _;
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(windows)]
+fn detach(cmd: &mut std::process::Command) {
+    use std::os::windows::process::CommandExt as _;
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    cmd.creation_flags(DETACHED_PROCESS | CREATE_NO_WINDOW);
+}
+
+pub(crate) fn spawn_new_instance(cwd: Option<&std::path::Path>) {
+    let Ok(exe) = std::env::current_exe() else {
+        log::warn!("could not locate ntty7 to open another window");
+        return;
+    };
+    let config = crate::core::config::config_dir_path();
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args(new_instance_args(cwd, config.as_deref()));
+    strip_inherited_terminal_env(&mut cmd);
+    cmd.stdin(std::process::Stdio::null());
+    cmd.stdout(std::process::Stdio::null());
+    cmd.stderr(std::process::Stdio::null());
+    detach(&mut cmd);
+    if let Err(error) = cmd.spawn() {
+        log::warn!("failed to open a new window: {error}");
+    }
+}
+
+fn wait_for_daemon() -> bool {
+    let start = std::time::Instant::now();
+    while start.elapsed() < std::time::Duration::from_secs(2) {
+        if crate::daemon::transport::endpoint_exists() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    crate::daemon::transport::endpoint_exists()
+}
+
+fn main() {
+    // Before args, config, or the log file: a parent tty7's `TTY7_*` must not
+    // decide this process's directory.
+    scrub_inherited_terminal_env();
+
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    // ntty7 does not install or serve agent hooks. A hook pointed at this
+    // binary must not rewrite Claude or Cursor settings that belong to an
+    // installed tty7.app, and it must not open a window at a fake path.
+    if args.first().map(std::ffi::OsString::as_os_str) == Some(std::ffi::OsStr::new("agent-hook")) {
+        return;
     }
 
     apply_config_dir_arg(&args);
+    pin_ephemeral_runtime();
+    crate::core::crash::install("gui");
+    crate::core::logfile::install("gui");
 
-    let daemon = args
-        .iter()
-        .any(|arg| arg == std::ffi::OsStr::new("--daemon"));
-    let mobile_helper = args
-        .iter()
-        .any(|arg| arg == std::ffi::OsStr::new(tty7_core::daemon::mobile::GATEWAY_FLAG));
-    let role = match (daemon, mobile_helper) {
-        (true, _) => "daemon",
-        (false, true) => "mobile",
-        (false, false) => "gui",
-    };
-    crate::core::crash::install(role);
-    crate::core::logfile::install(role);
-
-    // The Windows installer owns the Explorer context menu: a task checkbox
-    // runs these, and the uninstaller always runs the unregister half. Keeping
-    // the registry shape in `explorer_context_menu` rather than in the .iss
-    // means the installer and the running app can never disagree about it.
-    // Handled after the log file is open, because a GUI-subsystem process has
-    // no console to report a failure on and Inno does not surface exit codes:
-    // the log is the only place the reason can survive.
-    if let Some(register) = explorer_menu_action_from(&args) {
-        let result = if register {
-            // The verb labels are localized, and this process stops at the
-            // `return` below — it never reaches the `set_locale` on the GUI
-            // path. Without this read every install would write English
-            // entries, whatever language the user runs tty7 in.
-            crate::ui::i18n::set_locale(&Config::load().gui_language);
-            crate::core::explorer_context_menu::register()
-        } else {
-            crate::core::explorer_context_menu::unregister()
-        };
-        if let Err(error) = result {
-            log::error!("the Explorer context-menu update failed: {error}");
-            std::process::exit(1);
-        }
-        return;
-    }
-
-    // The daemon's mobile gateway, run by the daemon as its child: see
-    // `tty7_core::daemon::mobile`.
-    if mobile_helper {
-        let served = tty7_gateway::state::State::open_default()
-            .and_then(tty7_gateway::service::serve_until_stdin_closes);
-        if let Err(e) = served {
-            log::warn!("mobile gateway: {e:#}");
-        }
-        return;
-    }
-
-    if daemon {
-        if crate::daemon::server::run_daemon().is_err() {
-            std::process::exit(1);
-        }
-        return;
-    }
-
-    if args
-        .iter()
-        .any(|arg| arg == std::ffi::OsStr::new("--stop-daemon"))
-    {
-        // An installer about to replace `dir` says so, and gets more than a
-        // stop: orphaned ConPTY hosts and anything else still running from
-        // that directory are terminated, and the call does not return until
-        // the images there are actually replaceable (or says why they are
-        // not). Invoked by the Inno PrepareToInstall step and the updater.
-        #[cfg(windows)]
-        if let Some(dir) = update_install_dir_from(args.iter().cloned()) {
-            // Held in the *parent's* name: this helper returns in seconds,
-            // but the Setup (or uninstaller) that invoked it keeps replacing
-            // files in `dir` until it exits — and a daemon spawned in that
-            // window would relock them. The guard needs no clearing; it goes
-            // stale the moment that parent is gone.
-            tty7_core::daemon::update_guard::hold_for_parent();
-            if let Err(error) = crate::daemon::spawn::stop_for_update(&dir) {
-                log::error!(
-                    "preparing {} for replacement failed: {error}",
-                    dir.display()
-                );
-                std::process::exit(1);
-            }
-            return;
-        }
-        crate::daemon::spawn::stop();
-        return;
-    }
-
-    let open_path = open_path_from(args.into_iter());
-    if forward_open_path(open_path.as_deref()) {
-        return;
-    }
-
-    // After the forward: a launch that only hands a path to the running
-    // window has no use for the PATH, and running the user's rc costs time.
     #[cfg(unix)]
     enrich_path_from_login_shell();
-
-    // A package the user asked to have applied at the next launch. Deliberately
-    // here: after the forward above, so a second launch that is really a
-    // request to an existing window never replaces the bundle out from under
-    // it, and before everything below, so there is no daemon to strand and no
-    // window to flash. On success the updater takes over and this process is
-    // done; on failure it has already discarded the plan and we start normally.
-    if crate::core::update::apply_pending_at_launch() {
-        return;
-    }
-    // If this launch *is* the relaunch an updater just performed, its outcome
-    // file is waiting; fold it into the update state before the first window
-    // reads it. Also covers the recovery relaunch after a failed install.
-    crate::core::update::absorb_update_outcome_at_launch();
 
     let (config, config_outcome) = crate::core::config::Config::load_with_outcome();
     let gui_language = config.gui_language.clone();
     #[cfg(target_os = "macos")]
     apply_font_thicken(config.font_thicken);
 
-    // After the PATH enrichment above, which is what makes the candidate scan
-    // see the user's real PATH rather than the stub a Finder launch inherits —
-    // and before the daemon below, which forks every pane and so must already
-    // carry the CLI's directory in its environment.
-    crate::core::cli_install::install(config.install_cli_on_path);
-
-    // Give desktop toasts the tty7 icon and name instead of notify-rust's
-    // PowerShell fallback. Best-effort; no-op off Windows.
     #[cfg(target_os = "windows")]
     crate::core::aumid::init();
 
-    let restore_session = config.restore_session;
-    let daemon_result = if restore_session {
-        crate::daemon::spawn::ensure_running()
-    } else {
-        crate::daemon::spawn::restart()
-    };
-    // A pathless launch that found a GUI already registered hands the request
-    // to it — the GUI may be sitting in the tray with no window — and exits.
-    // The forward above cannot do this: it runs before the daemon exists, and
-    // routing through a daemon that is not up yet would fail on every cold
-    // start. Here the daemon is known to be running, so the probe is cheap and
-    // a `Bool(true)` means a GUI actually received the request.
-    if open_path.is_none() && daemon_result.is_ok() && forward_open_path(None) {
-        return;
-    }
-    match &daemon_result {
-        Ok(()) => {
-            if let Err(e) = crate::daemon::spawn::adopt_this_build() {
-                log::warn!("the daemon stays on its old build: {e}");
+    #[cfg(target_os = "macos")]
+    crate::daemon::responsibility::skip_disclaim();
+
+    std::thread::Builder::new()
+        .name("ntty7-daemon".into())
+        .spawn(|| {
+            if let Err(error) = crate::daemon::server::run_daemon() {
+                log::error!("terminal server stopped: {error:#}");
             }
-        }
-        Err(e) => log::error!("failed to ensure daemon is running: {e}"),
+        })
+        .expect("ntty7 daemon thread");
+    if !wait_for_daemon() {
+        log::error!("the in-process terminal server did not come up");
+        cleanup_runtime();
+        std::process::exit(1);
     }
 
-    // `Application`, not the in-loop `App`, owns the native delegate. Register
-    // before `run` so macOS can deliver Finder and URL events from launch.
-    let (external_open_tx, external_open_rx) = smol::channel::unbounded();
+    let open_path = open_path_from(args.into_iter());
     let application = gpui_platform::application()
         .with_assets(Assets)
-        // The window-close path decides whether this process survives: with
-        // the tray icon on, closing the last window retires to the tray, and
-        // without it the close handler quits explicitly. The platform default
-        // would quit on the last window unconditionally, which is exactly the
-        // orphaned-daemon trap the tray is meant to prevent.
         .with_quit_mode(QuitMode::Explicit);
-    application.on_open_urls(move |urls| {
-        let _ = external_open_tx.try_send(urls);
-    });
-    // macOS relaunching an app that is already running — the Dock icon, a
-    // double-click on the bundle, `open -a tty7` — only reaches this process
-    // as `applicationShouldHandleReopen:`, and gpui's delegate does nothing
-    // with it unless a handler is registered. That is the one entrance a
-    // tray-resident tty7 has: with `show_tray_icon` on, closing the last
-    // window keeps the process and its Dock icon alive with nothing on
-    // screen, and without this the icon's click was a no-op (the only ways
-    // back in were ⌘N, the tray's "Show tty7", or quitting and relaunching).
-    // Like `on_open_urls`, the hook lives on `Application`, so it cannot go
-    // beside the other app-level handlers in `keymap::init`; and like that
-    // path it defers to the loop rather than opening windows on AppKit's
-    // delegate stack, which is also how Zed's own reopen handler runs.
+    application.on_open_urls(note_external_opens);
     application.on_reopen(|cx| {
         cx.spawn(async move |cx| {
-            let _ = cx.update(crate::ui::windows::reopen);
+            let _ = cx.update(|cx| cx.activate(true));
         })
         .detach();
     });
     application.run(move |cx| {
-        // gpui invokes this callback without an `App` context. Bridge it
-        // back onto the application loop instead of touching UI state on
-        // AppKit's delegate call stack.
-        cx.spawn(async move |cx| {
-            while let Ok(urls) = external_open_rx.recv().await {
-                let _ = cx.update(|cx| handle_external_opens(urls, cx));
-            }
-        })
-        .detach();
         gpui_component::init(cx);
         register_bundled_fonts(cx);
         crate::ui::prompt::install(cx);
@@ -804,32 +866,26 @@ fn main() {
         #[cfg(target_os = "macos")]
         set_dock_icon_for_bare_binary();
         crate::ui::i18n::set_locale(&gui_language);
-        // The load above is reused rather than re-read: reading the same
-        // file twice at launch would report the same failure twice.
         cx.set_global(config);
         crate::ui::theme::refresh_system_appearance(cx);
-        crate::core::session::WorkspaceStore::init(cx);
-        crate::ui::windows::WindowRegistry::init(cx);
         crate::ui::presets::load_registry(cx);
         crate::ui::theme::apply_cursor_hide_mode(cx);
         spawn_config_watcher(cx);
-        crate::core::update::spawn_check(cx);
-        crate::core::update::install_image_client(cx);
-        cx.background_executor()
-            .spawn(async {
-                crate::core::agent_hooks::refresh_hooks_at_launch();
-            })
-            .detach();
+        // Dock Quit calls `NSApplication::terminate:` and never returns from
+        // `run`. The cleanup has to happen when the observer is invoked: gpui
+        // only polls the returned future for 200ms, which is not long enough
+        // to drop a pane. The subscription has to outlive `run`.
+        std::mem::forget(cx.on_app_quit(|_cx| {
+            cleanup_runtime();
+            async {}
+        }));
         keymap::init(cx);
-        crate::ui::local_link::LocalLink::install(cx);
-
-        let reopen = crate::ui::windows::restore_target(cx, open_path.as_deref());
-        crate::ui::windows::open_at(cx, reopen.map(|(id, _)| id), open_path);
-        crate::ui::windows::announce_detached_at_launch(cx, reopen);
+        crate::ui::solo::open(cx, open_path);
         if config_outcome.failed() {
             notify_config_load_failed(cx, config_outcome, true);
         }
     });
+    cleanup_runtime();
 }
 
 #[cfg(all(test, target_os = "macos"))]
@@ -867,7 +923,7 @@ mod font_thicken_tests {
 #[cfg(test)]
 mod config_reload_tests {
     use super::{apply_reloaded_config, is_theme_file};
-    use crate::core::actions::SplitRight;
+    use crate::core::actions::NewWindow;
     use crate::core::config::{Config, LoadOutcome};
     use gpui::{Action as _, App, KeyContext, Keystroke, TestAppContext};
 
@@ -894,14 +950,13 @@ mod config_reload_tests {
 
         gpui_component::init(cx);
         cx.set_global(config);
-        crate::ui::windows::WindowRegistry::init(cx);
         crate::ui::presets::load_registry(cx);
         crate::ui::keymap::init(cx);
     }
 
-    fn bound_to_split_right(config: &mut Config, key: &str) {
+    fn bound_to_new_window(config: &mut Config, key: &str) {
         config.keybindings.insert(
-            "SplitRight".to_string(),
+            "NewWindow".to_string(),
             crate::core::config::KeybindingOverride::Add(key.to_string()),
         );
     }
@@ -916,7 +971,7 @@ mod config_reload_tests {
             );
 
             let mut edited = Config::default();
-            bound_to_split_right(&mut edited, "ctrl-alt-9");
+            bound_to_new_window(&mut edited, "ctrl-alt-9");
             let mut announced = false;
             assert!(
                 apply_reloaded_config(cx, (edited, LoadOutcome::Parsed), &mut announced),
@@ -925,7 +980,7 @@ mod config_reload_tests {
 
             assert_eq!(
                 dispatched(cx, "ctrl-alt-9"),
-                vec![SplitRight::name_for_type()],
+                vec![NewWindow::name_for_type()],
                 "the hand-edited chord reaches the keymap gpui dispatches on"
             );
         });
@@ -960,11 +1015,11 @@ mod config_reload_tests {
     fn a_broken_config_does_not_take_the_users_keys_away(cx: &mut TestAppContext) {
         cx.update(|cx| {
             let mut user = Config::default();
-            bound_to_split_right(&mut user, "ctrl-alt-9");
+            bound_to_new_window(&mut user, "ctrl-alt-9");
             running_on(cx, user);
             assert_eq!(
                 dispatched(cx, "ctrl-alt-9"),
-                vec![SplitRight::name_for_type()]
+                vec![NewWindow::name_for_type()]
             );
 
             // A quarantined load hands back stand-in defaults, and the global
@@ -980,7 +1035,7 @@ mod config_reload_tests {
             );
             assert!(announced, "the breakage is announced");
             assert_eq!(
-                cx.global::<Config>().keybindings.get("SplitRight"),
+                cx.global::<Config>().keybindings.get("NewWindow"),
                 Some(&crate::core::config::KeybindingOverride::Add(
                     "ctrl-alt-9".to_string()
                 )),
@@ -988,14 +1043,14 @@ mod config_reload_tests {
             );
             assert_eq!(
                 dispatched(cx, "ctrl-alt-9"),
-                vec![SplitRight::name_for_type()],
+                vec![NewWindow::name_for_type()],
                 "and so do the keys the app is dispatching on"
             );
 
             // The file parses again: the latch clears, so a second breakage
             // can speak up.
             let mut fixed = Config::default();
-            bound_to_split_right(&mut fixed, "ctrl-alt-8");
+            bound_to_new_window(&mut fixed, "ctrl-alt-8");
             assert!(apply_reloaded_config(
                 cx,
                 (fixed, LoadOutcome::Parsed),
@@ -1004,7 +1059,7 @@ mod config_reload_tests {
             assert!(!announced);
             assert_eq!(
                 dispatched(cx, "ctrl-alt-8"),
-                vec![SplitRight::name_for_type()]
+                vec![NewWindow::name_for_type()]
             );
             assert!(
                 dispatched(cx, "ctrl-alt-9").is_empty(),
@@ -1070,32 +1125,9 @@ mod tests {
 
 #[cfg(test)]
 mod argument_tests {
-    use super::{
-        config_dir_from, explorer_menu_action_from, forward_open_path_with, open_path_from,
-    };
+    use super::{config_dir_from, open_path_from};
     use std::ffi::OsString;
     use std::path::PathBuf;
-    use tty7_core::daemon::control::ReplyOk;
-
-    /// The installer passes exactly one of these; every other launch — above
-    /// all a plain `--open-path` from the very menu they register — must fall
-    /// through to normal startup instead of rewriting the registry and exiting.
-    #[test]
-    fn explorer_menu_flags_are_distinguished_and_otherwise_absent() {
-        assert_eq!(
-            explorer_menu_action_from(&[OsString::from("--register-explorer-menu")]),
-            Some(true)
-        );
-        assert_eq!(
-            explorer_menu_action_from(&[OsString::from("--unregister-explorer-menu")]),
-            Some(false)
-        );
-        assert_eq!(
-            explorer_menu_action_from(&[OsString::from("--open-path"), OsString::from("/work")]),
-            None
-        );
-        assert_eq!(explorer_menu_action_from(&[]), None);
-    }
 
     #[test]
     fn open_path_accepts_separate_and_equals_forms() {
@@ -1141,129 +1173,136 @@ mod argument_tests {
     }
 
     #[test]
-    fn a_pathless_forward_asks_the_gui_to_surface_and_exits_only_on_bool_true() {
-        let delivered = forward_open_path_with(
-            None,
-            || false,
-            |actual| {
-                assert_eq!(actual, None, "a pathless request carries no wire path");
-                Ok(ReplyOk::Bool(true))
-            },
+    fn new_instance_args_carry_the_cwd_and_the_shared_config_dir() {
+        let cwd = std::path::Path::new("/work/app");
+        let cfg = std::path::Path::new("/home/me/.config/ntty7");
+        assert_eq!(
+            super::new_instance_args(Some(cwd), Some(cfg)),
+            vec![
+                std::ffi::OsString::from("--open-path"),
+                std::ffi::OsString::from("/work/app"),
+                std::ffi::OsString::from("--config-dir"),
+                std::ffi::OsString::from("/home/me/.config/ntty7"),
+            ]
         );
-        assert!(delivered, "a GUI accepted the surface request");
-
-        assert!(!forward_open_path_with(
-            None,
-            || false,
-            |_| Ok(ReplyOk::Bool(false))
-        ));
-        assert!(!forward_open_path_with(
-            None,
-            || false,
-            |_| Ok(ReplyOk::Unit)
-        ));
-        assert!(!forward_open_path_with(
-            None,
-            || false,
-            |_| {
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::ConnectionRefused,
-                    "daemon is not running",
-                ))
-            }
-        ));
+        assert!(super::new_instance_args(None, None).is_empty());
     }
 
     #[test]
-    fn early_dispatch_is_skipped_when_the_recorded_daemon_is_dead() {
-        // A dead recorded daemon cannot be routing for a registered GUI, so the
-        // probe must not run — the connect would only wait out the OS's refusal
-        // delay on the stale control port before `ensure_running` clears it.
-        assert!(!forward_open_path_with(
-            None,
-            || true,
-            |_| -> std::io::Result<ReplyOk> {
-                panic!("the probe must not dispatch when the daemon is dead")
-            },
-        ));
-        assert!(!forward_open_path_with(
-            Some(std::path::Path::new("/work")),
-            || true,
-            |_| -> std::io::Result<ReplyOk> {
-                panic!("the probe must not dispatch when the daemon is dead")
-            },
-        ));
-    }
-
-    #[test]
-    fn early_dispatch_exits_only_after_a_gui_accepts_the_path() {
-        let path = std::env::current_dir().unwrap().join("folder with spaces");
-        let expected = path.to_str().unwrap().to_owned();
-        let delivered = forward_open_path_with(
-            Some(&path),
-            || false,
-            |actual| {
-                assert_eq!(actual, Some(expected));
-                Ok(ReplyOk::Bool(true))
-            },
+    fn open_path_accepts_a_positional_directory_and_skips_flags() {
+        assert_eq!(
+            open_path_from([OsString::from("~/proj")].into_iter()),
+            Some(PathBuf::from("~/proj"))
         );
-
-        assert!(delivered);
-        assert!(!forward_open_path_with(
-            Some(&path),
-            || false,
-            |_| Ok(ReplyOk::Bool(false))
-        ));
-        assert!(!forward_open_path_with(
-            Some(&path),
-            || false,
-            |_| Ok(ReplyOk::Unit)
-        ));
-        assert!(!forward_open_path_with(
-            Some(&path),
-            || false,
-            |_| {
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::ConnectionRefused,
-                    "daemon is not running",
-                ))
-            }
-        ));
-    }
-
-    #[test]
-    fn early_dispatch_resolves_relative_paths_before_cross_process_delivery() {
-        let relative = std::path::Path::new("workspace");
-        let expected = std::env::current_dir()
-            .unwrap()
-            .join(relative)
-            .to_str()
-            .unwrap()
-            .to_owned();
-
-        assert!(forward_open_path_with(
-            Some(relative),
-            || false,
-            |actual| {
-                assert_eq!(actual, Some(expected));
-                Ok(ReplyOk::Bool(true))
-            }
-        ));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn early_dispatch_keeps_non_utf8_paths_in_the_current_process() {
-        use std::ffi::OsString;
-        use std::os::unix::ffi::OsStringExt as _;
-
-        let path = std::env::temp_dir().join(OsString::from_vec(b"tty7-\xff".to_vec()));
-        let delivered = forward_open_path_with(
-            Some(&path),
-            || false,
-            |_| panic!("a non-UTF-8 path must never be changed and sent over the string protocol"),
+        assert_eq!(
+            open_path_from([OsString::from(".")].into_iter()),
+            Some(PathBuf::from("."))
         );
+        assert_eq!(
+            open_path_from(
+                ["--config-dir", "/cfg", "--flag", "."]
+                    .into_iter()
+                    .map(OsString::from)
+            ),
+            Some(PathBuf::from("."))
+        );
+        assert_eq!(
+            open_path_from(["-psn_0_12345", "/work"].into_iter().map(OsString::from)),
+            Some(PathBuf::from("/work"))
+        );
+        assert_eq!(
+            open_path_from(
+                [".", "--open-path", "/explicit"]
+                    .into_iter()
+                    .map(OsString::from)
+            ),
+            Some(PathBuf::from("/explicit"))
+        );
+        assert_eq!(open_path_from([OsString::from("--flag")].into_iter()), None);
+    }
 
-        assert!(!delivered);
+    #[test]
+    fn finder_urls_become_directories() {
+        assert_eq!(
+            super::path_from_open_target("file:///Users/n/proj"),
+            Some(PathBuf::from("/Users/n/proj"))
+        );
+        assert_eq!(
+            super::path_from_open_target("file://localhost/Users/n/My%20Proj"),
+            Some(PathBuf::from("/Users/n/My Proj"))
+        );
+        assert_eq!(
+            super::path_from_open_target("file:///C:/work/app"),
+            Some(PathBuf::from("C:/work/app"))
+        );
+        assert_eq!(super::path_from_open_target("-psn_0_1"), None);
+        assert_eq!(super::path_from_open_target(""), None);
+
+        let dir = std::env::temp_dir().join(format!("ntty7-open-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("note.txt");
+        std::fs::write(&file, "x").unwrap();
+        assert_eq!(super::directory_for_open(&file), dir);
+        assert_eq!(super::directory_for_open(&dir), dir);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_ephemeral_runtime_dirname_is_not_a_config_dir() {
+        assert!(super::inherited_runtime_dirname_is_ephemeral(Some(
+            "ntty7-1234"
+        )));
+        assert!(!super::inherited_runtime_dirname_is_ephemeral(Some(
+            "ntty7"
+        )));
+        assert!(!super::inherited_runtime_dirname_is_ephemeral(Some(
+            "ntty7-custom"
+        )));
+        assert!(!super::inherited_runtime_dirname_is_ephemeral(None));
+    }
+
+    #[test]
+    fn outer_tty7_zdotdir_restore_skips_the_redirector() {
+        let home = std::ffi::OsStr::new("/Users/n");
+        assert!(matches!(
+            super::zdotdir_restore(Some(home)),
+            super::ZdotdirRestore::Set(path) if path == home
+        ));
+        assert!(matches!(
+            super::zdotdir_restore(Some(std::ffi::OsStr::new(""))),
+            super::ZdotdirRestore::Clear
+        ));
+        assert!(matches!(
+            super::zdotdir_restore(Some(std::ffi::OsStr::new("/tmp/tty7-zdotdir-4-1"))),
+            super::ZdotdirRestore::Clear
+        ));
+        assert!(matches!(
+            super::zdotdir_restore(None),
+            super::ZdotdirRestore::Leave
+        ));
+        assert!(super::zdotdir_is_throwaway(std::ffi::OsStr::new(
+            "/var/folders/xx/tty7-zdotdir-9-0"
+        )));
+        assert!(!super::zdotdir_is_throwaway(std::ffi::OsStr::new(
+            "/Users/n"
+        )));
+    }
+
+    #[test]
+    fn a_cold_home_window_absorbs_only_the_first_open_urls() {
+        let grace = super::LAUNCH_URL_GRACE;
+        let young = std::time::Duration::from_millis(10);
+        assert!(super::absorb_cold_open(true, false, false, young));
+        assert!(super::absorb_cold_open(
+            true,
+            false,
+            false,
+            std::time::Duration::from_millis(499)
+        ));
+        assert!(!super::absorb_cold_open(true, false, false, grace));
+        assert!(!super::absorb_cold_open(true, true, false, young));
+        assert!(!super::absorb_cold_open(true, false, true, young));
+        assert!(!super::absorb_cold_open(false, false, false, young));
     }
 }

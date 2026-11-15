@@ -9,7 +9,7 @@ use gpui::{
     ScrollWheelEvent, Task, WeakEntity, Window, actions, div, prelude::*, px,
 };
 use gpui_component::kbd::Kbd;
-use gpui_component::menu::{ContextMenuExt, PopupMenuItem};
+use gpui_component::menu::ContextMenuExt;
 use gpui_component::scroll::Scrollbar;
 use gpui_component::{ActiveTheme as _, Icon, IconName, WindowExt as _, h_flex};
 
@@ -25,10 +25,8 @@ use super::scrollbar::{GridScroll, TerminalScrollHandle};
 use super::search::{LinkTarget, SearchState};
 use super::typeahead::{RawInput, Typeahead};
 use crate::core::actions::{
-    CloseActiveTab, CopyLinkPathUnderPointer, DecreaseFontSize, ForkAgentSessionDown,
-    ForkAgentSessionLeft, ForkAgentSessionRight, ForkAgentSessionUp, IncreaseFontSize, NewTab,
-    OpenLinkUnderPointer, OpenLinkWithDefaultApp, RevealLinkUnderPointer, SaveAgentLaunchArgs,
-    SendBackTab, SendTab, SplitDown, SplitRight, ToggleMaximizePane,
+    CloseWindow, CopyLinkPathUnderPointer, DecreaseFontSize, IncreaseFontSize, NewWindow,
+    OpenLinkUnderPointer, OpenLinkWithDefaultApp, RevealLinkUnderPointer, SendBackTab, SendTab,
 };
 use crate::core::config::{BellMode, Config, LinkFileOpen, MouseZoomModifier};
 use crate::core::shell_quote::quote_for_shell;
@@ -86,31 +84,6 @@ struct DisplayedRegistry(
 
 impl gpui::Global for DisplayedRegistry {}
 
-pub fn declare_displayed(cx: &App, panes: impl IntoIterator<Item = (EntityId, bool)>) {
-    // No registry means no pane has ever been built in this app.
-    let Some(registry) = cx.try_global::<DisplayedRegistry>() else {
-        return;
-    };
-    let map = registry.0.lock().unwrap();
-    for (id, on) in panes {
-        if let Some(flag) = map.get(&id) {
-            flag.store(on, std::sync::atomic::Ordering::Relaxed);
-        }
-    }
-}
-
-/// What the registry holds for `id`: `None` when the pane never registered
-/// (or already released), otherwise the flag the output gate would consult.
-#[cfg(test)]
-pub(crate) fn displayed_for_test(cx: &App, id: EntityId) -> Option<bool> {
-    cx.try_global::<DisplayedRegistry>()?
-        .0
-        .lock()
-        .unwrap()
-        .get(&id)
-        .map(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
-}
-
 actions!(
     terminal,
     [
@@ -151,29 +124,8 @@ pub struct AgentDetected(pub crate::core::cli_agent::CLIAgent);
 
 impl gpui::EventEmitter<AgentDetected> for TerminalView {}
 
-/// A file link the user clicked, on its way to whoever can show it. The
-/// terminal resolves the path — it is the only thing that knows the pane's
-/// directory and host — and the app opens it, because the editor and the file
-/// tree are its to drive.
-pub struct OpenFileRequested {
-    pub path: std::path::PathBuf,
-    pub line: Option<u32>,
-    pub column: Option<u32>,
-    /// A directory link asks "where is this?", not "what does it say?" — the
-    /// app answers it in the file tree instead of the editor.
-    pub is_dir: bool,
-}
-
-impl gpui::EventEmitter<OpenFileRequested> for TerminalView {}
-
-pub struct NativeSshParts {
-    terminal: RemoteTerminal,
-    pane_id: u64,
-    persist: Box<crate::daemon::protocol::NativeSshSpec>,
-}
-
 /// What a pane is called when nothing running in it has said otherwise.
-pub(crate) const DEFAULT_TITLE: &str = "tty7";
+pub(crate) const DEFAULT_TITLE: &str = "ntty7";
 
 /// What a pane is *saying* about itself, if anything — the reading behind
 /// [`TerminalView::stated_title`], split out so it can be pinned without a
@@ -183,7 +135,7 @@ pub(crate) const DEFAULT_TITLE: &str = "tty7";
 /// 0/2" on purpose: an SSH pane answers to the host it dialled and a workspace
 /// pane to its workspace's name, and those are names tty7 gave the pane
 /// deliberately (#438) rather than the absence of one. The literal string
-/// `tty7` is the only title that says nothing, because it is the app's own
+/// `ntty7` is the only title that says nothing, because it is the app's own
 /// name standing in for a pane that has never introduced itself.
 pub(crate) fn stated_title(title: &str) -> Option<&str> {
     match title.trim() {
@@ -307,10 +259,6 @@ pub struct TerminalView {
     owner_workspace: Option<crate::core::session::WorkspaceId>,
     restored: bool,
     ssh_spec: Option<Box<crate::daemon::protocol::NativeSshSpec>>,
-    /// The verified remote staging directory for pasted images, once one has
-    /// been prepared for this pane. `None` means "not prepared yet", never
-    /// "preparation failed" — see [`staging_cache`].
-    remote_clipboard_dir: Option<String>,
     remote_clipboard_write_in_flight: Option<u64>,
     remote_clipboard_write_generation: u64,
     pub focus_handle: FocusHandle,
@@ -527,9 +475,7 @@ pub struct TerminalView {
     editor_goal_col: Option<usize>,
     pub(super) hovered_link: Option<HoveredLink>,
     /// How opaque the pane wants this terminal painted this frame: 1.0 at
-    /// rest, [`crate::ui::pane::INACTIVE_DIM`] for an unfocused pane in a
-    /// split, [`crate::ui::pane::LIFTED_DIM`] while the pane is being
-    /// dragged. The pane leaf computes it and stores it here, because the
+    /// rest. The pane computes it and stores it here, because the
     /// dim is applied by blending the terminal's own colours toward the
     /// window background instead of the pane's element opacity — an opacity
     /// style would alpha-multiply every quad and path separately, so a
@@ -557,12 +503,6 @@ pub(super) struct HoveredLink {
     /// the kind of small lie that teaches people to stop trusting the
     /// underline.
     pub armed: bool,
-}
-
-enum LoopbackOpen {
-    Forwarded(String),
-    ForwardFailed(String),
-    NotLoopback,
 }
 
 /// What sits under a cell, once the grid has been read.
@@ -688,13 +628,9 @@ const INTEGRATION_GRACE: std::time::Duration = std::time::Duration::from_secs(8)
 
 const INTEGRATION_NOTICE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
-const OPPORTUNISTIC_GIT_GAP: std::time::Duration = std::time::Duration::from_millis(1500);
-
 /// How long a pane with an unknown or negative repository answer waits
 /// before asking again. Discovery can miss temporarily unavailable metadata;
 /// retry without issuing a request on every poll tick.
-const GIT_RETRY_GAP: std::time::Duration = std::time::Duration::from_secs(10);
-
 /// How long a title the program set has to stand before the tab adopts it.
 ///
 /// Long enough that a command which is over almost as soon as it started never
@@ -779,7 +715,6 @@ fn history_seed_source(
 enum HistorySeedFetch {
     None,
     Host(Vec<(crate::ui::host_ops::SharedHost, std::path::PathBuf)>),
-    Sftp(crate::ui::sftp::SftpRoute),
 }
 
 impl HistorySeedFetch {
@@ -797,37 +732,8 @@ impl HistorySeedFetch {
                     Some((name, host.read_file(&path, MAX_HISTORY_BYTES).ok()?))
                 })
                 .collect(),
-            HistorySeedFetch::Sftp(route) => read_shell_history_over_sftp(&route),
         }
     }
-}
-
-fn read_shell_history_over_sftp(route: &crate::ui::sftp::SftpRoute) -> Vec<(String, Vec<u8>)> {
-    use crate::daemon::protocol::{SftpOp, SftpOpResult};
-    let home = match route.op(SftpOp::Realpath {
-        path: ".".to_string(),
-    }) {
-        SftpOpResult::Link(home) if home.starts_with('/') => home,
-        other => {
-            log::debug!(target: "tty7::history", "no remote home to seed history from: {other:?}");
-            return Vec::new();
-        }
-    };
-    super::history::shell_history_names()
-        .into_iter()
-        .filter_map(|rel| {
-            let path = crate::daemon::ssh::sftp::remote_join(&home, rel);
-            match route.op(SftpOp::ReadFile {
-                path,
-                max_bytes: MAX_HISTORY_BYTES,
-            }) {
-                SftpOpResult::File { bytes, .. } => {
-                    Some((crate::daemon::ssh::sftp::remote_basename(rel), bytes))
-                }
-                _ => None,
-            }
-        })
-        .collect()
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -835,7 +741,7 @@ enum GitRefresh {
     Edge,
     Opportunistic,
     /// Nothing happened; the cache just has no answer for this pane's cwd
-    /// yet, or the last probe found no repository. Throttled by [`GIT_RETRY_GAP`].
+    /// yet, or the last probe found no repository.
     Retry,
 }
 
@@ -864,7 +770,7 @@ fn compose_notification_title(
     match (lead.or(host), workspace) {
         (Some(lead), Some(workspace)) => format!("{lead} · {workspace}"),
         (Some(only), None) | (None, Some(only)) => only,
-        (None, None) => "tty7".to_string(),
+        (None, None) => DEFAULT_TITLE.to_string(),
     }
 }
 
@@ -1002,15 +908,8 @@ impl TerminalView {
         }
     }
 
-    fn notification_title(&self, lead: Option<&str>, cx: &App) -> String {
-        let host = self
-            .workspace
-            .as_ref()
-            .map(|w| crate::ui::remote_connect::target_label(cx, &w.target));
-        let workspace = self
-            .owner_workspace
-            .and_then(|id| crate::ui::machine_mirror::display_name_for(cx, id));
-        compose_notification_title(lead.map(str::to_string), host, workspace)
+    fn notification_title(&self, lead: Option<&str>, _cx: &App) -> String {
+        compose_notification_title(lead.map(str::to_string), None, None)
     }
 }
 
@@ -1341,15 +1240,42 @@ fn local_path_for_pane(local: &str, shares_localhost: bool) -> String {
 /// world-writable `/tmp`, where any local account could pre-create the
 /// directory, read what lands in it, or swap a pasted file for one of its own
 /// before the pane's agent opens it.
+#[cfg(test)]
 const REMOTE_CLIPBOARD_PATH: [&str; 3] = [".cache", "tty7", "clipboard"];
 
 /// Owner-only, and *only* owner: a staging directory anyone else can enter is
 /// one anyone else can read the pasted files out of.
+#[cfg(test)]
 const REMOTE_CLIPBOARD_MODE: u32 = 0o700;
+
+/// Whether a prepared staging directory may be uploaded into.
+///
+/// The mode is what a `stat` reported after a `chmod 0700` the daemon watched
+/// succeed, which is the ownership proof: POSIX only lets a file's owner
+/// change its mode. A symlink is refused because `stat` follows links.
+#[cfg(test)]
+fn staging_dir_is_safe(
+    is_symlink: bool,
+    kind: Option<crate::daemon::protocol::SftpEntryKind>,
+    mode: u32,
+) -> bool {
+    use crate::daemon::protocol::SftpEntryKind;
+    !is_symlink
+        && matches!(kind, Some(SftpEntryKind::Dir))
+        && mode & 0o7777 == REMOTE_CLIPBOARD_MODE
+}
+
+/// The staging directory to reuse on the next paste. A failed preparation is
+/// not cached, so the next paste tries again.
+#[cfg(test)]
+fn staging_cache(prepared: &Result<String, String>) -> Option<String> {
+    prepared.as_ref().ok().cloned()
+}
 
 /// How long a paste stays staged on the remote. Long enough to outlive any
 /// conversation that still refers to it; a week of pasted spreadsheets is
 /// what would otherwise pile up in the user's home forever.
+#[cfg(test)]
 const REMOTE_CLIPBOARD_TTL_SECS: u64 = 7 * 24 * 60 * 60;
 
 /// A fresh name for one paste's own directory under the staging directory.
@@ -1357,6 +1283,7 @@ const REMOTE_CLIPBOARD_TTL_SECS: u64 = 7 * 24 * 60 * 60;
 /// Each paste gets a directory so every file keeps its real name — which is
 /// what the agent reads, and `report.xlsx` says far more than a hash — without
 /// two pastes of the same name overwriting each other.
+#[cfg(test)]
 fn paste_dir_name() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -1369,205 +1296,9 @@ fn paste_dir_name() -> String {
 
 /// Whether a staging entry has outlived [`REMOTE_CLIPBOARD_TTL_SECS`]. An
 /// entry with no mtime (`0`) is left alone: its age is unknown, not great.
+#[cfg(test)]
 fn staged_entry_expired(mtime: u64, now: u64) -> bool {
     mtime != 0 && now.saturating_sub(mtime) > REMOTE_CLIPBOARD_TTL_SECS
-}
-
-/// Remove the staging directory's expired entries. Best effort: a failure
-/// here costs disk space, never a paste, so nothing is reported.
-fn prune_remote_clipboard_dir(route: &crate::ui::sftp::SftpRoute, dir: &str) {
-    let Ok(entries) = route.list(dir) else {
-        return;
-    };
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
-    for entry in entries {
-        if entry.name == "." || entry.name == ".." || !staged_entry_expired(entry.mtime, now) {
-            continue;
-        }
-        remove_remote_tree(
-            route,
-            &crate::daemon::ssh::sftp::remote_join(dir, &entry.name),
-            entry.kind,
-            0,
-        );
-    }
-}
-
-/// Delete a remote file or directory tree. A symlink is removed as a link and
-/// never followed — the tree is ours, where it points is not.
-fn remove_remote_tree(
-    route: &crate::ui::sftp::SftpRoute,
-    path: &str,
-    kind: crate::daemon::protocol::SftpEntryKind,
-    depth: usize,
-) {
-    use crate::daemon::protocol::{SftpEntryKind, SftpOp};
-    // A pasted folder is as deep as it was on disk; this bounds a pathological
-    // one rather than any real one.
-    const MAX_DEPTH: usize = 64;
-    if kind != SftpEntryKind::Dir {
-        route.op(SftpOp::RemoveFile {
-            path: path.to_string(),
-        });
-        return;
-    }
-    if depth < MAX_DEPTH
-        && let Ok(children) = route.list(path)
-    {
-        for child in children {
-            if child.name == "." || child.name == ".." {
-                continue;
-            }
-            let child_path = crate::daemon::ssh::sftp::remote_join(path, &child.name);
-            remove_remote_tree(route, &child_path, child.kind, depth + 1);
-        }
-    }
-    route.op(SftpOp::RemoveDir {
-        path: path.to_string(),
-    });
-}
-
-/// One local path handed to the remote: where it went and the transfer
-/// carrying it, or why it never left.
-struct PasteUpload {
-    local: std::path::PathBuf,
-    started: Result<StartedUpload, String>,
-}
-
-struct StartedUpload {
-    remote: String,
-    job: u64,
-    is_dir: bool,
-}
-
-/// Start uploading `sources` into a new directory of their own under the
-/// staging directory `dir`. Blocking, like everything that talks to the
-/// daemon, so this runs off the UI thread. `Err` means the paste's directory
-/// could not be made and nothing was started; a source that could not be
-/// started on its own is reported in its own entry.
-fn start_paste_uploads(
-    route: &crate::ui::sftp::SftpRoute,
-    pane_id: u64,
-    dir: &str,
-    sources: &[std::path::PathBuf],
-) -> Result<Vec<PasteUpload>, String> {
-    use crate::daemon::protocol::{SftpOp, SftpOpResult, SftpTransferKind, SftpTransferSpec};
-    let paste_dir = crate::daemon::ssh::sftp::remote_join(dir, &paste_dir_name());
-    if let SftpOpResult::Error(e) = route.op(SftpOp::Mkdir {
-        path: paste_dir.clone(),
-    }) {
-        return Err(e);
-    }
-    Ok(sources
-        .iter()
-        .map(|local| {
-            let started = (|| {
-                let name = local
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .filter(|n| crate::daemon::ssh::sftp::safe_local_name(n))
-                    .ok_or_else(|| format!("{} has no file name", local.display()))?;
-                let is_dir = std::fs::metadata(local)
-                    .map_err(|e| format!("{}: {e}", local.display()))?
-                    .is_dir();
-                let remote = crate::daemon::ssh::sftp::remote_join(&paste_dir, &name);
-                let job = route.transfer_start(SftpTransferSpec {
-                    pane_id,
-                    kind: SftpTransferKind::Upload,
-                    local: local.clone(),
-                    remote: remote.clone(),
-                    recursive: is_dir,
-                })?;
-                Ok(StartedUpload {
-                    remote,
-                    job,
-                    is_dir,
-                })
-            })();
-            PasteUpload {
-                local: local.clone(),
-                started,
-            }
-        })
-        .collect())
-}
-
-/// Whether a prepared staging directory may be uploaded into.
-///
-/// The mode is what a `stat` reported *after* a `chmod 0700` the daemon
-/// watched succeed, which is the ownership proof: POSIX only lets a file's
-/// owner change its mode, so a directory tty7 can chmod and then observe at
-/// exactly `0700` is one the SSH user owns and nobody else can enter. A
-/// symlink is refused outright because `stat` follows links, so a link planted
-/// at the staging path would otherwise be judged by its target.
-fn staging_dir_is_safe(
-    is_symlink: bool,
-    kind: Option<crate::daemon::protocol::SftpEntryKind>,
-    mode: u32,
-) -> bool {
-    use crate::daemon::protocol::SftpEntryKind;
-    !is_symlink
-        && matches!(kind, Some(SftpEntryKind::Dir))
-        && mode & 0o7777 == REMOTE_CLIPBOARD_MODE
-}
-
-/// The staging directory to reuse on the next paste. Only a verified directory
-/// is cached: a preparation that failed — a dropped link, a squatted path, a
-/// remote with no POSIX `/home` — must be retried rather than latched, or
-/// every later paste emits a remote path for a directory that was never
-/// created.
-fn staging_cache(prepared: &Result<String, String>) -> Option<String> {
-    prepared.as_ref().ok().cloned()
-}
-
-/// Create and verify the per-user staging directory, answering the absolute
-/// remote path to upload into. Blocking: every step is a daemon round trip
-/// over the pane's SSH connection, so this only ever runs off the UI thread.
-fn prepare_remote_clipboard_dir(route: &crate::ui::sftp::SftpRoute) -> Result<String, String> {
-    use crate::daemon::protocol::{SftpOp, SftpOpResult};
-    let home = match route.op(SftpOp::Realpath {
-        path: ".".to_string(),
-    }) {
-        SftpOpResult::Link(home) if home.starts_with('/') => home,
-        SftpOpResult::Error(e) => return Err(e),
-        other => {
-            return Err(format!(
-                "the remote home directory is not a path: {other:?}"
-            ));
-        }
-    };
-    let mut dir = home;
-    for component in REMOTE_CLIPBOARD_PATH {
-        dir = crate::daemon::ssh::sftp::remote_join(&dir, component);
-        // An existing directory fails here with EEXIST; the checks below are
-        // what decide whether this one is ours, so the result carries no
-        // information worth branching on.
-        let _ = route.op(SftpOp::Mkdir { path: dir.clone() });
-    }
-    if let SftpOpResult::Link(target) = route.op(SftpOp::Readlink { path: dir.clone() }) {
-        return Err(format!("{dir} is a symlink to {target}"));
-    }
-    if let SftpOpResult::Error(e) = route.op(SftpOp::Chmod {
-        path: dir.clone(),
-        mode: REMOTE_CLIPBOARD_MODE,
-    }) {
-        return Err(format!("{dir} is not owned by this session: {e}"));
-    }
-    match route.op(SftpOp::Stat { path: dir.clone() }) {
-        SftpOpResult::Stat(entry)
-            if staging_dir_is_safe(false, Some(entry.kind), entry.permissions) =>
-        {
-            Ok(dir)
-        }
-        SftpOpResult::Stat(entry) => Err(format!(
-            "{dir} is not a private directory (mode {:o})",
-            entry.permissions & 0o7777
-        )),
-        SftpOpResult::Error(e) => Err(e),
-        other => Err(format!("unexpected reply for {dir}: {other:?}")),
-    }
 }
 
 fn transcode_to_png(bytes: &[u8], format: gpui::ImageFormat) -> Option<Vec<u8>> {
@@ -1655,6 +1386,10 @@ fn apply_fallback_chain(
 }
 
 impl TerminalView {
+    pub(crate) fn kill_pane(pane_id: u64) {
+        RemoteTerminal::kill_pane(pane_id);
+    }
+
     pub fn spawn_shell_terminal_in(
         workspace: Option<crate::terminal::PaneWorkspace>,
         working_directory: Option<std::path::PathBuf>,
@@ -1745,53 +1480,6 @@ impl TerminalView {
         view.owner_workspace = parts.owner;
         view.restored = parts.restored;
         view.set_workspace(parts.workspace);
-        view
-    }
-
-    pub(crate) fn restored(&self) -> bool {
-        self.restored
-    }
-
-    pub fn owner_workspace(&self) -> Option<crate::core::session::WorkspaceId> {
-        self.owner_workspace
-    }
-
-    /// Dials `spec` through the local daemon. `remote_start_dir` is a
-    /// directory on the far host — see [`ClientMsg::SpawnNativeSsh`]'s `cwd`
-    /// — and never a local one.
-    ///
-    /// [`ClientMsg::SpawnNativeSsh`]: crate::daemon::protocol::ClientMsg::SpawnNativeSsh
-    pub fn spawn_native_ssh_terminal(
-        spec: Box<crate::daemon::protocol::NativeSshSpec>,
-        remote_start_dir: Option<std::path::PathBuf>,
-    ) -> anyhow::Result<NativeSshParts> {
-        let persist = Box::new(spec.without_secrets());
-        let (terminal, pane_id) =
-            RemoteTerminal::spawn_native_ssh(TermSize::new(80, 24), 8, 17, remote_start_dir, spec)?;
-        Ok(NativeSshParts {
-            terminal,
-            pane_id,
-            persist,
-        })
-    }
-
-    pub fn from_native_ssh_parts(
-        parts: NativeSshParts,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Self {
-        let mut view = Self::with_terminal(parts.terminal, parts.pane_id, window, cx);
-        if let Some(name) = parts
-            .persist
-            .display_name
-            .as_deref()
-            .map(str::trim)
-            .filter(|n| !n.is_empty())
-        {
-            view.default_title = name.to_string();
-            view.title = name.to_string();
-        }
-        view.ssh_spec = Some(parts.persist);
         view
     }
 
@@ -1963,7 +1651,6 @@ impl TerminalView {
             owner_workspace: None,
             restored: false,
             ssh_spec: None,
-            remote_clipboard_dir: None,
             remote_clipboard_write_in_flight: None,
             remote_clipboard_write_generation: 0,
             focus_handle,
@@ -2174,25 +1861,6 @@ impl TerminalView {
         self.remote_context().is_none() && self.host_id.is_local()
     }
 
-    /// The directory a `~` in this pane's paths stands for, for anything that
-    /// draws one of them shortened.
-    ///
-    /// The pane's own host answers, never this machine on its behalf (#580).
-    /// A shell that has ssh'd somewhere gets no answer at all: the paths it
-    /// reports are on a third machine tty7 has no link to, and neither this
-    /// laptop's home nor the pane host's describes it — the same reason #568
-    /// stopped resolving file links in those panes.
-    pub fn display_home(&self, cx: &gpui::App) -> Option<std::path::PathBuf> {
-        match self.remote_context().is_some() {
-            true => None,
-            false => crate::ui::path_display::home_for_host(cx, self.host_id),
-        }
-    }
-
-    pub fn spawnable_cwd(&self) -> Option<std::path::PathBuf> {
-        self.remote_context().is_none().then(|| self.cwd())?
-    }
-
     pub fn host(&self, cx: &gpui::App) -> Option<crate::ui::host_ops::SharedHost> {
         crate::ui::host_registry::HostRegistry::lookup(cx, self.host_id)
     }
@@ -2225,26 +1893,17 @@ impl TerminalView {
         crate::terminal::PaneRoute::for_workspace(self.workspace.as_ref())
     }
 
-    fn accepts_input(&self, cx: &gpui::App) -> bool {
-        // A local pane has no `PaneWorkspace`, but the window that owns it can
-        // still have been taken over by a remote client.
-        let Some(ws) = self
-            .workspace()
-            .map(|w| w.workspace)
-            .or(self.owner_workspace)
-        else {
-            return true;
-        };
-        crate::ui::remote_workspace::workspace_accepts_input(cx, ws)
-    }
-
-    pub fn relink_plan(&self) -> (u64, TermSize, u16, u16) {
-        (
-            self.pane_id,
-            self.terminal.size(),
-            self.cell_width.as_f32().round() as u16,
-            self.line_height.as_f32().round() as u16,
-        )
+    fn accepts_input(&self, _cx: &gpui::App) -> bool {
+        // The workbench link supervisor is gone. A pane bound to a remote
+        // workspace has nobody to attach it, so it stays read-only; a local
+        // pane types as it always did.
+        !self.workspace.as_ref().is_some_and(|workspace| {
+            workspace.target.is_ssh()
+                || matches!(
+                    workspace.target,
+                    crate::core::session::RemoteTarget::Wsl { .. }
+                )
+        })
     }
 
     pub fn adopt_relink(
@@ -2267,11 +1926,6 @@ impl TerminalView {
         self.title = self.default_title.clone();
         cx.notify();
         Ok(())
-    }
-
-    pub fn detach_link(&mut self, cx: &mut Context<Self>) {
-        self.terminal.detach_link();
-        cx.notify();
     }
 
     pub fn host_cwd(&self) -> Option<std::path::PathBuf> {
@@ -2335,12 +1989,6 @@ impl TerminalView {
         self.agent_result_unread
     }
 
-    pub fn mark_agent_result_unread(&mut self, refocus_incoming: bool, cx: &mut App) {
-        self.agent_result_unread = true;
-        self.keep_unread_on_focus = refocus_incoming;
-        self.note_agent_result_unread(cx);
-    }
-
     /// Leave what the reader has seen of this pane's agent where the pane's
     /// next view will look for it — see [`AgentReadMarks`]. A mark left at any
     /// status other than `Done` never vouches for a finished turn, but it still
@@ -2369,39 +2017,8 @@ impl TerminalView {
         }
     }
 
-    pub fn git_status(&self, cx: &App) -> Option<crate::terminal::git_status::GitStatus> {
-        let cwd = self.git_status_cwd.as_ref()?;
-        cx.try_global::<crate::terminal::git_status::GitStatusCache>()?
-            .status_for(self.host_id, cwd)
-    }
-
-    pub fn git_status_cwd(&self) -> Option<&std::path::Path> {
-        self.git_status_cwd.as_deref()
-    }
-
-    /// Retry unknown and negative repo answers. A transient discovery failure
-    /// must not leave an idle pane in Ungrouped until it moves or restarts.
-    ///
-    /// Read-only on purpose: this runs on every poll tick, and the cache is a
-    /// global whose every mutable touch redraws the window — while a probe is
-    /// in flight or throttled, the answer has to be "no" at no cost.
-    fn git_retry_due(&self, cx: &App) -> bool {
-        let Some(cwd) = self.git_status_cwd.as_deref() else {
-            return false;
-        };
-        let Some(cache) = cx.try_global::<crate::terminal::git_status::GitStatusCache>() else {
-            return false;
-        };
-        cache.retry_due(self.host_id, cwd, GIT_RETRY_GAP)
-    }
-
-    /// Plant the cwd the git-status poll would have found. For tests that
-    /// need a pane to look like it is sitting somewhere known — a real poll
-    /// needs a live shell reporting a directory, which a quiet test pane has
-    /// no way to do.
-    #[cfg(test)]
-    pub(crate) fn set_git_status_cwd_for_test(&mut self, cwd: Option<std::path::PathBuf>) {
-        self.git_status_cwd = cwd;
+    fn git_retry_due(&self, _cx: &App) -> bool {
+        false
     }
 
     /// The directory this pane's *work* is happening in — what every panel
@@ -2448,34 +2065,6 @@ impl TerminalView {
         files_cwd(self.effective_host_cwd(), distro.as_deref(), cwd)
     }
 
-    pub fn refresh_git_status_now(&mut self, cx: &mut Context<Self>) {
-        let cwd = self.git_status_cwd.clone();
-        if cwd.is_some() {
-            self.refresh_git_status(cwd, GitRefresh::Opportunistic, cx);
-        }
-    }
-
-    pub fn selection_text(&self) -> Option<String> {
-        self.terminal
-            .term
-            .lock()
-            .selection_to_string()
-            .filter(|t| !t.trim().is_empty())
-    }
-
-    pub fn send_agent_prompt(&self, prompt: &str) {
-        self.terminal
-            .write(crate::core::agent_prompt::submit_bytes(prompt));
-    }
-
-    pub fn run_command_line(&self, cmd: &str) {
-        self.terminal.write(format!("{cmd}\r").into_bytes());
-    }
-
-    pub fn shell_spec(&self) -> Option<ShellSpec> {
-        self.shell_spec.clone()
-    }
-
     /// The shell binary this pane is running, for the path-quoting rules.
     ///
     /// `None` before the pane has resolved one, which [`quote_for_shell`]
@@ -2484,18 +2073,6 @@ impl TerminalView {
     /// reported in yet.
     pub(super) fn shell_program(&self) -> Option<String> {
         self.shell_spec.as_ref().map(|s| s.program.clone())
-    }
-
-    pub fn ssh_spec(&self) -> Option<Box<crate::daemon::protocol::NativeSshSpec>> {
-        self.ssh_spec.clone()
-    }
-
-    pub fn ssh_phase(&self) -> Option<crate::daemon::protocol::SshPhase> {
-        self.terminal.ssh_phase()
-    }
-
-    pub fn ssh_disconnected(&self) -> bool {
-        self.ssh_spec.is_some() && self.terminal.exited
     }
 
     /// Whether this pane is a workspace pane whose link died under it — the
@@ -3765,15 +3342,6 @@ impl TerminalView {
         false
     }
 
-    pub fn find_step(&mut self, forward: bool, cx: &mut Context<Self>) {
-        let direction = if forward {
-            Direction::Right
-        } else {
-            Direction::Left
-        };
-        self.step_match(direction, cx);
-    }
-
     pub fn undo_edit(&mut self, redo: bool, cx: &mut Context<Self>) {
         if !self.input_active() {
             return;
@@ -3827,17 +3395,6 @@ impl TerminalView {
 
     pub(super) fn drop_files(&mut self, paths: &ExternalPaths, cx: &mut Context<Self>) {
         self.paste_local_paths(paths.paths().to_vec(), cx);
-    }
-
-    /// A row dragged out of a remote Files tree names a file on that remote,
-    /// not here: there is nothing to upload, and the path is pasted as the
-    /// tree spells it.
-    pub(super) fn drop_remote_path(
-        &mut self,
-        drag: &crate::ui::file_tree::RemotePathDrag,
-        cx: &mut Context<Self>,
-    ) {
-        self.paste_paths(vec![drag.path.to_string_lossy().into_owned()], cx);
     }
 
     /// Paste paths already spelled the way the pane's host reads them: into
@@ -3921,219 +3478,12 @@ impl TerminalView {
         true
     }
 
-    /// Upload local files to the pane's remote host and paste their remote
-    /// paths, all off the UI thread. Answers whether this pane took the paste
-    /// over; `false` means a local, WSL, or spec-less pane the caller should
-    /// paste the local paths for.
-    ///
-    /// The paste lands as soon as the transfers start — Ctrl+V must not stall
-    /// on the wire — and each file appears at its path only once it is whole,
-    /// since the upload writes a temporary name and renames it into place. The
-    /// transfers are watched to the end, and a failure warns the user that the
-    /// path they were handed is dangling.
     fn upload_for_remote(
         &mut self,
-        sources: Vec<std::path::PathBuf>,
-        cx: &mut Context<Self>,
+        _sources: Vec<std::path::PathBuf>,
+        _cx: &mut Context<Self>,
     ) -> bool {
-        let Some(spec) = remote_paste_spec(self.workspace.as_ref(), self.ssh_spec.as_deref())
-        else {
-            return false;
-        };
-        let host = format!("{}@{}", spec.user, spec.host);
-        let route = crate::ui::sftp::SftpRoute::new(self.pane_id, self.workspace.clone());
-        let cached = self.remote_clipboard_dir.clone();
-        let pane_id = self.pane_id;
-        cx.spawn(async move |this, cx| {
-            let prepared = match cached {
-                Some(dir) => Ok(dir),
-                None => {
-                    let route = route.clone();
-                    cx.background_spawn(async move {
-                        let prepared = prepare_remote_clipboard_dir(&route);
-                        // Only on the pane's first paste, which is the only
-                        // time the directory is prepared: one listing, cheap
-                        // next to the upload that follows it.
-                        if let Ok(dir) = &prepared {
-                            prune_remote_clipboard_dir(&route, dir);
-                        }
-                        prepared
-                    })
-                    .await
-                }
-            };
-            let dir = match this.update(cx, |view, _| {
-                view.remote_clipboard_dir = staging_cache(&prepared);
-                view.remote_clipboard_dir.clone()
-            }) {
-                Ok(Some(dir)) => dir,
-                Ok(None) => {
-                    let reason = prepared.unwrap_or_else(|e| e);
-                    Self::paste_local_fallback(&this, cx, &sources, &host, &reason);
-                    return;
-                }
-                Err(_) => return,
-            };
-            let started = {
-                let (route, sources) = (route.clone(), sources.clone());
-                cx.background_spawn(
-                    async move { start_paste_uploads(&route, pane_id, &dir, &sources) },
-                )
-                .await
-            };
-            let uploads = match started {
-                Ok(uploads) => uploads,
-                Err(reason) => {
-                    Self::paste_local_fallback(&this, cx, &sources, &host, &reason);
-                    return;
-                }
-            };
-            // A source that never left is pasted by its local path, so the
-            // line still says which file was meant.
-            let spelled: Vec<String> = uploads
-                .iter()
-                .map(|u| match &u.started {
-                    Ok(s) => s.remote.clone(),
-                    Err(_) => u.local.to_string_lossy().into_owned(),
-                })
-                .collect();
-            let pasted = this.update_in(cx, |view, window, cx| {
-                view.paste_paths(spelled, cx);
-                for u in &uploads {
-                    if let Err(reason) = &u.started {
-                        view.warn_paste_upload_failed(&u.local, &host, reason, window, cx);
-                    }
-                }
-            });
-            if pasted.is_err() {
-                return;
-            }
-            for u in uploads {
-                let Ok(started) = u.started else { continue };
-                if let Err(reason) = Self::watch_upload(route.clone(), &started, cx).await {
-                    let _ = this.update_in(cx, |view, window, cx| {
-                        view.warn_paste_upload_failed(&u.local, &host, &reason, window, cx);
-                    });
-                }
-            }
-        })
-        .detach();
-        true
-    }
-
-    /// Fall back to the local paths when nothing could be staged on the remote
-    /// — the paste is never dropped — and say why they are local.
-    fn paste_local_fallback(
-        this: &gpui::WeakEntity<Self>,
-        cx: &mut gpui::AsyncApp,
-        sources: &[std::path::PathBuf],
-        host: &str,
-        reason: &str,
-    ) {
-        let spelled: Vec<String> = sources
-            .iter()
-            .map(|p| p.to_string_lossy().into_owned())
-            .collect();
-        let _ = this.update_in(cx, |view, window, cx| {
-            view.paste_paths(spelled, cx);
-            if let Some(first) = sources.first() {
-                view.warn_paste_upload_failed(first, host, reason, window, cx);
-            }
-        });
-    }
-
-    /// Poll a started upload to a terminal state. The transfer history the
-    /// SFTP panel reads is only polled while that panel is open, and the
-    /// daemon drops finished jobs after 30s, so a paste that no one is
-    /// watching would otherwise fail in silence.
-    async fn watch_upload(
-        route: crate::ui::sftp::SftpRoute,
-        upload: &StartedUpload,
-        cx: &mut gpui::AsyncApp,
-    ) -> Result<(), String> {
-        use crate::daemon::protocol::{SftpJobState, SftpOp};
-        const POLL: std::time::Duration = std::time::Duration::from_millis(500);
-        // A pasted file can be any size, so there is no deadline on the whole
-        // transfer — only on one that has stopped moving, which is wedged
-        // rather than slow.
-        const STALLED_POLLS: usize = 600;
-        let mut last_done = 0;
-        let mut still = 0;
-        while still < STALLED_POLLS {
-            cx.background_executor().timer(POLL).await;
-            let listed = {
-                let route = route.clone();
-                cx.background_spawn(async move { route.transfer_list() })
-                    .await
-            };
-            // A poll that failed says nothing about the job — keep asking
-            // until it answers or the budget above runs out.
-            let Ok(listed) = listed else {
-                still += 1;
-                continue;
-            };
-            let Some(progress) = listed.into_iter().find(|j| j.job_id == upload.job) else {
-                // Pruned after the retention window, or the daemon restarted:
-                // there is nothing left to report either way.
-                return Ok(());
-            };
-            match progress.state {
-                SftpJobState::Running => {
-                    still = if progress.bytes_done == last_done {
-                        still + 1
-                    } else {
-                        0
-                    };
-                    last_done = progress.bytes_done;
-                }
-                SftpJobState::Done => {
-                    // The staging directory is already owner-only, so this is
-                    // belt and braces against a wider umask on the remote. A
-                    // folder is left as it was: its contents are behind the
-                    // same owner-only directory, and its own layout is the
-                    // user's.
-                    if !upload.is_dir {
-                        let (route, path) = (route.clone(), upload.remote.clone());
-                        cx.background_spawn(async move {
-                            route.op(SftpOp::Chmod { path, mode: 0o600 })
-                        })
-                        .await;
-                    }
-                    return Ok(());
-                }
-                SftpJobState::Cancelled => return Ok(()),
-                SftpJobState::Error => {
-                    return Err(progress.error.unwrap_or_else(|| "upload failed".into()));
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// One notification per failed file — the pane's line already has a path
-    /// in it, and the user is the only one who can tell whether it matters.
-    fn warn_paste_upload_failed(
-        &self,
-        local: &std::path::Path,
-        host: &str,
-        reason: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        log::warn!(
-            "pasted upload of {} to {host} failed: {reason}",
-            local.display()
-        );
-        let name = local
-            .file_name()
-            .map_or_else(|| local.to_string_lossy(), |n| n.to_string_lossy());
-        window.push_notification(
-            crate::ui::i18n::t_fmt(
-                crate::ui::i18n::L10nKey::SftpPasteUploadFailed,
-                &[("name", &name), ("host", host), ("error", reason)],
-            ),
-            cx,
-        );
+        false
     }
 
     /// Same shape as `warn_paste_upload_failed`: one toast per failed open, so
@@ -4343,9 +3693,6 @@ impl TerminalView {
             })
             .flatten();
         if cwd_now.as_ref() != self.git_status_cwd.as_ref() || cmd_finished || turn_finished {
-            if cmd_finished || turn_finished {
-                self.mark_repo_changed(cwd_now.as_deref(), cx);
-            }
             self.refresh_git_status(cwd_now, GitRefresh::Edge, cx);
         } else if tool_activity {
             self.refresh_git_status(cwd_now, GitRefresh::Opportunistic, cx);
@@ -4354,33 +3701,6 @@ impl TerminalView {
         }
 
         self.follow_history_scope(cx);
-    }
-
-    /// Tell the source control cache that a command just ran here.
-    ///
-    /// The `.git` watch catches anything that writes the repository, and the
-    /// file tree catches edits in the directories it is showing. What is left
-    /// is the common case neither sees: a command that edits a file somewhere
-    /// the tree is not looking. A command boundary is the cheapest honest
-    /// signal that that may have happened.
-    ///
-    /// Only the epoch moves. Scheduling the debounced re-read needs the app
-    /// entity, which a pane does not hold — but `refresh_git_status` below
-    /// writes `GitStatusCache`, the app observes that global, and the panel's
-    /// next render finds the repository stale and asks. One notify, not two.
-    fn mark_repo_changed(&self, cwd: Option<&std::path::Path>, cx: &mut Context<Self>) {
-        use crate::terminal::git_data::ScmData;
-        use crate::terminal::git_status::GitStatusCache;
-
-        let Some(cwd) = cwd else { return };
-        let Some(root) = cx
-            .try_global::<GitStatusCache>()
-            .and_then(|cache| cache.repo_root_for(self.host_id, cwd))
-            .map(std::path::Path::to_path_buf)
-        else {
-            return;
-        };
-        cx.default_global::<ScmData>().bump(self.host_id, &root);
     }
 
     fn desired_history_scope(&self) -> super::history::Scope {
@@ -4460,16 +3780,7 @@ impl TerminalView {
         cx.notify();
 
         self.history_seed_pending = false;
-        let fetch = match self.history_seed_fetch(cx) {
-            // The pane's connection is not up yet (still authenticating, most
-            // likely): load what tty7 recorded now, and fetch the far end's
-            // files once it is — see `seed_history_when_connected`.
-            HistorySeedFetch::Sftp(_) if !self.ssh_connected() => {
-                self.history_seed_pending = true;
-                HistorySeedFetch::None
-            }
-            fetch => fetch,
-        };
+        let fetch = self.history_seed_fetch(cx);
         self.spawn_history_load(scope, fetch, cx);
     }
 
@@ -4568,10 +3879,7 @@ impl TerminalView {
             HistorySeedSource::WorkspaceHost => {
                 HistorySeedFetch::Host(self.workspace_host_history_files(cx))
             }
-            HistorySeedSource::PaneSftp => HistorySeedFetch::Sftp(crate::ui::sftp::SftpRoute::new(
-                self.pane_id,
-                self.workspace.clone(),
-            )),
+            HistorySeedSource::PaneSftp => HistorySeedFetch::None,
         }
     }
 
@@ -4585,7 +3893,12 @@ impl TerminalView {
         if !host.is_connected() {
             return Vec::new();
         }
-        let Some(home) = crate::ui::remote_connect::HostLinks::home(cx, self.host_id) else {
+        let Some(home) = self
+            .host_id
+            .is_local()
+            .then(crate::ui::path_display::local_home)
+            .flatten()
+        else {
             return Vec::new();
         };
         super::history::shell_history_names()
@@ -4597,65 +3910,14 @@ impl TerminalView {
     fn refresh_git_status(
         &mut self,
         cwd: Option<std::path::PathBuf>,
-        trigger: GitRefresh,
+        _trigger: GitRefresh,
         cx: &mut Context<Self>,
     ) {
-        use crate::terminal::git_status::GitStatusCache;
-
         let changed = self.git_status_cwd != cwd;
-        self.git_status_cwd = cwd.clone();
-        let Some(cwd) = cwd else {
-            if changed {
-                cx.notify();
-            }
-            return;
-        };
-        let id = self.host_id;
-        let Some(host) = self.host(cx) else {
-            if changed {
-                cx.notify();
-            }
-            return;
-        };
-        if !host.is_connected() {
-            if changed {
-                cx.notify();
-            }
-            return;
+        self.git_status_cwd = cwd;
+        if changed {
+            cx.notify();
         }
-        cx.default_global::<GitStatusCache>();
-        let claimed = cx.update_global::<GitStatusCache, _>(|cache, _| match trigger {
-            GitRefresh::Edge => cache.begin_probe(id, &cwd),
-            GitRefresh::Opportunistic => {
-                cache.begin_probe_throttled(id, &cwd, OPPORTUNISTIC_GIT_GAP)
-            }
-            GitRefresh::Retry => cache.begin_probe_throttled(id, &cwd, GIT_RETRY_GAP),
-        });
-        if !claimed {
-            return;
-        }
-        let probe_cwd = cwd.clone();
-        let pane = cx.weak_entity();
-        crate::ui::host_ops::HostOps::run_detached(
-            host,
-            cx,
-            move |h| crate::terminal::git_status::probe_repo(h, &probe_cwd),
-            move |cx, result| {
-                use crate::terminal::git_status::RepoProbe;
-                let rerun = cx.update_global::<GitStatusCache, _>(|cache, _| match result {
-                    RepoProbe::Repo(snap) => cache.finish_probe(id, &cwd, Some(snap)),
-                    RepoProbe::NotARepo => cache.finish_probe(id, &cwd, None),
-                    RepoProbe::Failed => cache.fail_probe(id, &cwd),
-                });
-                if rerun {
-                    let _ = pane.update(cx, |view, cx| {
-                        if view.git_status_cwd.as_deref() == Some(&cwd) {
-                            view.refresh_git_status(Some(cwd), GitRefresh::Edge, cx);
-                        }
-                    });
-                }
-            },
-        );
     }
 
     /// Report an agent that has just started in this pane ([`AgentDetected`]),
@@ -5834,111 +5096,12 @@ impl TerminalView {
 
     fn spawn_remote_path_completion(
         &mut self,
-        line: &str,
-        cursor: usize,
-        forward: bool,
-        cx: &mut Context<Self>,
+        _line: &str,
+        _cursor: usize,
+        _forward: bool,
+        _cx: &mut Context<Self>,
     ) -> bool {
-        let Some(cwd) = self.remote_ssh_cwd() else {
-            return false;
-        };
-        let Some(req) = completion::remote_path_request(line, cursor, &cwd) else {
-            log::debug!(
-                target: "tty7::completion",
-                "no remote listing to ask for: {line:?} at {cursor} against {cwd}"
-            );
-            return false;
-        };
-        if self.remote_completion_inflight {
-            return true;
-        }
-        self.remote_completion_inflight = true;
-        // The listing takes a network round-trip the menu says nothing about
-        // — paint the "listing…" pill now, or a slow link reads as a broken
-        // Tab key (#585).
-        cx.notify();
-        let route = crate::ui::sftp::SftpRoute::new(self.pane_id, self.workspace.clone());
-        let dir = req.dir.clone();
-        let line = line.to_string();
-        log::debug!(target: "tty7::completion", "listing {dir} over the remote's own connection");
-        cx.spawn(async move |this, cx| {
-            let listed = cx.background_spawn(async move { route.list(&dir) }).await;
-            let (entries, failed) = match listed {
-                Ok(entries) => (entries, None),
-                Err(e) => {
-                    // A failure is not an empty directory: the two used to
-                    // end in the same silence (#585).
-                    log::warn!(
-                        target: "tty7::completion",
-                        "remote listing failed, treating it as no candidates: {e}"
-                    );
-                    (Vec::new(), Some(e.to_string()))
-                }
-            };
-            let _ = this.update(cx, |view, cx| {
-                view.remote_completion_inflight = false;
-                if let Some(error) = failed {
-                    view.remote_completion_notice = Some(t_fmt(
-                        L10nKey::CompletionRemoteListingFailed,
-                        &[("error", &error)],
-                    ));
-                }
-                view.remote_path_results(req, &line, cursor, entries, forward, cx);
-                // An empty listing closes the menu without one — the pill
-                // still has to come down.
-                cx.notify();
-            });
-        })
-        .detach();
-        true
-    }
-
-    fn remote_path_results(
-        &mut self,
-        req: completion::RemotePathRequest,
-        line: &str,
-        cursor: usize,
-        listed: Vec<crate::daemon::protocol::SftpEntry>,
-        forward: bool,
-        cx: &mut Context<Self>,
-    ) {
-        if let Some(reason) = self
-            .link_inactive_reason(cx)
-            .or_else(|| self.input_inactive_reason())
-        {
-            log::debug!(
-                target: "tty7::completion",
-                "dropping a remote listing for {line:?}: {reason}"
-            );
-            return;
-        }
-        if self.cmd.text() != line || self.cmd.cursor() != cursor {
-            log::debug!(
-                target: "tty7::completion",
-                "dropping a remote listing for {line:?}: the line has moved on"
-            );
-            return;
-        }
-        let entries: Vec<completion::RemoteEntry> = listed
-            .into_iter()
-            .map(|e| completion::RemoteEntry {
-                is_dir: e.kind == crate::daemon::protocol::SftpEntryKind::Dir || e.target_is_dir,
-                name: e.name,
-            })
-            .collect();
-        let cands = completion::remote_path_candidates(&req, &entries);
-        log::debug!(
-            target: "tty7::completion",
-            "{} entries in {}, {} match the word",
-            entries.len(),
-            req.dir,
-            cands.len()
-        );
-        if cands.is_empty() {
-            self.handoff_tab_to_shell(!forward, cx);
-            return;
-        }
-        self.offer_candidates(line, req.word_start, req.cursor, cands, 0, cx);
+        false
     }
 
     fn open_completion(&mut self, session: CompletionSession) -> u64 {
@@ -6381,7 +5544,7 @@ impl TerminalView {
     /// standing behind you has to work the same whether or not what is running
     /// asked for the wheel. Steps go out as the same actions the keyboard and
     /// the View menu send, so the min/max clamp and the saved setting live in
-    /// one place — [`Tty7App::change_font_size`](crate::ui::app::Tty7App).
+    /// one place — the window handles `IncreaseFontSize` and `DecreaseFontSize`.
     fn zoom_scroll(
         &mut self,
         ev: &ScrollWheelEvent,
@@ -6720,7 +5883,7 @@ impl TerminalView {
         path: std::path::PathBuf,
         line: Option<u32>,
         column: Option<u32>,
-        is_dir: bool,
+        _is_dir: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -6729,10 +5892,7 @@ impl TerminalView {
         let command = cfg.link_file_command.clone();
         // A path that was just resolved on another machine means nothing to a
         // local opener: `open` and a user's `code --goto` would both be handed
-        // a path this filesystem never had, throwing away the one thing that
-        // made the link right and silently showing this machine's copy when
-        // one happens to exist. The editor is the only one that can reach the
-        // file, so it takes the click whatever the setting says.
+        // a path this filesystem never had.
         let mode = match self.host_id.is_local() {
             true => mode,
             false => LinkFileOpen::Internal,
@@ -6740,22 +5900,20 @@ impl TerminalView {
         // Both external arms have to answer for a failed spawn (#542): a
         // misspelled `link_file_command` or a missing opener used to hit only
         // the log, and the link read as dead — while the path was only ever
-        // underlined because it verifiably exists. The built-in editor has
-        // its own error path downstream of OpenFileRequested.
+        // underlined because it verifiably exists.
         let outcome = match (mode, command) {
             (LinkFileOpen::Command, Some(template)) => {
                 run_file_command(&template, &path, line, column)
             }
             (LinkFileOpen::System, _) => open_file_path(&path),
-            // Told to run a command, with no command left to run: falling back
-            // to the built-in editor beats the click doing nothing.
+            // No in-window editor. A local path opens with the system; a path
+            // on another machine has nothing here that can show it.
+            (LinkFileOpen::Internal | LinkFileOpen::Command, _) if self.host_id.is_local() => {
+                open_file_path(&path)
+            }
             (LinkFileOpen::Internal | LinkFileOpen::Command, _) => {
-                cx.emit(OpenFileRequested {
-                    path,
-                    line,
-                    column,
-                    is_dir,
-                });
+                let shown = path.display().to_string();
+                window.push_notification(t_fmt(L10nKey::LinkFileMissing, &[("path", &shown)]), cx);
                 return;
             }
         };
@@ -6811,54 +5969,8 @@ impl TerminalView {
         true
     }
 
-    fn open_url(&self, url: &str, window: &mut Window, cx: &mut Context<Self>) {
-        match self.forwarded_loopback_url(url, cx) {
-            LoopbackOpen::Forwarded(url) => cx.open_url(&url),
-            LoopbackOpen::NotLoopback => cx.open_url(url),
-            LoopbackOpen::ForwardFailed(reason) => {
-                window.push_notification(reason, cx);
-            }
-        }
-    }
-
-    fn forwarded_loopback_url(&self, url: &str, cx: &mut Context<Self>) -> LoopbackOpen {
-        let plan = self.loopback_plan(cx);
-        if matches!(plan, LoopbackPlan::Direct) {
-            return LoopbackOpen::NotLoopback;
-        }
-        let Some(loopback) = super::loopback::parse_loopback_url(url) else {
-            return LoopbackOpen::NotLoopback;
-        };
-        if matches!(plan, LoopbackPlan::NoForwardNeeded) {
-            return LoopbackOpen::NotLoopback;
-        }
-
-        let forwarded = match &plan {
-            LoopbackPlan::ForwardOnPane(_) | LoopbackPlan::ForwardOnWorkspace(_) => self
-                .forward_route()
-                .ensure_loopback(loopback.forward_host(), loopback.port),
-            LoopbackPlan::Direct | LoopbackPlan::NoForwardNeeded => unreachable!("handled above"),
-        };
-        match forwarded {
-            Ok(forward) => LoopbackOpen::Forwarded(loopback.forwarded_url(forward.local_port)),
-            Err(e) => {
-                log::warn!("failed to forward loopback URL {url}: {e}");
-                LoopbackOpen::ForwardFailed(t_fmt(
-                    L10nKey::LoopbackForwardFailed,
-                    &[
-                        ("port", &loopback.port.to_string()),
-                        ("error", &e.to_string()),
-                    ],
-                ))
-            }
-        }
-    }
-
-    /// How forward requests about this pane reach the daemon that owns them —
-    /// through the workspace when there is one, and by pane id when there is
-    /// not. The Ports list and the port watcher build the same thing.
-    pub(crate) fn forward_route(&self) -> crate::ui::app::ForwardRoute {
-        crate::ui::app::ForwardRoute::new(self.pane_id, self.workspace.clone())
+    fn open_url(&self, url: &str, _window: &mut Window, cx: &mut Context<Self>) {
+        cx.open_url(url);
     }
 
     fn loopback_plan(&self, cx: &gpui::App) -> LoopbackPlan {
@@ -6872,17 +5984,6 @@ impl TerminalView {
 
     fn can_forward_loopback(&self, cx: &gpui::App) -> bool {
         !matches!(self.loopback_plan(cx), LoopbackPlan::Direct)
-    }
-
-    /// How a loopback port this pane is serving can be reached from here.
-    ///
-    /// The Ports list asks this about every listener it found, and it is a
-    /// different question from "is this pane local": a remote pane's :3000 is
-    /// perfectly reachable once a forward exists, and building that forward is
-    /// something this app already knows how to do. Answering only "local or
-    /// not" is what left the list showing a port it refused to open.
-    pub(crate) fn port_route(&self, cx: &gpui::App) -> PortRoute {
-        port_route_of(&self.loopback_plan(cx), self.host_id().is_local())
     }
 
     pub fn hover_link_at(
@@ -7143,20 +6244,6 @@ impl TerminalView {
                 .as_ref()
                 .is_some_and(|(asked_for, _)| asked_for == cwd)
         {
-            return;
-        }
-        // The git-status probe asks this same question about this same
-        // directory on its own schedule and files the answer per host, so a
-        // hit there costs nothing and saves a round trip. Only a hit: the
-        // cache cannot tell "asked, and there is no repository" apart from
-        // "never asked", and treating the second as the first would nail a
-        // pane to one root forever.
-        let cached = cx
-            .try_global::<crate::terminal::git_status::GitStatusCache>()
-            .and_then(|cache| cache.repo_root_for(self.host_id, cwd))
-            .map(std::path::Path::to_path_buf);
-        if let Some(root) = cached {
-            self.link_repo_root = Some((cwd.to_path_buf(), Some(root)));
             return;
         }
         let Some(host) = self.host(cx) else {
@@ -7951,15 +7038,6 @@ impl Render for TerminalView {
                 window.focus(&this.focus_handle, cx);
                 this.drop_files(paths, cx);
             }))
-            .drag_over::<crate::ui::file_tree::RemotePathDrag>(|s, _, _, cx| {
-                s.bg(cx.theme().drag_border.opacity(0.12))
-            })
-            .on_drop(cx.listener(
-                |this, drag: &crate::ui::file_tree::RemotePathDrag, window, cx| {
-                    window.focus(&this.focus_handle, cx);
-                    this.drop_remote_path(drag, cx);
-                },
-            ))
             .on_action(cx.listener(|this, _: &CopyText, _w, cx| {
                 this.copy_contextual(false, false, cx);
             }))
@@ -8041,7 +7119,7 @@ impl Render for TerminalView {
             .children(integration_notice)
             .children(remote_completion_notice)
             .children(composer_over)
-            .context_menu(move |menu, window, cx| {
+            .context_menu(move |menu, _window, cx| {
                 // Suppressing the popup means handing back an item-less menu:
                 // gpui-component's `ContextMenu` element skips rendering the
                 // anchored overlay entirely when the built menu `is_empty()`,
@@ -8090,8 +7168,7 @@ impl Render for TerminalView {
                     }
                     None => menu,
                 };
-                let menu = menu
-                    .min_w(px(240.))
+                menu.min_w(px(240.))
                     .action_context(menu_focus.clone())
                     .menu_element_with_disabled(
                         Box::new(CopyText),
@@ -8115,75 +7192,10 @@ impl Render for TerminalView {
                     .menu(t(L10nKey::AppMenuFind), Box::new(FindInTerminal))
                     // Inside the terminal, what gets cleared goes without
                     // saying; the menu bar keeps the full "Clear Scrollback".
-                    .menu(t(L10nKey::TerminalContextClear), Box::new(ClearScrollback));
-
-                // `fork_label` is tty7-core's capability probe, and core has no
-                // locale table — take the answer, not its English wording.
-                let can_fork = view.agent().and_then(|a| a.fork_label()).is_some();
-                let fork_ready = can_fork
-                    && view.remote_context().is_none()
-                    && view.agent_session().is_some_and(|s| s.session_id.is_some());
-                // `None` over a pane with no agent; otherwise whether it knows
-                // the command line it was started with.
-                let launch_argv_known = view.agent().map(|_| {
-                    view.agent_session()
-                        .is_some_and(|s| s.launch_argv.is_some())
-                });
-
-                let menu = match (can_fork, fork_ready) {
-                    (true, true) => {
-                        let focus = menu_focus.clone();
-                        menu.separator().submenu(
-                            t(L10nKey::AppMenuForkSession),
-                            window,
-                            cx,
-                            move |submenu, _window, _cx| {
-                                submenu
-                                    .action_context(focus.clone())
-                                    .menu(
-                                        t(L10nKey::AppMenuSplitRight),
-                                        Box::new(ForkAgentSessionRight),
-                                    )
-                                    .menu(
-                                        t(L10nKey::AppMenuSplitLeft),
-                                        Box::new(ForkAgentSessionLeft),
-                                    )
-                                    .menu(
-                                        t(L10nKey::AppMenuSplitDown),
-                                        Box::new(ForkAgentSessionDown),
-                                    )
-                                    .menu(t(L10nKey::AppMenuSplitUp), Box::new(ForkAgentSessionUp))
-                            },
-                        )
-                    }
-                    (true, false) => menu
-                        .separator()
-                        .item(PopupMenuItem::new(t(L10nKey::AppMenuForkSession)).disabled(true)),
-                    (false, _) => menu,
-                };
-
-                // Only over a running agent, and only live when the pane knows
-                // the command line it was started with — there is nothing to
-                // save otherwise. Beside Fork when both are there.
-                let menu = match launch_argv_known {
-                    Some(known) => {
-                        let menu = if can_fork { menu } else { menu.separator() };
-                        menu.menu_with_disabled(
-                            t(L10nKey::AppMenuSaveAgentLaunchArgs),
-                            Box::new(SaveAgentLaunchArgs),
-                            !known,
-                        )
-                    }
-                    None => menu,
-                };
-
-                menu.separator()
-                    .menu(t(L10nKey::AppMenuSplitRight), Box::new(SplitRight))
-                    .menu(t(L10nKey::AppMenuSplitDown), Box::new(SplitDown))
-                    .menu(t(L10nKey::AppMenuZoomPane), Box::new(ToggleMaximizePane))
+                    .menu(t(L10nKey::TerminalContextClear), Box::new(ClearScrollback))
                     .separator()
-                    .menu(t(L10nKey::AppMenuNewTab), Box::new(NewTab))
-                    .menu(t(L10nKey::AppMenuClosePaneTab), Box::new(CloseActiveTab))
+                    .menu(t(L10nKey::CmdNewWindow), Box::new(NewWindow))
+                    .menu(t(L10nKey::CmdCloseWindow), Box::new(CloseWindow))
             })
     }
 }
@@ -8985,8 +7997,8 @@ mod tests {
         use super::stated_title;
 
         // Nothing has spoken — this is the pane a directory stands in for.
-        assert_eq!(stated_title("tty7"), None);
-        assert_eq!(stated_title("  tty7  "), None);
+        assert_eq!(stated_title("ntty7"), None);
+        assert_eq!(stated_title("  ntty7  "), None);
         assert_eq!(stated_title("   "), None);
 
         // A title from the program running in it.
@@ -8998,8 +8010,8 @@ mod tests {
         assert_eq!(stated_title("prod-web"), Some("prod-web"));
         // So does the state a finished pane is left showing.
         assert_eq!(
-            stated_title("tty7 — process exited"),
-            Some("tty7 — process exited")
+            stated_title("ntty7 — process exited"),
+            Some("ntty7 — process exited")
         );
     }
 
@@ -9212,7 +8224,7 @@ mod tests {
             compose_notification_title(Some("Claude".into()), None, None),
             "Claude"
         );
-        assert_eq!(compose_notification_title(None, None, None), "tty7");
+        assert_eq!(compose_notification_title(None, None, None), "ntty7");
     }
 
     #[test]
@@ -11135,52 +10147,6 @@ pub(crate) fn quiet_reattached_test_pane(
     (view, daemon_side)
 }
 
-/// A quiet pane that was dialled by hand, with no saved host behind it.
-///
-/// Ungated on purpose: the transport this hands back is already
-/// platform-neutral, and gating it left every test that wanted an SSH pane
-/// silently skipped on Windows.
-#[cfg(test)]
-pub(crate) fn quiet_test_ssh_pane(
-    pane_id: u64,
-    window: &mut Window,
-    cx: &mut gpui::App,
-) -> (gpui::Entity<TerminalView>, crate::daemon::transport::Stream) {
-    quiet_test_ssh_pane_of(pane_id, None, window, cx)
-}
-
-/// The same, for a pane opened from a saved host — `profile_id` is what tells
-/// the two apart everywhere the connection is offered back to the user.
-#[cfg(test)]
-pub(crate) fn quiet_test_ssh_pane_of(
-    pane_id: u64,
-    profile_id: Option<uuid::Uuid>,
-    window: &mut Window,
-    cx: &mut gpui::App,
-) -> (gpui::Entity<TerminalView>, crate::daemon::transport::Stream) {
-    let mut spec: crate::daemon::protocol::NativeSshSpec =
-        serde_json::from_str(r#"{"host":"build-box","port":22,"user":"me","auth_mode":"auto"}"#)
-            .expect("a minimal NativeSshSpec decodes");
-    spec.profile_id = profile_id.map(|id| id.to_string());
-    quiet_test_ssh_pane_with(pane_id, spec, window, cx)
-}
-
-/// The same again, over a spec the caller shaped — for everything a live
-/// connection carries beyond its address.
-#[cfg(test)]
-pub(crate) fn quiet_test_ssh_pane_with(
-    pane_id: u64,
-    spec: crate::daemon::protocol::NativeSshSpec,
-    window: &mut Window,
-    cx: &mut gpui::App,
-) -> (gpui::Entity<TerminalView>, crate::daemon::transport::Stream) {
-    let (view, stream) = quiet_test_pane(pane_id, window, cx);
-    view.update(cx, |view, _| {
-        view.ssh_spec = Some(Box::new(spec));
-    });
-    (view, stream)
-}
-
 #[cfg(test)]
 mod gpui_tests {
     use super::*;
@@ -12674,7 +11640,7 @@ mod gpui_tests {
         let (window, _daemon) = harness(cx);
         window
             .update(cx, |view, _, cx| {
-                assert_eq!(view.title, "tty7");
+                assert_eq!(view.title, "ntty7");
                 view.handle_event(AlacEvent::Title("vim — main.rs".into()), cx);
             })
             .unwrap();
@@ -12687,7 +11653,7 @@ mod gpui_tests {
             .unwrap();
         settle(cx);
         window
-            .update(cx, |view, _, _| assert_eq!(view.title, "tty7"))
+            .update(cx, |view, _, _| assert_eq!(view.title, "ntty7"))
             .unwrap();
     }
 
@@ -13541,45 +12507,6 @@ mod gpui_tests {
             next_input_until_timeout(&mut daemon),
             None,
             "the fresh line must not keep going raw to the shell"
-        );
-    }
-
-    #[gpui::test]
-    fn a_late_remote_listing_leaves_a_line_the_editor_no_longer_owns_alone(
-        cx: &mut TestAppContext,
-    ) {
-        crate::core::config::pin_test_config_dir();
-        let (window, mut daemon) = harness(cx);
-        DaemonMsg::Prompt {
-            active: true,
-            at_prompt: true,
-            last_exit: None,
-        }
-        .encode(&mut daemon)
-        .unwrap();
-        wait_for_input_active(&window, cx);
-
-        window
-            .update(cx, |view, _, cx| {
-                view.cmd.set("ls /nope/");
-                view.editor_handoff = Some(view.terminal.prompt_cycle());
-                assert!(!view.input_active(), "the shell owns this prompt already");
-
-                let req =
-                    super::completion::remote_path_request("ls /nope/", 9, "/home/u").unwrap();
-                view.remote_path_results(req, "ls /nope/", 9, Vec::new(), true, cx);
-
-                assert_eq!(
-                    view.cmd.text(),
-                    "ls /nope/",
-                    "an empty listing must not hand off a line the editor no longer drives"
-                );
-            })
-            .unwrap();
-        assert_eq!(
-            next_input_until_timeout(&mut daemon),
-            None,
-            "not one byte reached the wire"
         );
     }
 
@@ -15511,25 +14438,15 @@ mod gpui_tests {
 
     fn bind_to_a_disconnected_remote_workspace(
         view: &mut TerminalView,
-        cx: &mut Context<TerminalView>,
+        _cx: &mut Context<TerminalView>,
     ) -> crate::core::session::WorkspaceId {
-        use crate::core::session::{
-            RemoteRef, RemoteTarget, WindowViews, WorkspaceId, WorkspaceStore,
-        };
+        use crate::core::session::{RemoteRef, RemoteTarget, WorkspaceId};
         use crate::terminal::PaneWorkspace;
         let host = RemoteRef::new(
             RemoteTarget::direct("me", "build-box", 22),
             WorkspaceId::new(),
         );
-        let entry = crate::core::session::WindowView::on_remote(host.clone());
-        let id = entry.id;
-        WorkspaceStore::install_for_test(
-            cx,
-            WindowViews {
-                views: vec![entry],
-                active: None,
-            },
-        );
+        let id = host.workspace;
         view.set_workspace(Some(PaneWorkspace {
             workspace: id,
             target: host.target,
@@ -15770,18 +14687,18 @@ mod gpui_tests {
             .update(cx, |view, _, cx| {
                 bind_to_a_disconnected_remote_workspace(view, cx);
                 view.handle_event(AlacEvent::Exit, cx);
-                assert_eq!(view.title, "tty7 — disconnected");
+                assert_eq!(view.title, "ntty7 — disconnected");
 
                 view.set_workspace(None);
                 view.handle_event(AlacEvent::Exit, cx);
-                assert_eq!(view.title, "tty7 — process exited");
+                assert_eq!(view.title, "ntty7 — process exited");
             })
             .unwrap();
     }
 
     /// A workspace pane answers to its workspace's name: untitled tabs show
     /// it, and a dead link's suffix hangs off it — not off the bare app name,
-    /// which read "tty7 — disconnected" no matter whose link died.
+    /// which read "ntty7 — disconnected" no matter whose link died.
     #[gpui::test]
     fn a_workspace_pane_answers_to_its_workspaces_name(cx: &mut TestAppContext) {
         use crate::core::session::{RemoteTarget, WorkspaceId};
@@ -15930,7 +14847,7 @@ mod gpui_tests {
                 )
                 .expect("the swap itself cannot fail");
                 assert_eq!(
-                    view.title, "tty7",
+                    view.title, "ntty7",
                     "a relinked pane is not \"process exited\""
                 );
             })
@@ -16729,7 +15646,7 @@ mod gpui_tests {
             .update(cx, |view, _, cx| {
                 view.handle_event(AlacEvent::Exit, cx);
                 assert!(view.terminal.exited);
-                assert_eq!(view.title, "tty7 — process exited");
+                assert_eq!(view.title, "ntty7 — process exited");
             })
             .unwrap();
     }

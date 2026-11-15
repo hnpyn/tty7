@@ -12,7 +12,7 @@ fn main() {
 }
 
 /// Put the bundled ConPTY beside cargo's output, the way the packaged app has
-/// it beside `tty7-app.exe`.
+/// it beside `ntty7.exe`.
 ///
 /// `portable-pty` picks a sideloaded `conpty.dll` over the one in `kernel32`,
 /// and finds it through the DLL search path — which starts at the directory of

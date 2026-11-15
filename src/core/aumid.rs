@@ -10,9 +10,9 @@
 //! It is deliberately reluctant to write. The installer stamps its own
 //! shortcuts (see `windows-installer.iss`), so the runtime write only has to
 //! cover the portable zip and installs that predate that change. It therefore
-//! touches at most the single per-user `tty7.lnk` that Inno's default install
+//! touches at most the single per-user `ntty7.lnk` that Inno's default install
 //! owns anyway — never a second Start Menu entry beside an all-users install
-//! (which would show "tty7" twice and outlive the uninstaller), and never
+//! (which would show "ntty7" twice and outlive the uninstaller), and never
 //! anything at all from a `cargo` build directory (which would repoint the
 //! user's installed shortcut at `target\debug`).
 //!
@@ -39,7 +39,7 @@ use std::time::{Duration, Instant};
 /// The toast/taskbar identity. Keep in sync with the `AppUserModelID` on the
 /// installer shortcuts in `.github/scripts/windows-installer.iss` — a
 /// mismatch silently splits the identity in two (a unit test checks this).
-pub(crate) const AUMID: &str = "com.github.tty7";
+pub(crate) const AUMID: &str = "com.github.ntty7";
 
 /// The toast activator class (`core::toast_activator`). Keep in sync with the
 /// `AppUserModelToastActivatorCLSID` on the installer shortcuts and the key
@@ -149,8 +149,8 @@ enum Decision {
 fn decide() -> Result<Decision, String> {
     let exe = std::env::current_exe().map_err(|e| format!("current exe: {e}"))?;
 
-    // An elevated install owns `%ProgramData%\...\tty7.lnk`, which we cannot
-    // rewrite unelevated. A per-user twin beside it would list "tty7" twice in
+    // An elevated install owns `%ProgramData%\...\ntty7.lnk`, which we cannot
+    // rewrite unelevated. A per-user twin beside it would list "ntty7" twice in
     // the Start Menu and survive the uninstaller, so that file settles the
     // question on its own: branded if the installer stamped our AUMID on it,
     // unbranded until the user upgrades to an installer that does.
@@ -361,15 +361,16 @@ fn programs_dir(env_var: &str) -> Option<PathBuf> {
 }
 
 /// The only shortcut we ever write: the per-user Start Menu, which is also
-/// where Inno's default (non-elevated) install puts `tty7.lnk` — so refreshing
+/// where Inno's default (non-elevated) install puts `ntty7.lnk` — so refreshing
 /// it adds no entry the uninstaller does not already know how to remove.
+/// The name is not `tty7.lnk`: that shortcut belongs to an installed tty7.
 fn start_menu_shortcut_path() -> Option<PathBuf> {
-    Some(programs_dir("APPDATA")?.join("tty7.lnk"))
+    Some(programs_dir("APPDATA")?.join("ntty7.lnk"))
 }
 
 /// The all-users twin an elevated install writes. Read-only for us.
 fn all_users_shortcut_path() -> Option<PathBuf> {
-    Some(programs_dir("ProgramData")?.join("tty7.lnk"))
+    Some(programs_dir("ProgramData")?.join("ntty7.lnk"))
 }
 
 #[derive(Default)]
@@ -566,8 +567,8 @@ mod tests {
     #[test]
     fn the_local_server_command_quotes_the_exe() {
         assert_eq!(
-            super::local_server_command(Path::new(r"C:\Program Files\tty7\tty7-app.exe")),
-            r#""C:\Program Files\tty7\tty7-app.exe" --toast-activated"#
+            super::local_server_command(Path::new(r"C:\Program Files\ntty7\ntty7.exe")),
+            r#""C:\Program Files\ntty7\ntty7.exe" --toast-activated"#
         );
     }
 
@@ -576,7 +577,7 @@ mod tests {
         let Some(lnk) = super::start_menu_shortcut_path() else {
             return; // no APPDATA in this environment — nothing to assert
         };
-        assert_eq!(lnk.file_name().and_then(|n| n.to_str()), Some("tty7.lnk"));
+        assert_eq!(lnk.file_name().and_then(|n| n.to_str()), Some("ntty7.lnk"));
         assert_eq!(
             lnk.parent()
                 .and_then(|p| p.file_name())
@@ -662,7 +663,7 @@ mod tests {
     fn a_written_shortcut_reads_back_as_ours() {
         let dir = std::env::temp_dir().join(format!("tty7-aumid-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("create temp dir");
-        let lnk = dir.join("tty7.lnk");
+        let lnk = dir.join("ntty7.lnk");
 
         let written = super::write_shortcut(&lnk);
         let read = written.as_ref().ok().map(|()| super::read_shortcut(&lnk));
@@ -699,7 +700,7 @@ mod tests {
         };
         println!("decision: {decision}");
         println!("toast_app_id: {:?}", super::toast_app_id());
-        crate::terminal::notify_desktop(Some("tty7"), "AUMID toast test");
+        crate::terminal::notify_desktop(Some("ntty7"), "AUMID toast test");
         std::thread::sleep(std::time::Duration::from_secs(3));
     }
 }

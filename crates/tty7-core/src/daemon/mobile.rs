@@ -159,7 +159,7 @@ fn start() -> Result<Child, String> {
             .to_string()
     })?;
     if let Some(dir) = config_dir_path() {
-        cmd.env("TTY7_CONFIG_DIR", dir);
+        cmd.env("NTTY7_CONFIG_DIR", dir);
     }
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::null())

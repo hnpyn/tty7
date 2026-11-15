@@ -59,36 +59,6 @@ fn agent_icon(path: &str) -> Option<&'static [u8]> {
         "icons/power.svg" => include_bytes!("../../assets/icons/power.svg"),
         "icons/list-tree.svg" => include_bytes!("../../assets/icons/list-tree.svg"),
         "icons/list-flat.svg" => include_bytes!("../../assets/icons/list-flat.svg"),
-        "icons/settings/about.svg" => include_bytes!("../../assets/icons/settings/about.svg"),
-        "icons/settings/appearance.svg" => {
-            include_bytes!("../../assets/icons/settings/appearance.svg")
-        }
-        "icons/settings/back.svg" => include_bytes!("../../assets/icons/settings/back.svg"),
-        "icons/settings/check.svg" => include_bytes!("../../assets/icons/settings/check.svg"),
-        "icons/settings/chevron-down.svg" => {
-            include_bytes!("../../assets/icons/settings/chevron-down.svg")
-        }
-        "icons/settings/chevron-right.svg" => {
-            include_bytes!("../../assets/icons/settings/chevron-right.svg")
-        }
-        "icons/settings/close.svg" => include_bytes!("../../assets/icons/settings/close.svg"),
-        "icons/settings/mobile.svg" => include_bytes!("../../assets/icons/settings/mobile.svg"),
-        "icons/settings/general.svg" => include_bytes!("../../assets/icons/settings/general.svg"),
-        "icons/settings/integrations.svg" => {
-            include_bytes!("../../assets/icons/settings/integrations.svg")
-        }
-        "icons/settings/keyboard.svg" => include_bytes!("../../assets/icons/settings/keyboard.svg"),
-        "icons/settings/machine-local.svg" => {
-            include_bytes!("../../assets/icons/settings/machine-local.svg")
-        }
-        "icons/settings/machine-remote.svg" => {
-            include_bytes!("../../assets/icons/settings/machine-remote.svg")
-        }
-        "icons/settings/more.svg" => include_bytes!("../../assets/icons/settings/more.svg"),
-        "icons/settings/plus.svg" => include_bytes!("../../assets/icons/settings/plus.svg"),
-        "icons/settings/search.svg" => include_bytes!("../../assets/icons/settings/search.svg"),
-        "icons/settings/ssh.svg" => include_bytes!("../../assets/icons/settings/ssh.svg"),
-        "icons/settings/terminal.svg" => include_bytes!("../../assets/icons/settings/terminal.svg"),
         "icons/agents/claude.svg" => include_bytes!("../../assets/icons/agents/claude.svg"),
         "icons/agents/codex.svg" => include_bytes!("../../assets/icons/agents/codex.svg"),
         "icons/agents/traecli.svg" => include_bytes!("../../assets/icons/agents/traecli.svg"),
@@ -112,31 +82,6 @@ fn agent_icon(path: &str) -> Option<&'static [u8]> {
         "icons/agents/crush.svg" => include_bytes!("../../assets/icons/agents/crush.svg"),
         "icons/agents/codebuddy.svg" => {
             include_bytes!("../../assets/icons/agents/codebuddy.svg")
-        }
-        // The GitHub tab's state glyphs: one shape per state, not one colour.
-        "icons/github/issue-open.svg" => include_bytes!("../../assets/icons/github/issue-open.svg"),
-        "icons/github/issue-closed.svg" => {
-            include_bytes!("../../assets/icons/github/issue-closed.svg")
-        }
-        "icons/github/issue-not-planned.svg" => {
-            include_bytes!("../../assets/icons/github/issue-not-planned.svg")
-        }
-        "icons/github/pr-open.svg" => include_bytes!("../../assets/icons/github/pr-open.svg"),
-        "icons/github/pr-closed.svg" => include_bytes!("../../assets/icons/github/pr-closed.svg"),
-        "icons/github/pr-merged.svg" => include_bytes!("../../assets/icons/github/pr-merged.svg"),
-        "icons/github/pr-draft.svg" => include_bytes!("../../assets/icons/github/pr-draft.svg"),
-        // …and its checks': passed, failed, running, skipped.
-        "icons/github/check-passed.svg" => {
-            include_bytes!("../../assets/icons/github/check-passed.svg")
-        }
-        "icons/github/check-failed.svg" => {
-            include_bytes!("../../assets/icons/github/check-failed.svg")
-        }
-        "icons/github/check-pending.svg" => {
-            include_bytes!("../../assets/icons/github/check-pending.svg")
-        }
-        "icons/github/check-skipped.svg" => {
-            include_bytes!("../../assets/icons/github/check-skipped.svg")
         }
         _ => return None,
     };
@@ -314,7 +259,7 @@ mod tests {
         // move to. Landing the cap on a half instead buys 11px, which is
         // device-aligned at 2x and only misses the grid at 1x, where a cross
         // this small is already the least of it.
-        let tip = (v_top - stroke / 2.) * crate::ui::app::TILE_GLYPH / 24.;
+        let tip = (v_top - stroke / 2.) * 16. / 24.;
         let grid = tip * 2.;
         assert!(
             (grid - grid.round()).abs() < 0.01,
