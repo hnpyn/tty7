@@ -28,6 +28,13 @@ impl OscTokenizer {
         }
     }
 
+    /// Between sequences. Ground only leaves on `0x1b` — 8-bit C1 controls
+    /// are ordinary payload bytes here, so a chunk with no ESC cannot move
+    /// an idle tokenizer.
+    pub fn is_ground(&self) -> bool {
+        matches!(self.state, State::Ground)
+    }
+
     pub fn feed(&mut self, bytes: &[u8], mut on_payload: impl FnMut(&[u8])) {
         self.feed_at(bytes, |_, payload| on_payload(payload));
     }
@@ -123,6 +130,17 @@ impl OscTokenizer {
         self.buf.clear();
         self.state = State::Ground;
     }
+}
+
+/// Whether `bytes` contains an ESC introducer (`0x1b`).
+///
+/// Ground in [`OscTokenizer`], [`crate::core::term_modes::TerminalModes`],
+/// the clipboard tokenizer, and the kitty APC tokenizer all wait on `0x1b`
+/// alone. None of them treat 8-bit C1 (`0x90` DCS, `0x9b` CSI, `0x9d` OSC,
+/// `0x9f` APC) as an introducer, so one SIMD scan is enough to prove a
+/// chunk is plain text for every idle machine on the output path.
+pub fn contains_esc(bytes: &[u8]) -> bool {
+    memchr::memchr(0x1b, bytes).is_some()
 }
 
 /// A desktop notification: its title, if it has one, and its body.
@@ -738,6 +756,23 @@ mod tests {
             notes(&[b"99;d=0;stale", b"99;p=body;fresh"]),
             vec![(None, "fresh".into())]
         );
+    }
+
+    #[test]
+    fn a_split_osc_completes_when_the_second_chunk_has_no_esc() {
+        let mut tok = OscTokenizer::new(&[b"133"]);
+        let mut got = Vec::new();
+        tok.feed(b"\x1b]133;C;ec", |p| got.push(p.to_vec()));
+        assert!(!tok.is_ground(), "the command mark is still open");
+        assert!(got.is_empty());
+        let rest = b"ho\x07";
+        assert!(memchr::memchr(0x1b, rest).is_none());
+        tok.feed(rest, |p| got.push(p.to_vec()));
+        assert_eq!(got, vec![b"133;C;echo".to_vec()]);
+        assert!(tok.is_ground());
+        // Back in ground, a chunk with no ESC must not be required to move it.
+        tok.feed(b"plain", |_| panic!("plain text is not an OSC payload"));
+        assert!(tok.is_ground());
     }
 
     #[test]

@@ -321,6 +321,12 @@ impl TerminalModes {
         Some(out)
     }
 
+    /// Between sequences. The text state only leaves on `0x1b`; 8-bit C1
+    /// controls are not introducers.
+    pub fn is_ground(&self) -> bool {
+        self.state == State::Text
+    }
+
     /// Folds one chunk of pty output into the tracked state. Sequences split
     /// across chunks are carried, so the caller may feed whatever sizes the pty
     /// hands it.

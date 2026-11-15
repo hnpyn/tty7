@@ -264,6 +264,11 @@ impl ClipboardSniffer {
         self.parser.available = epoch.is_some();
     }
 
+    /// Between sequences. See [`crate::core::osc::contains_esc`].
+    pub fn is_ground(&self) -> bool {
+        self.tokenizer.ground()
+    }
+
     pub fn sniff<'a>(&mut self, bytes: &'a [u8]) -> Sniffed<'a> {
         if self.tokenizer.ground() && !might_contain_protocol(bytes) {
             return Sniffed::Plain(bytes);
