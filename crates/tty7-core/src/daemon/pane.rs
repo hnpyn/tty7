@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::thread::JoinHandle;
@@ -656,6 +656,32 @@ const RING_CAP: usize = 8 * 1024 * 1024;
 const MAX_RING_SEGMENTS: usize = 64;
 const REMOTE_CONTEXT_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
+/// How often a sustained flood may call `tcgetpgrp`. A read smaller than
+/// [`GROUP_FLOOD_BYTES`], or one that spent [`GROUP_IDLE_GAP`] blocked in
+/// `read`, checks immediately, as do prompt and command marks (`OSC 133`
+/// `B`/`C`/`D`) and a cwd report.
+const GROUP_CHECK_INTERVAL: Duration = Duration::from_millis(50);
+
+/// A read this small is a prompt, an echo, a `preexec` line, or a TUI's first
+/// paint. Those always recheck the foreground group, including a child that
+/// took the tty within [`GROUP_CHECK_INTERVAL`] and then went quiet.
+const GROUP_FLOOD_BYTES: usize = 4096;
+
+/// How long `read` itself may block before the next chunk counts as a pause.
+/// A flood that is already queued returns at once, so it stays on the 50 ms
+/// timer; a shell that produced nothing for this long does not.
+const GROUP_IDLE_GAP: Duration = Duration::from_millis(2);
+
+/// One PTY read, after draining output the kernel has already queued. A burst
+/// becomes one buffer instead of a 1 KiB syscall per iteration.
+const READ_BURST: usize = 256 * 1024;
+
+/// A macOS pty master `read` returns about one 1 KiB packet even when the
+/// slave has written megabytes. A shorter read is the whole delivery (a
+/// prompt, an echo, a keystroke) and must not be followed by another `read`.
+#[cfg_attr(not(unix), allow(dead_code))]
+const PTY_CHUNK: usize = 1024;
+
 pub struct OutputGate {
     queued: AtomicI64,
     park: Mutex<()>,
@@ -765,12 +791,55 @@ struct SizeLease {
     desk: WinSize,
 }
 
+/// Clipboard controller the reader applies to the chunk it just woke up
+/// with. Epoch and permission share one word, so a publish and a load
+/// cannot tear into `(old epoch, new permission)`. `0` is no controller.
+/// A live one (`epoch >= 1`) is `(epoch << 1) | allowed`. The reader holds
+/// its own `Arc` and never takes the pane lock to read this.
+struct ClipPermit {
+    word: AtomicU64,
+}
+
+impl ClipPermit {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            word: AtomicU64::new(0),
+        })
+    }
+
+    fn publish(&self, subscriber: bool, epoch: u64, allowed: bool) {
+        let packed = match epoch.checked_shl(1) {
+            Some(shifted) if subscriber && epoch >= 1 => shifted | u64::from(allowed),
+            _ => 0,
+        };
+        self.word.store(packed, Ordering::Release);
+    }
+
+    fn load(&self) -> (Option<u64>, bool) {
+        let packed = self.word.load(Ordering::Acquire);
+        if packed == 0 {
+            (None, false)
+        } else {
+            (Some(packed >> 1), packed & 1 == 1)
+        }
+    }
+}
+
+fn publish_clip(st: &PaneState) {
+    st.clip_live.publish(
+        st.subscriber.is_some(),
+        st.subscriber_epoch,
+        st.allow_remote_clipboard_write,
+    );
+}
+
 struct PaneState {
     id: u64,
     ring: ReplayRing,
     subscriber: Option<Sender<DaemonMsg>>,
     subscriber_epoch: u64,
     allow_remote_clipboard_write: bool,
+    clip_live: Arc<ClipPermit>,
     /// A native ssh pane's answer belongs to the profile that dialled the
     /// host, and the client attaching to it never sees that spec: a window
     /// reopening onto a pane it outlived attaches by id and sends `false`
@@ -1123,9 +1192,13 @@ enum PaneBackend {
 }
 
 struct ForegroundProbes {
-    /// The pty's foreground process group: one ioctl, cheap enough to ask on
-    /// every read, and a change in it is what says the probes below would now
-    /// answer differently.
+    /// The pty's foreground process group. A sustained flood
+    /// ([`GROUP_FLOOD_BYTES`] or more, with `read` returning inside
+    /// [`GROUP_IDLE_GAP`]) asks at most every [`GROUP_CHECK_INTERVAL`]. Any
+    /// smaller read, any pause, an OSC 133 `B`/`C`/`D`, or a cwd report asks
+    /// immediately, and the read after a `C` whose group has not moved yet
+    /// asks again. A change is what says the probes below would now answer
+    /// differently.
     group: Box<dyn Fn() -> Option<i32> + Send>,
     remote: Box<dyn Fn() -> Option<RemoteContext> + Send>,
     agent: Box<dyn Fn() -> Option<Option<(crate::core::cli_agent::CLIAgent, Vec<String>)>> + Send>,
@@ -1303,6 +1376,7 @@ fn drain_then_report(
 /// frames, and they must reach the client in that same order. `Output` becomes a
 /// `DaemonMsg::Output`, `Image` an encoded image frame, `Delete` a compact
 /// selector — see the reader loop's `sniff` handling.
+#[derive(Debug)]
 enum GraphicsFrame {
     Output(Vec<u8>),
     Image(Vec<u8>),
@@ -1425,6 +1499,228 @@ fn lift_out_of_band<'a>(
             std::borrow::Cow::Owned(pass)
         }
     }
+}
+
+/// Split one PTY chunk into passthrough bytes, out-of-band frames, and OSC
+/// signals.
+///
+/// When clipboard, graphics, and the OSC sniffer are all in ground and the
+/// chunk holds no `0x1b`, one SIMD scan skips every state machine. Ground
+/// only advances on `0x1b` (none of these parsers treat 8-bit C1 as an
+/// introducer — see [`crate::core::osc::contains_esc`]). A sequence split
+/// across reads leaves its machine *outside* ground, so the following chunk
+/// is still fed when it has no ESC: the rest of an OSC can be payload plus
+/// BEL, and the rest of a kitty APC can be the `\` of an ST whose ESC
+/// arrived in the previous chunk.
+///
+/// The pane's mode tracker is fed here too, off the state lock. The replay
+/// ring is not: [`ReplayRing`] still sees every byte, including the ones it
+/// evicts, so a UTF-8 or escape boundary at the head of the ring is unchanged.
+fn scan_chunk<'a>(
+    raw: &'a [u8],
+    clipboard: &mut ClipboardSniffer,
+    graphics: &mut GraphicsSniffer,
+    sniffer: &mut OscSniffer,
+    modes: &mut TerminalModes,
+    has_controller: bool,
+    writer: &Arc<Mutex<Box<dyn Write + Send>>>,
+) -> (
+    std::borrow::Cow<'a, [u8]>,
+    Vec<GraphicsFrame>,
+    SniffSignals,
+    bool,
+) {
+    let has_esc = crate::core::osc::contains_esc(raw);
+    let mut frames = Vec::new();
+    let passthrough = if !has_esc && clipboard.is_ground() && graphics.is_ground() {
+        std::borrow::Cow::Borrowed(raw)
+    } else {
+        lift_out_of_band(
+            raw,
+            clipboard,
+            graphics,
+            has_controller,
+            writer,
+            &mut frames,
+        )
+    };
+    let out_has_esc = match &passthrough {
+        std::borrow::Cow::Borrowed(_) if !has_esc => false,
+        bytes => crate::core::osc::contains_esc(bytes),
+    };
+    let signals = if !out_has_esc && sniffer.is_ground() {
+        SniffSignals::default()
+    } else {
+        sniffer.feed(&passthrough)
+    };
+    let fed_modes = if !out_has_esc && modes.is_ground() {
+        false
+    } else {
+        modes.feed(&passthrough);
+        true
+    };
+    (passthrough, frames, signals, fed_modes)
+}
+
+/// PTY reader that, after a blocking read of a full packet, drains output
+/// the kernel has already queued. macOS hands back ~1 KiB per `read` even
+/// when the slave wrote megabytes, so one call returns up to [`READ_BURST`].
+///
+/// A short read returns immediately: a prompt or a keystroke is not followed
+/// by another syscall. The continuation never sets `O_NONBLOCK`. `dup`
+/// shares the open file description with the pane writer, and a non-blocking
+/// master would make `write_all` return `EAGAIN` when the input buffer is
+/// full. The drain `poll`s first — `XOFF` (`TS_TTSTOP`) leaves
+/// `TIOCOUTQ > 0` while `read` blocks until `Ctrl-Q` — and then reads at
+/// most the queued count. An empty or stopped queue never starts a `read`.
+struct BurstRead {
+    inner: Box<dyn Read + Send>,
+    poll_fd: Option<i32>,
+}
+
+impl BurstRead {
+    fn boxed(inner: Box<dyn Read + Send>, poll_fd: Option<i32>) -> Box<dyn Read + Send> {
+        Box::new(Self { inner, poll_fd })
+    }
+}
+
+impl Drop for BurstRead {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if let Some(fd) = self.poll_fd.take() {
+            unsafe { libc::close(fd) };
+        }
+    }
+}
+
+impl Read for BurstRead {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        #[cfg_attr(not(unix), allow(unused_mut))]
+        let mut filled = self.inner.read(buf)?;
+        if filled == 0 || filled == buf.len() {
+            return Ok(filled);
+        }
+        // A short packet is the whole delivery. Draining it would be an
+        // extra syscall on every echo, and the only `read` that can block
+        // with bytes already in `buf`.
+        #[cfg(unix)]
+        if filled >= PTY_CHUNK
+            && let Some(fd) = self.poll_fd
+        {
+            filled = drain_queued(&mut *self.inner, fd, buf, filled)?;
+        }
+        #[cfg(not(unix))]
+        let _ = self.poll_fd;
+        Ok(filled)
+    }
+}
+
+#[cfg(unix)]
+fn drain_queued(
+    inner: &mut dyn Read,
+    fd: i32,
+    buf: &mut [u8],
+    mut filled: usize,
+) -> std::io::Result<usize> {
+    while filled < buf.len() {
+        // `poll` before the queue count. Flow control (`Ctrl-S` /
+        // `tcflow(TCOOFF)`) keeps `TIOCOUTQ` above zero while `read` blocks
+        // until `Ctrl-Q`; `POLLIN` is clear in that state.
+        if !pty_readable(fd) {
+            break;
+        }
+        let avail = queued_pty_output(fd).unwrap_or(0);
+        if avail == 0 {
+            break;
+        }
+        let end = filled.saturating_add(avail).min(buf.len());
+        if end == filled {
+            break;
+        }
+        match inner.read(&mut buf[filled..end]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            // Keep the bytes already in hand. The next `read` reports the error.
+            Err(_) => break,
+        }
+    }
+    Ok(filled)
+}
+
+/// `POLLIN` with a zero timeout. False when the master is `XOFF`'d: the
+/// output queue may still hold bytes, and `read` would block until `XON`.
+#[cfg(unix)]
+fn pty_readable(fd: i32) -> bool {
+    let mut pfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    loop {
+        let rc = unsafe { libc::poll(&mut pfd, 1, 0) };
+        if rc < 0 {
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return false;
+        }
+        return rc > 0 && (pfd.revents & libc::POLLIN) != 0;
+    }
+}
+
+/// Bytes of slave output waiting on the master. `None` means "do not read":
+/// the queue is empty or the ioctl failed. This count stays positive while
+/// output is `XOFF`'d, so callers also require [`pty_readable`].
+#[cfg(unix)]
+fn queued_pty_output(fd: i32) -> Option<usize> {
+    let mut avail: libc::c_int = 0;
+    // macOS reports the master's readable output through `TIOCOUTQ`.
+    // `FIONREAD` stays 0 for that data and instead counts keystrokes the
+    // slave has not read yet. Linux reports the readable output through
+    // `FIONREAD`.
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "tvos",
+        target_os = "watchos"
+    ))]
+    let req = libc::TIOCOUTQ;
+    #[cfg(not(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "tvos",
+        target_os = "watchos"
+    )))]
+    let req = libc::FIONREAD;
+    loop {
+        let rc = unsafe { libc::ioctl(fd, req, &mut avail) };
+        if rc >= 0 {
+            break;
+        }
+        if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+            return None;
+        }
+    }
+    (avail > 0).then_some(avail as usize)
+}
+
+#[cfg(unix)]
+fn dup_reader_fd(master: &dyn MasterPty) -> Option<i32> {
+    let fd = master.as_raw_fd()?;
+    let duped = unsafe { libc::dup(fd) };
+    if duped < 0 {
+        return None;
+    }
+    unsafe {
+        libc::fcntl(duped, libc::F_SETFD, libc::FD_CLOEXEC);
+    }
+    Some(duped)
+}
+
+#[cfg(not(unix))]
+fn dup_reader_fd(_master: &dyn MasterPty) -> Option<i32> {
+    None
 }
 
 /// A live pane, reduced to what survives an `exec` plus what has to be written
@@ -1879,6 +2175,7 @@ impl DaemonPane {
                 subscriber: None,
                 subscriber_epoch: 0,
                 allow_remote_clipboard_write,
+                clip_live: ClipPermit::new(),
                 clipboard_write_from_spec: None,
                 observers: Vec::new(),
                 observer_seq: 0,
@@ -1926,6 +2223,9 @@ impl DaemonPane {
             reader_handle,
             writer,
         } = parts;
+        // Local pty only. A native SSH pane's reader is the channel bridge,
+        // which has no master fd to poll; `spawn_native_ssh` does not wrap it.
+        let reader_handle = BurstRead::boxed(reader_handle, dup_reader_fd(master.as_ref()));
 
         let id = state.id;
         let state = Arc::new(Mutex::new(state));
@@ -2106,6 +2406,7 @@ impl DaemonPane {
                 subscriber: None,
                 subscriber_epoch: 0,
                 allow_remote_clipboard_write: false,
+                clip_live: ClipPermit::new(),
                 clipboard_write_from_spec: None,
                 observers: Vec::new(),
                 observer_seq: 0,
@@ -2181,6 +2482,7 @@ impl DaemonPane {
             subscriber: None,
             subscriber_epoch: 0,
             allow_remote_clipboard_write,
+            clip_live: ClipPermit::new(),
             clipboard_write_from_spec: Some(allow_remote_clipboard_write),
             observers: Vec::new(),
             observer_seq: 0,
@@ -2320,9 +2622,16 @@ impl DaemonPane {
                 // local can `ssh` out mid-session, so the flag is refreshed from
                 // the same remote-context poll below. Seed it from the pane's
                 // current context so the first probe answers correctly.
-                let starts_local = state.lock().unwrap().remote.is_none();
+                let (starts_local, mut modes, clip_permit) = {
+                    let st = state.lock().unwrap();
+                    (
+                        st.remote.is_none(),
+                        st.modes.clone(),
+                        Arc::clone(&st.clip_live),
+                    )
+                };
                 let mut graphics = GraphicsSniffer::new_local(starts_local);
-                let mut buf = [0u8; 65536];
+                let mut buf = vec![0u8; READ_BURST];
 
                 let trace = std::env::var("TTY7_TRACE").is_ok_and(|v| !v.is_empty() && v != "0");
                 let mut tr_last = std::time::Instant::now();
@@ -2331,7 +2640,14 @@ impl DaemonPane {
                 let mut tr_read_t = std::time::Duration::ZERO;
                 let mut tr_disp_t = std::time::Duration::ZERO;
                 let mut next_remote_check = std::time::Instant::now();
+                let mut next_group_check = std::time::Instant::now();
                 let mut last_group = None;
+                // Two samples have to agree before a plain burst stops asking.
+                // The first read of a pane, and the read after a group change
+                // or an OSC 133 `C`, still see a program that took the tty
+                // between those samples.
+                let mut group_seen = false;
+                let mut group_settled = false;
 
                 loop {
                     if trace && tr_last.elapsed() >= std::time::Duration::from_secs(1) {
@@ -2355,38 +2671,37 @@ impl DaemonPane {
                     }
                     gate.wait_below_high_water();
                     let tr0 = trace.then(std::time::Instant::now);
+                    // Only the time spent blocked in `read`. A flood that is
+                    // already queued returns immediately; backpressure waits
+                    // above are not an idle gap.
+                    let waited = std::time::Instant::now();
                     match reader.read(&mut buf) {
                         Ok(0) => break,
                         Ok(n) => {
+                            let idle_gap = waited.elapsed();
                             if let Some(tr0) = tr0 {
                                 tr_read_t += tr0.elapsed();
                                 tr_reads += 1;
                                 tr_bytes += n as u64;
                             }
                             let raw = &buf[..n];
-                            let (controller, allowed) = state
-                                .lock()
-                                .map(|st| {
-                                    (
-                                        st.subscriber.as_ref().map(|_| st.subscriber_epoch),
-                                        st.allow_remote_clipboard_write,
-                                    )
-                                })
-                                .unwrap_or((None, false));
-                            clipboard.set_controller(controller, allowed);
-                            let mut frames: Vec<GraphicsFrame> = Vec::new();
-                            let passthrough = lift_out_of_band(
+                            // Loaded after `read` returns. An attach or detach
+                            // that landed while this read was blocked has
+                            // already published, so the first byte of this
+                            // chunk sees it. The cache from the previous
+                            // iteration would still say the old controller.
+                            let (clip_epoch, clip_allowed) = clip_permit.load();
+                            clipboard.set_controller(clip_epoch, clip_allowed);
+                            let (passthrough, frames, mut signals, fed_modes) = scan_chunk(
                                 raw,
                                 &mut clipboard,
                                 &mut graphics,
-                                controller.is_some(),
+                                &mut sniffer,
+                                &mut modes,
+                                clip_epoch.is_some(),
                                 &writer,
-                                &mut frames,
                             );
                             let bytes: &[u8] = &passthrough;
-                            // Sniff first (cheap, over the same bytes); collect any
-                            // cwd/prompt change to emit while we hold the lock.
-                            let mut signals = sniffer.feed(bytes);
 
                             // `any` first: `foreground_running` is a syscall,
                             // and most reads carry no prompt mark at all.
@@ -2418,15 +2733,35 @@ impl DaemonPane {
                             // did that every time, and the pane never learned
                             // it was running an agent until something else
                             // printed.
-                            let group = foreground_group();
-                            let group_changed = group != last_group;
-                            last_group = group;
-                            let poll_now = back_at_prompt
-                                || group_changed
-                                || std::time::Instant::now() >= next_remote_check;
+                            // `tcgetpgrp` on every 1 KiB read dominated a plain
+                            // burst. A flood of full chunks asks on a timer. A
+                            // short read or a pause asks every time: an
+                            // uninstrumented shell, and a `preexec` line that
+                            // lands before the child calls `tcsetpgrp`, both
+                            // look settled until that next small chunk. A `C`
+                            // whose group has not moved yet leaves the next
+                            // read unsettled too — the child often takes the
+                            // tty on the following chunk (`force_next_check`).
+                            let now = std::time::Instant::now();
+                            let check_group = bytes.len() < GROUP_FLOOD_BYTES
+                                || idle_gap >= GROUP_IDLE_GAP
+                                || signals.boundary
+                                || signals.cwd.is_some()
+                                || !group_settled
+                                || now >= next_group_check;
+                            let mut group_changed = false;
+                            if check_group {
+                                let group = foreground_group();
+                                group_changed = group != last_group;
+                                group_settled =
+                                    group_seen && group == last_group && !signals.command_started;
+                                group_seen = true;
+                                last_group = group;
+                                next_group_check = now + GROUP_CHECK_INTERVAL;
+                            }
+                            let poll_now = back_at_prompt || group_changed || now >= next_remote_check;
                             if poll_now {
-                                next_remote_check =
-                                    std::time::Instant::now() + REMOTE_CONTEXT_POLL_INTERVAL;
+                                next_remote_check = now + REMOTE_CONTEXT_POLL_INTERVAL;
                             }
                             let remote = if poll_now {
                                 let managed = {
@@ -2457,7 +2792,18 @@ impl DaemonPane {
                                 signals.shell.iter().any(|s| s.mark_at_prompt);
                             let mut st = state.lock().unwrap();
                             let facts_before = may_change_facts.then(|| observed_facts(&st));
-                            record_output(&mut st, bytes);
+                            // The ring folds every byte, including ones it
+                            // evicts, through `HeadCut`. Modes were folded
+                            // above, outside this lock, and published only
+                            // when the chunk actually moved them.
+                            st.ring.append(bytes);
+                            if fed_modes {
+                                st.modes.clone_from(&modes);
+                                // `detached_queries` takes the published copy.
+                                // Drop the reader's too, or the next publish
+                                // would hand the same query over again.
+                                modes.take_queries();
+                            }
                             fan_out_output(&mut st, bytes, frames, &gate);
                             let owed = detached_queries(&mut st);
                             apply_signals(&mut st, signals);
@@ -3377,9 +3723,20 @@ impl ReplayRing {
 /// themselves, and the modes they switched on. One function so the two can
 /// never drift apart — the modes are only worth anything if they were folded
 /// from exactly the bytes the ring was given.
+/// Test helper. The reader appends to the ring itself and folds modes off
+/// the state lock; this keeps the same pair of updates for tests that feed
+/// a pane directly.
+#[cfg(test)]
 fn record_output(st: &mut PaneState, bytes: &[u8]) {
+    // `ReplayRing::append` still folds every evicted byte through `HeadCut`
+    // and `head_modes`. A no-ESC skip is not equivalent there: eviction can
+    // be mid-sequence, and the cut also refuses to land on a UTF-8
+    // continuation. The pane's own mode tracker is different — ground only
+    // leaves on `0x1b`, so plain text is a no-op.
     st.ring.append(bytes);
-    st.modes.feed(bytes);
+    if !st.modes.is_ground() || crate::core::osc::contains_esc(bytes) {
+        st.modes.feed(bytes);
+    }
 }
 
 /// A pane with no client attached has nobody to answer its queries, and a
@@ -3620,6 +3977,7 @@ fn attach_subscriber(st: &mut PaneState, subscriber: Sender<DaemonMsg>) -> u64 {
 /// other pane is exactly as permitted as the client controlling it says.
 fn set_clipboard_permission(st: &mut PaneState, controller_says: bool) {
     st.allow_remote_clipboard_write = st.clipboard_write_from_spec.unwrap_or(controller_says);
+    publish_clip(st);
 }
 
 /// The new controller's gate starts from what its replay queued, under the
@@ -3634,10 +3992,13 @@ fn attach_subscriber_with_permissions(
 ) -> u64 {
     st.subscriber_epoch += 1;
     st.lease_watch = false;
-    set_clipboard_permission(st, allow_remote_clipboard_write);
     gate.reset();
     gate.add(replay_state(st, &subscriber, foreground_command));
     st.subscriber = Some(subscriber);
+    // After the subscriber is installed, so the published epoch is this
+    // controller's and not the one that was just replaced. A reader blocked
+    // in `read` loads this word when the read returns.
+    set_clipboard_permission(st, allow_remote_clipboard_write);
     st.subscriber_epoch
 }
 
@@ -4329,6 +4690,11 @@ struct SniffSignals {
     shell: Vec<ShellState>,
     agent_events: Vec<crate::core::cli_agent::AgentEvent>,
     notification: Option<String>,
+    /// This chunk carried an OSC 133 `B`, `C`, or `D`.
+    boundary: bool,
+    /// OSC 133 `C`: a command just started. The new process group often
+    /// shows up on the next read rather than this one.
+    command_started: bool,
 }
 
 struct OscSniffer {
@@ -4350,6 +4716,10 @@ impl OscSniffer {
         }
     }
 
+    fn is_ground(&self) -> bool {
+        self.tok.is_ground()
+    }
+
     fn feed(&mut self, bytes: &[u8]) -> SniffSignals {
         let mut signals = SniffSignals::default();
         let shell = &mut self.shell;
@@ -4366,6 +4736,14 @@ impl OscSniffer {
             } else if let Some(title) = parse_osc_title(payload) {
                 signals.title = Some(title);
             } else if let Some(rest) = payload.strip_prefix(b"133;") {
+                match rest.first() {
+                    Some(b'B' | b'D') => signals.boundary = true,
+                    Some(b'C') => {
+                        signals.boundary = true;
+                        signals.command_started = true;
+                    }
+                    _ => {}
+                }
                 if handle_osc133(shell, rest) {
                     match signals.shell.last_mut() {
                         Some(last) if last.at_prompt == shell.at_prompt => {
@@ -6334,6 +6712,7 @@ mod tests {
             subscriber: None,
             subscriber_epoch: 0,
             allow_remote_clipboard_write: false,
+            clip_live: ClipPermit::new(),
             clipboard_write_from_spec: None,
             observers: Vec::new(),
             observer_seq: 0,
@@ -9318,5 +9697,910 @@ mod tests {
             redraw_nudge(&mut st, true, std::time::Instant::now()),
             Some(ws(80, 2))
         );
+    }
+
+    #[test]
+    fn clip_permit_packs_epoch_and_permission_into_one_word() {
+        let permit = ClipPermit::new();
+        assert_eq!(permit.load(), (None, false));
+        permit.publish(true, 1, false);
+        assert_eq!(permit.load(), (Some(1), false));
+        permit.publish(true, 4, true);
+        assert_eq!(permit.load(), (Some(4), true));
+        permit.publish(false, 4, true);
+        assert_eq!(permit.load(), (None, false));
+        permit.publish(true, 0, true);
+        assert_eq!(permit.load(), (None, false));
+    }
+
+    #[test]
+    fn osc_133_marks_b_c_and_d_force_a_group_check() {
+        let mut sniffer = OscSniffer::new();
+        let began = sniffer.feed(b"\x1b]133;B\x07");
+        assert!(began.boundary);
+        assert!(!began.command_started);
+        let started = sniffer.feed(b"\x1b]133;C;ls\x07");
+        assert!(started.boundary && started.command_started);
+        let done = sniffer.feed(b"\x1b]133;D;0\x07");
+        assert!(done.boundary);
+        assert!(!done.command_started);
+        let prompt_a = sniffer.feed(b"\x1b]133;A\x07");
+        assert!(!prompt_a.boundary);
+        assert!(!prompt_a.command_started);
+    }
+
+    /// A plain burst samples the foreground group twice (the first read, then
+    /// one confirming read) and then stops. A cwd report and an OSC 133 `C`
+    /// ask again at once, and the read after `C` asks even though the group
+    /// had not moved yet — the child takes the tty on that next chunk.
+    #[test]
+    fn a_settled_foreground_group_is_not_asked_on_every_read() {
+        struct Chunks(std::collections::VecDeque<Vec<u8>>);
+
+        impl Read for Chunks {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                match self.0.pop_front() {
+                    Some(chunk) => {
+                        buf[..chunk.len()].copy_from_slice(&chunk);
+                        Ok(chunk.len())
+                    }
+                    None => Ok(0),
+                }
+            }
+        }
+
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_in = calls.clone();
+        let probes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let probes_in = probes.clone();
+        let groups = Mutex::new([7, 7, 8, 8, 8, 9].into_iter());
+        let flood = || vec![b'a'; GROUP_FLOOD_BYTES];
+        let handle = DaemonPane::spawn_reader(
+            Arc::new(Mutex::new(test_state(true))),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(OutputGate::new()),
+            Box::new(Chunks(
+                [
+                    flood(),
+                    flood(),
+                    flood(),
+                    flood(),
+                    b"\x1b]7;file://host/tmp\x07".to_vec(),
+                    b"still".to_vec(),
+                    b"\x1b]133;C;echo\x07".to_vec(),
+                    b"child".to_vec(),
+                ]
+                .into_iter()
+                .collect(),
+            )),
+            null_writer(),
+            || false,
+            ForegroundProbes {
+                group: Box::new(move || {
+                    calls_in.fetch_add(1, Ordering::SeqCst);
+                    groups.lock().unwrap().next()
+                }),
+                remote: Box::new(|| None),
+                agent: Box::new(move || {
+                    probes_in.fetch_add(1, Ordering::SeqCst);
+                    None
+                }),
+                cwd: Box::new(|| None),
+            },
+            Arc::new(DeathReporter::new(|| {})),
+        );
+        handle.join().unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            6,
+            "two flood reads settle the group; the next two stay on the \
+             timer; cwd, the confirming read, the command mark, and the \
+             child's first output ask again"
+        );
+        assert_eq!(
+            probes.load(Ordering::SeqCst),
+            3,
+            "a probe runs on the first sample and on each group change, not on every read"
+        );
+    }
+
+    /// Prompt, echo, and a child screen, back to back, with no OSC 133 and
+    /// no pause long enough to expire the 50 ms timer. Every short read asks,
+    /// so the child's first paint is seen on that chunk.
+    #[test]
+    fn a_fast_child_without_shell_integration_is_seen_on_its_first_screen() {
+        struct Chunks(std::collections::VecDeque<Vec<u8>>);
+
+        impl Read for Chunks {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                match self.0.pop_front() {
+                    Some(chunk) => {
+                        buf[..chunk.len()].copy_from_slice(&chunk);
+                        Ok(chunk.len())
+                    }
+                    None => Ok(0),
+                }
+            }
+        }
+
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_in = calls.clone();
+        let probes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let probes_in = probes.clone();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen_in = seen.clone();
+        let groups = Mutex::new([7, 7, 7, 8].into_iter());
+        let handle = DaemonPane::spawn_reader(
+            Arc::new(Mutex::new(test_state(true))),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(OutputGate::new()),
+            Box::new(Chunks(
+                [
+                    b"$ ".to_vec(),
+                    b"claude".to_vec(),
+                    b"\r".to_vec(),
+                    b"Claude ready".to_vec(),
+                ]
+                .into_iter()
+                .collect(),
+            )),
+            null_writer(),
+            || false,
+            ForegroundProbes {
+                group: Box::new(move || {
+                    calls_in.fetch_add(1, Ordering::SeqCst);
+                    let group = groups.lock().unwrap().next();
+                    if let Some(group) = group {
+                        seen_in.lock().unwrap().push(group);
+                    }
+                    group
+                }),
+                remote: Box::new(|| None),
+                agent: Box::new(move || {
+                    probes_in.fetch_add(1, Ordering::SeqCst);
+                    None
+                }),
+                cwd: Box::new(|| None),
+            },
+            Arc::new(DeathReporter::new(|| {})),
+        );
+        handle.join().unwrap();
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            &[7, 7, 7, 8],
+            "every short read asks, including the child's first screen"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
+        assert_eq!(
+            probes.load(Ordering::SeqCst),
+            2,
+            "the shell's first sample and the child's new group each probe; \
+             the echoes in between do not"
+        );
+    }
+
+    /// An ESC sequence split across two reads, where the second read contains
+    /// no `0x1b`. Skipping those chunks because `memchr` finds no ESC would
+    /// drop the image, the command, and the mode.
+    #[test]
+    fn a_sequence_split_across_reads_parses_when_the_second_chunk_has_no_esc() {
+        use crate::core::kitty_graphics::Image;
+        use crate::core::term_modes::ALT_SCREEN;
+        use base64::Engine as _;
+
+        let pixel = [0xffu8, 0x00, 0x00, 0xff];
+        let b64 = base64::engine::general_purpose::STANDARD.encode(pixel);
+        let seq = format!("\x1b_Ga=T,f=32,t=d,s=1,v=1,i=1;{b64}\x1b\\");
+        let seq = seq.into_bytes();
+        assert_eq!(seq[seq.len() - 2], 0x1b);
+        let chunk1 = &seq[..seq.len() - 1];
+        let mut chunk2 = vec![b'\\'];
+        chunk2.extend_from_slice(b"after");
+        assert!(crate::core::osc::contains_esc(chunk1));
+        assert!(!crate::core::osc::contains_esc(&chunk2));
+
+        let writer: Arc<Mutex<Box<dyn Write + Send>>> =
+            Arc::new(Mutex::new(Box::new(std::io::sink())));
+        let mut clipboard = ClipboardSniffer::default();
+        let mut graphics = GraphicsSniffer::new_local(true);
+        let mut sniffer = OscSniffer::new();
+        let mut modes = TerminalModes::new();
+
+        let (pass, frames, _, _) = scan_chunk(
+            chunk1,
+            &mut clipboard,
+            &mut graphics,
+            &mut sniffer,
+            &mut modes,
+            false,
+            &writer,
+        );
+        assert!(pass.is_empty(), "the APC is not passthrough");
+        assert!(frames.is_empty(), "the ST has not arrived");
+        assert!(
+            !graphics.is_ground(),
+            "the fast path must not skip the next chunk"
+        );
+
+        let (pass, frames, _, fed) = scan_chunk(
+            &chunk2,
+            &mut clipboard,
+            &mut graphics,
+            &mut sniffer,
+            &mut modes,
+            false,
+            &writer,
+        );
+        assert_eq!(&pass[..], b"after");
+        assert!(!fed, "plain text after the image does not move modes");
+        assert!(graphics.is_ground());
+        match frames.as_slice() {
+            [GraphicsFrame::Image(frame), GraphicsFrame::Output(text)] => {
+                let img = Image::decode_frame(frame).expect("image");
+                assert_eq!(img.id, 1);
+                assert_eq!(img.to_rgba8().unwrap(), pixel);
+                assert_eq!(text, b"after");
+            }
+            other => panic!("image then the text after it, got {other:?}"),
+        }
+
+        let (pass, frames, signals, fed) = scan_chunk(
+            b"plain",
+            &mut clipboard,
+            &mut graphics,
+            &mut sniffer,
+            &mut modes,
+            false,
+            &writer,
+        );
+        assert_eq!(&pass[..], b"plain");
+        assert!(frames.is_empty());
+        assert!(!signals.boundary);
+        assert!(!fed);
+        assert!(clipboard.is_ground() && graphics.is_ground());
+        assert!(sniffer.is_ground() && modes.is_ground());
+
+        let osc_head = b"\x1b]133;C;echo";
+        let osc_tail = b" hi\x07";
+        assert!(!crate::core::osc::contains_esc(osc_tail));
+        let (_, _, signals, _) = scan_chunk(
+            osc_head,
+            &mut clipboard,
+            &mut graphics,
+            &mut sniffer,
+            &mut modes,
+            false,
+            &writer,
+        );
+        assert!(!signals.command_started);
+        assert!(!sniffer.is_ground());
+        let (_, _, signals, _) = scan_chunk(
+            osc_tail,
+            &mut clipboard,
+            &mut graphics,
+            &mut sniffer,
+            &mut modes,
+            false,
+            &writer,
+        );
+        assert!(signals.command_started);
+        assert_eq!(signals.shell[0].command.as_deref(), Some("echo hi"));
+        assert!(sniffer.is_ground());
+
+        assert!(!crate::core::osc::contains_esc(b"h"));
+        let (_, _, _, fed) = scan_chunk(
+            b"\x1b[?1049",
+            &mut clipboard,
+            &mut graphics,
+            &mut sniffer,
+            &mut modes,
+            false,
+            &writer,
+        );
+        assert!(fed);
+        assert!(!modes.is_ground());
+        assert!(!modes.is_on(ALT_SCREEN));
+        let (pass, _, _, fed) = scan_chunk(
+            b"h",
+            &mut clipboard,
+            &mut graphics,
+            &mut sniffer,
+            &mut modes,
+            false,
+            &writer,
+        );
+        assert_eq!(&pass[..], b"h");
+        assert!(fed);
+        assert!(modes.is_ground());
+        assert!(modes.is_on(ALT_SCREEN));
+    }
+
+    /// The same splits, through the reader thread: the second chunk of each
+    /// sequence has no `0x1b`, and the image, the command, and the mode all
+    /// still land.
+    #[test]
+    fn the_reader_parses_sequences_split_across_chunks_with_no_esc_in_the_second() {
+        use crate::core::kitty_graphics::Image;
+        use crate::core::term_modes::ALT_SCREEN;
+        use base64::Engine as _;
+
+        struct Chunks(std::collections::VecDeque<Vec<u8>>);
+
+        impl Read for Chunks {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                match self.0.pop_front() {
+                    Some(chunk) => {
+                        buf[..chunk.len()].copy_from_slice(&chunk);
+                        Ok(chunk.len())
+                    }
+                    None => Ok(0),
+                }
+            }
+        }
+
+        let pixel = [0xffu8, 0x00, 0x00, 0xff];
+        let b64 = base64::engine::general_purpose::STANDARD.encode(pixel);
+        let seq = format!("\x1b_Ga=T,f=32,t=d,s=1,v=1,i=1;{b64}\x1b\\");
+        let seq = seq.into_bytes();
+        let mut kitty_tail = vec![b'\\'];
+        kitty_tail.extend_from_slice(b"after");
+        assert!(!crate::core::osc::contains_esc(&kitty_tail));
+        assert!(!crate::core::osc::contains_esc(b" hi\x07"));
+        assert!(!crate::core::osc::contains_esc(b"h"));
+
+        let state = Arc::new(Mutex::new(test_state(true)));
+        let (sub_tx, sub_rx) = mpsc::channel();
+        state.lock().unwrap().subscriber = Some(sub_tx);
+        let handle = DaemonPane::spawn_reader(
+            state.clone(),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(OutputGate::new()),
+            Box::new(Chunks(
+                [
+                    seq[..seq.len() - 1].to_vec(),
+                    kitty_tail,
+                    b"\x1b]133;C;echo".to_vec(),
+                    b" hi\x07".to_vec(),
+                    b"\x1b[?1049".to_vec(),
+                    b"h".to_vec(),
+                ]
+                .into_iter()
+                .collect(),
+            )),
+            null_writer(),
+            || false,
+            ForegroundProbes {
+                group: Box::new(|| None),
+                remote: Box::new(|| None),
+                agent: Box::new(|| None),
+                cwd: Box::new(|| None),
+            },
+            Arc::new(DeathReporter::new(|| {})),
+        );
+        handle.join().unwrap();
+
+        let msgs: Vec<DaemonMsg> = sub_rx.try_iter().collect();
+        let image_at = msgs
+            .iter()
+            .position(|msg| matches!(msg, DaemonMsg::Image(_)))
+            .expect("image");
+        let after_at = msgs
+            .iter()
+            .position(|msg| matches!(msg, DaemonMsg::Output(b) if b == b"after"))
+            .expect("text after the image");
+        assert!(
+            image_at < after_at,
+            "the image is anchored before the text that follows it"
+        );
+        match &msgs[image_at] {
+            DaemonMsg::Image(frame) => {
+                let img = Image::decode_frame(frame).expect("image");
+                assert_eq!(img.to_rgba8().unwrap(), pixel);
+            }
+            _ => unreachable!(),
+        }
+        let st = state.lock().unwrap();
+        assert_eq!(st.shell.command.as_deref(), Some("echo hi"));
+        assert!(st.modes.is_on(ALT_SCREEN));
+    }
+
+    /// The reader is parked in `read` with no controller. Granting clipboard
+    /// permission while it is idle has to apply to the OSC 5522 that wakes
+    /// it.
+    #[test]
+    fn clipboard_permission_granted_while_idle_applies_to_the_next_byte() {
+        use base64::Engine as _;
+
+        struct Hold {
+            bytes: Vec<u8>,
+            pos: usize,
+            entered: Arc<(Mutex<bool>, Condvar)>,
+            go: Arc<(Mutex<bool>, Condvar)>,
+        }
+
+        impl Read for Hold {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.pos >= self.bytes.len() {
+                    return Ok(0);
+                }
+                {
+                    let (lock, cv) = &*self.entered;
+                    *lock.lock().unwrap() = true;
+                    cv.notify_one();
+                }
+                {
+                    let (lock, cv) = &*self.go;
+                    let mut go = lock.lock().unwrap();
+                    while !*go {
+                        go = cv.wait(go).unwrap();
+                    }
+                }
+                let n = (self.bytes.len() - self.pos).min(buf.len());
+                buf[..n].copy_from_slice(&self.bytes[self.pos..self.pos + n]);
+                self.pos += n;
+                Ok(n)
+            }
+        }
+
+        #[derive(Clone)]
+        struct SharedBuf(Arc<Mutex<Vec<u8>>>);
+        impl Write for SharedBuf {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let entered = Arc::new((Mutex::new(false), Condvar::new()));
+        let go = Arc::new((Mutex::new(false), Condvar::new()));
+        let state = Arc::new(Mutex::new(test_state(true)));
+        let (controller_tx, controller_rx) = mpsc::channel();
+        let gate = Arc::new(OutputGate::new());
+        let sink = Arc::new(Mutex::new(Vec::new()));
+        let writer: Arc<Mutex<Box<dyn Write + Send>>> =
+            Arc::new(Mutex::new(Box::new(SharedBuf(sink.clone()))));
+        let mime = base64::engine::general_purpose::STANDARD.encode("image/png");
+        let data = base64::engine::general_purpose::STANDARD.encode(b"png-data");
+        let stream = format!(
+            "\x1b]5522;type=write:id=wake\x1b\\\
+             \x1b]5522;type=wdata:mime={mime};{data}\x1b\\\
+             \x1b]5522;type=wdata\x1b\\"
+        );
+        let handle = DaemonPane::spawn_reader(
+            state.clone(),
+            Arc::new(AtomicBool::new(false)),
+            gate.clone(),
+            Box::new(Hold {
+                bytes: stream.into_bytes(),
+                pos: 0,
+                entered: entered.clone(),
+                go: go.clone(),
+            }),
+            writer,
+            || false,
+            ForegroundProbes {
+                group: Box::new(|| None),
+                remote: Box::new(|| None),
+                agent: Box::new(|| None),
+                cwd: Box::new(|| None),
+            },
+            Arc::new(DeathReporter::new(|| {})),
+        );
+
+        {
+            let (lock, cv) = &*entered;
+            let ready = lock.lock().unwrap();
+            let (ready, waited) = cv
+                .wait_timeout(ready, Duration::from_secs(2))
+                .expect("entered lock");
+            assert!(
+                !waited.timed_out() && *ready,
+                "reader did not block in read"
+            );
+        }
+        attach_subscriber_with_permissions(
+            &mut state.lock().unwrap(),
+            controller_tx,
+            &gate,
+            true,
+            false,
+        );
+        {
+            let (lock, cv) = &*go;
+            *lock.lock().unwrap() = true;
+            cv.notify_one();
+        }
+        handle.join().unwrap();
+
+        let frame = controller_rx.try_iter().find_map(|msg| match msg {
+            DaemonMsg::ClipboardWrite(frame) => Some(frame),
+            _ => None,
+        });
+        let write = crate::core::clipboard::ClipboardWrite::decode_frame(
+            frame.expect("the write that woke the reader is allowed"),
+        )
+        .unwrap();
+        assert_eq!(write.mime, "image/png");
+        assert_eq!(write.data, b"png-data");
+        assert_eq!(write.id.as_deref(), Some("wake"));
+        assert!(
+            sink.lock().unwrap().is_empty(),
+            "a grant that lands while idle must not be answered with EPERM"
+        );
+    }
+
+    /// A short master read is the whole delivery and must come back without a
+    /// second `read`. A full packet drains whatever `TIOCOUTQ` / `FIONREAD`
+    /// already has queued, and still returns when that queue is empty instead
+    /// of blocking for the next packet.
+    #[cfg(unix)]
+    #[test]
+    fn burst_read_returns_a_short_packet_and_drains_only_queued_output() {
+        struct OwnedFd(i32);
+        impl Drop for OwnedFd {
+            fn drop(&mut self) {
+                if self.0 >= 0 {
+                    unsafe { libc::close(self.0) };
+                    self.0 = -1;
+                }
+            }
+        }
+        impl Read for OwnedFd {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let n = unsafe { libc::read(self.0, buf.as_mut_ptr().cast(), buf.len()) };
+                if n < 0 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Ok(n as usize)
+                }
+            }
+        }
+
+        fn raw_pty() -> (i32, i32) {
+            let mut master = -1;
+            let mut slave = -1;
+            let rc = unsafe {
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            };
+            assert_eq!(rc, 0, "openpty: {}", std::io::Error::last_os_error());
+            let mut termios = unsafe { std::mem::zeroed::<libc::termios>() };
+            assert_eq!(unsafe { libc::tcgetattr(slave, &mut termios) }, 0);
+            unsafe { libc::cfmakeraw(&mut termios) };
+            assert_eq!(
+                unsafe { libc::tcsetattr(slave, libc::TCSANOW, &termios) },
+                0
+            );
+            (master, slave)
+        }
+
+        fn read_one(master: i32, slave: i32) -> Vec<u8> {
+            let poll = unsafe { libc::dup(master) };
+            assert!(poll >= 0);
+            let mut burst = BurstRead {
+                inner: Box::new(OwnedFd(master)),
+                poll_fd: Some(poll),
+            };
+            let slave = OwnedFd(slave);
+            let (tx, rx) = mpsc::channel();
+            std::thread::spawn(move || {
+                let mut buf = vec![0u8; READ_BURST];
+                let n = burst.read(&mut buf);
+                let _ = tx.send(n.map(|n| buf[..n].to_vec()));
+            });
+            match rx.recv_timeout(Duration::from_secs(2)) {
+                Ok(Ok(got)) => {
+                    drop(slave);
+                    got
+                }
+                other => {
+                    drop(slave);
+                    panic!("pty read blocked after bytes were already queued: {other:?}");
+                }
+            }
+        }
+
+        let (master, slave) = raw_pty();
+        let payload = b"ready $ ";
+        assert_eq!(
+            unsafe { libc::write(slave, payload.as_ptr().cast(), payload.len()) },
+            payload.len() as isize
+        );
+        assert_eq!(read_one(master, slave), payload);
+
+        let (master, slave) = raw_pty();
+        let flags = unsafe { libc::fcntl(slave, libc::F_GETFL) };
+        assert!(flags >= 0);
+        assert_eq!(
+            unsafe { libc::fcntl(slave, libc::F_SETFL, flags | libc::O_NONBLOCK) },
+            0
+        );
+        let blob = vec![b'Q'; 8192];
+        let mut written = 0;
+        while written < blob.len() {
+            let n = unsafe {
+                libc::write(slave, blob[written..].as_ptr().cast(), blob.len() - written)
+            };
+            if n < 0 {
+                let err = std::io::Error::last_os_error();
+                assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
+                break;
+            }
+            assert!(n > 0);
+            written += n as usize;
+        }
+        assert!(
+            written >= PTY_CHUNK,
+            "the pty queue held {written} bytes, short of one packet"
+        );
+        let got = read_one(master, slave);
+        assert_eq!(
+            got.len(),
+            written,
+            "a full packet must take the bytes already queued and not stop \
+             after the first 1 KiB, nor block for bytes that are not queued"
+        );
+        assert!(got.iter().all(|b| *b == b'Q'));
+    }
+
+    /// `TIOCOUTQ` stays positive after `tcflow(TCOOFF)`, and `read` blocks
+    /// until `XON`. The drain must see `poll` say not-readable and return the
+    /// packet already taken instead of waiting for `Ctrl-Q`.
+    #[cfg(unix)]
+    #[test]
+    fn burst_read_does_not_block_when_xoff_stops_the_output_queue() {
+        struct OwnedFd(i32);
+        impl Drop for OwnedFd {
+            fn drop(&mut self) {
+                if self.0 >= 0 {
+                    unsafe { libc::close(self.0) };
+                    self.0 = -1;
+                }
+            }
+        }
+
+        let mut master = -1;
+        let mut slave = -1;
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            },
+            0,
+            "openpty: {}",
+            std::io::Error::last_os_error()
+        );
+        let mut termios = unsafe { std::mem::zeroed::<libc::termios>() };
+        assert_eq!(unsafe { libc::tcgetattr(slave, &mut termios) }, 0);
+        unsafe { libc::cfmakeraw(&mut termios) };
+        assert_eq!(
+            unsafe { libc::tcsetattr(slave, libc::TCSANOW, &termios) },
+            0
+        );
+        let flags = unsafe { libc::fcntl(slave, libc::F_GETFL) };
+        assert!(flags >= 0);
+        assert_eq!(
+            unsafe { libc::fcntl(slave, libc::F_SETFL, flags | libc::O_NONBLOCK) },
+            0
+        );
+        let blob = vec![b'Q'; 8192];
+        let mut written = 0;
+        while written < blob.len() {
+            let n = unsafe {
+                libc::write(slave, blob[written..].as_ptr().cast(), blob.len() - written)
+            };
+            if n < 0 {
+                assert_eq!(
+                    std::io::Error::last_os_error().kind(),
+                    std::io::ErrorKind::WouldBlock
+                );
+                break;
+            }
+            assert!(n > 0);
+            written += n as usize;
+        }
+        assert!(written >= PTY_CHUNK, "queued {written}");
+        assert_eq!(unsafe { libc::tcflow(slave, libc::TCOOFF) }, 0);
+        assert!(
+            !pty_readable(master),
+            "XOFF output must not poll as readable"
+        );
+        assert!(
+            queued_pty_output(master).unwrap_or(0) >= PTY_CHUNK,
+            "XOFF leaves the output queue occupied"
+        );
+
+        struct FirstPacket {
+            fd: i32,
+            served: bool,
+        }
+        impl Read for FirstPacket {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if !self.served {
+                    self.served = true;
+                    let n = PTY_CHUNK.min(buf.len());
+                    buf[..n].fill(b'A');
+                    return Ok(n);
+                }
+                let n = unsafe { libc::read(self.fd, buf.as_mut_ptr().cast(), buf.len()) };
+                if n < 0 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Ok(n as usize)
+                }
+            }
+        }
+        impl Drop for FirstPacket {
+            fn drop(&mut self) {
+                if self.fd >= 0 {
+                    unsafe { libc::close(self.fd) };
+                    self.fd = -1;
+                }
+            }
+        }
+
+        let poll = unsafe { libc::dup(master) };
+        assert!(poll >= 0);
+        let probe = unsafe { libc::dup(master) };
+        assert!(probe >= 0);
+        let mut burst = BurstRead {
+            inner: Box::new(FirstPacket {
+                fd: master,
+                served: false,
+            }),
+            poll_fd: Some(poll),
+        };
+        let slave = OwnedFd(slave);
+        let probe = OwnedFd(probe);
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            let mut buf = vec![0u8; READ_BURST];
+            let read = burst.read(&mut buf);
+            let queued = queued_pty_output(probe.0).unwrap_or(0);
+            let elapsed = started.elapsed();
+            let _ = tx.send(read.map(|n| (buf[..n].to_vec(), queued, elapsed)));
+            drop(burst);
+            drop(probe);
+        });
+        let reported = rx.recv_timeout(Duration::from_millis(800));
+        drop(slave);
+        match reported {
+            Ok(Ok((got, queued, elapsed))) => {
+                assert!(
+                    elapsed < Duration::from_millis(500),
+                    "drain blocked for {elapsed:?} under XOFF"
+                );
+                assert_eq!(got, vec![b'A'; PTY_CHUNK]);
+                assert!(
+                    queued >= PTY_CHUNK,
+                    "drain consumed the stopped queue ({queued} left)"
+                );
+            }
+            other => panic!("burst read blocked while output was XOFF'd: {other:?}"),
+        }
+    }
+
+    /// A slave that keeps writing past one packet has to come back as one
+    /// `read`. Each packet wakes the writer; the drain loops while `poll`
+    /// and the queue count both say more output is already there.
+    #[cfg(unix)]
+    #[test]
+    fn burst_read_coalesces_while_the_slave_keeps_writing() {
+        struct OwnedFd(i32);
+        impl Drop for OwnedFd {
+            fn drop(&mut self) {
+                if self.0 >= 0 {
+                    unsafe { libc::close(self.0) };
+                    self.0 = -1;
+                }
+            }
+        }
+        impl Read for OwnedFd {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let n = unsafe { libc::read(self.0, buf.as_mut_ptr().cast(), buf.len()) };
+                if n > 0 {
+                    let start = std::time::Instant::now();
+                    while start.elapsed() < Duration::from_millis(50) && !pty_readable(self.0) {
+                        std::thread::yield_now();
+                    }
+                }
+                if n < 0 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Ok(n as usize)
+                }
+            }
+        }
+
+        let mut master = -1;
+        let mut slave = -1;
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            },
+            0,
+            "openpty: {}",
+            std::io::Error::last_os_error()
+        );
+        let mut termios = unsafe { std::mem::zeroed::<libc::termios>() };
+        assert_eq!(unsafe { libc::tcgetattr(slave, &mut termios) }, 0);
+        unsafe { libc::cfmakeraw(&mut termios) };
+        assert_eq!(
+            unsafe { libc::tcsetattr(slave, libc::TCSANOW, &termios) },
+            0
+        );
+
+        let total = 8 * 1024;
+        let slave_fd = slave;
+        let writer = std::thread::spawn(move || {
+            let chunk = [b'Z'; 1024];
+            let mut left = total;
+            while left > 0 {
+                let n =
+                    unsafe { libc::write(slave_fd, chunk.as_ptr().cast(), chunk.len().min(left)) };
+                if n < 0 {
+                    let err = std::io::Error::last_os_error();
+                    if err.kind() == std::io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    return Err(err);
+                }
+                if n == 0 {
+                    break;
+                }
+                left -= n as usize;
+            }
+            unsafe { libc::close(slave_fd) };
+            Ok(total - left)
+        });
+
+        let poll = unsafe { libc::dup(master) };
+        assert!(poll >= 0);
+        let mut burst = BurstRead {
+            inner: Box::new(OwnedFd(master)),
+            poll_fd: Some(poll),
+        };
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut buf = vec![0u8; READ_BURST];
+            let n = burst.read(&mut buf);
+            drop(burst);
+            let _ = tx.send(n.map(|n| buf[..n].to_vec()));
+        });
+        let reported = rx.recv_timeout(Duration::from_secs(2));
+        let wrote = writer.join().expect("writer thread");
+        match reported {
+            Ok(Ok(got)) => {
+                let wrote = wrote.expect("slave write");
+                assert_eq!(wrote, total);
+                assert!(
+                    got.len() > 4 * 1024,
+                    "one read coalesced only {} bytes",
+                    got.len()
+                );
+                assert!(got.iter().all(|b| *b == b'Z'));
+            }
+            other => panic!("coalesced read did not return: {other:?}"),
+        }
     }
 }

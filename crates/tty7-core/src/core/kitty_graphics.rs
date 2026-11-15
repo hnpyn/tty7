@@ -117,6 +117,12 @@ impl ApcTokenizer {
         }
     }
 
+    /// Between sequences. Ground only leaves on `0x1b` (an APC is `ESC _`);
+    /// 8-bit C1 `0x9f` is not an introducer here.
+    pub fn is_ground(&self) -> bool {
+        matches!(self.state, State::Ground)
+    }
+
     /// Feed one chunk of output. `on_passthrough` receives runs of non-graphics
     /// bytes (the input minus every `ESC _ G … ST`); `on_command` receives the
     /// `G…` payload of each graphics command that terminates within the chunk.
@@ -337,6 +343,12 @@ impl GraphicsSniffer {
             tokenizer: ApcTokenizer::new(),
             parser: GraphicsParser::new_local(local),
         }
+    }
+
+    /// Between sequences. Ground only leaves on `0x1b` (an APC is `ESC _`);
+    /// 8-bit C1 `0x9f` is not an introducer here.
+    pub fn is_ground(&self) -> bool {
+        self.tokenizer.is_ground()
     }
 
     /// Update whether the sender currently shares this host's filesystem. A pane
