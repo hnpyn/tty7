@@ -708,6 +708,7 @@ const READ_BURST: usize = OUTPUT_COALESCE_MAX;
 /// already queued. A threshold of 1024 never enters the drain for those, so
 /// every read stays one packet. Prompts and echoes are smaller than this and
 /// must not pay for another syscall.
+#[cfg_attr(not(unix), allow(dead_code))]
 const PTY_CHUNK: usize = 256;
 
 pub struct OutputGate {
