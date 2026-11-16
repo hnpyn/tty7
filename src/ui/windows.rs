@@ -878,52 +878,167 @@ fn window_options(cx: &mut App, workspace: Option<WorkspaceId>) -> WindowOptions
     }
 }
 
-/// The display the user is currently working on: the one under the pointer on
-/// macOS ( falling back to the active window's display), so a launch or `⌘N`
-/// opens on the screen in front of the user instead of always jumping to the
-/// primary menu-bar display.
+/// Display of the tty7 window the OS currently considers key.
+///
+/// Recorded from that window while it is on the stack. A shortcut such as
+/// `⌘N` runs inside `App::update_window`, which has already taken that
+/// window out of `cx.windows`, so asking it again with `w.update` returns
+/// `Err` and would otherwise drop the new window on the primary screen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FocusedDisplay {
+    window: gpui::WindowId,
+    display: gpui::DisplayId,
+}
+
+impl Global for FocusedDisplay {}
+
+/// Remember `window`'s display when it is the key window. Callers that
+/// already hold `&Window` — a key binding, the switcher, settings — record
+/// it on the way into `open`, which cannot re-enter `w.update`.
+pub(crate) fn note_focused_display(window: &Window, cx: &mut App) {
+    if !window.is_window_active() {
+        return;
+    }
+    let Some(display) = window.display(cx).map(|display| display.id()) else {
+        return;
+    };
+    let next = FocusedDisplay {
+        window: window.window_handle().window_id(),
+        display,
+    };
+    if cx.try_global::<FocusedDisplay>() != Some(&next) {
+        cx.set_global(next);
+    }
+}
+
+/// Where a new window should open.
+///
+/// A key window of ours wins, including while that window is borrowed by the
+/// action that is opening the new one. The pointer is only the answer when
+/// nothing of ours is key: a Dock, Spotlight, tray, or CLI launch, which is
+/// the screen the user is looking at.
 pub(crate) fn focused_display_id(cx: &mut App) -> Option<gpui::DisplayId> {
-    #[cfg(target_os = "macos")]
-    {
-        #[repr(C)]
-        #[derive(Clone, Copy)]
-        struct CGPoint {
-            x: f64,
-            y: f64,
-        }
-        #[link(name = "CoreGraphics", kind = "framework")]
-        unsafe extern "C" {
-            fn CGEventCreate(source: *const std::ffi::c_void) -> *mut std::ffi::c_void;
-            fn CGEventGetLocation(event: *mut std::ffi::c_void) -> CGPoint;
-            fn CGGetDisplaysWithPoint(
-                point: CGPoint,
-                max_displays: u32,
-                displays: *mut u32,
-                matching_display_count: *mut u32,
-            ) -> i32;
-        }
-        unsafe {
-            let ev = CGEventCreate(std::ptr::null());
-            if !ev.is_null() {
-                let pt = CGEventGetLocation(ev);
-                core_foundation::base::CFRelease(ev as _);
-                let mut id: u32 = 0;
-                let mut count: u32 = 0;
-                if CGGetDisplaysWithPoint(pt, 1, &mut id, &mut count) == 0 && count > 0 {
-                    let candidate = gpui::DisplayId::new(id as u64);
-                    if cx.find_display(candidate).is_some() {
-                        return Some(candidate);
-                    }
+    let choice = match cx.active_window() {
+        Some(window) => match window.update(cx, |_, window, cx| window.display(cx).map(|d| d.id()))
+        {
+            Ok(display) => {
+                if let Some(display) = display {
+                    cx.set_global(FocusedDisplay {
+                        window: window.window_id(),
+                        display,
+                    });
                 }
+                ScreenChoice::Focused(display)
             }
+            Err(_) => {
+                let remembered = cx.try_global::<FocusedDisplay>().and_then(|focused| {
+                    (focused.window == window.window_id()).then_some(focused.display)
+                });
+                ScreenChoice::Focused(remembered)
+            }
+        },
+        None => ScreenChoice::Unfocused,
+    };
+    let cursor = match choice {
+        ScreenChoice::Unfocused => pointer_display(),
+        ScreenChoice::Focused(_) => None,
+    };
+    screen_for_new_window(choice, cursor, |id| cx.find_display(id).is_some())
+}
+
+/// `Focused` means one of our windows is key. `None` inside it means gpui
+/// has not named that window's display; the pointer must not fill in, or a
+/// window on monitor B opens on monitor A because the mouse rested there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ScreenChoice {
+    Focused(Option<gpui::DisplayId>),
+    Unfocused,
+}
+
+fn screen_for_new_window(
+    choice: ScreenChoice,
+    cursor: Option<gpui::DisplayId>,
+    known: impl Fn(gpui::DisplayId) -> bool,
+) -> Option<gpui::DisplayId> {
+    match choice {
+        ScreenChoice::Focused(Some(id)) if known(id) => Some(id),
+        ScreenChoice::Focused(_) => None,
+        ScreenChoice::Unfocused => cursor.filter(|id| known(*id)),
+    }
+}
+
+/// The screen under the pointer. macOS names it with a display id. Windows
+/// names it with the `HMONITOR` gpui already uses as `DisplayId`; the bounds
+/// of that monitor are the virtual screen, which is the same space
+/// `GetCursorPos` reports. Linux reports one X screen at the origin, and a
+/// Wayland pointer is surface-local until a window exists, so a cold launch
+/// there stays on the primary display.
+#[cfg(target_os = "macos")]
+fn pointer_display() -> Option<gpui::DisplayId> {
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct CGPoint {
+        x: f64,
+        y: f64,
+    }
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGEventCreate(source: *const std::ffi::c_void) -> *mut std::ffi::c_void;
+        fn CGEventGetLocation(event: *mut std::ffi::c_void) -> CGPoint;
+        fn CGGetDisplaysWithPoint(
+            point: CGPoint,
+            max_displays: u32,
+            displays: *mut u32,
+            matching_display_count: *mut u32,
+        ) -> i32;
+    }
+    unsafe {
+        let event = CGEventCreate(std::ptr::null());
+        if event.is_null() {
+            return None;
+        }
+        let point = CGEventGetLocation(event);
+        core_foundation::base::CFRelease(event as _);
+        let mut id: u32 = 0;
+        let mut count: u32 = 0;
+        if CGGetDisplaysWithPoint(point, 1, &mut id, &mut count) == 0 && count > 0 {
+            Some(gpui::DisplayId::new(id as u64))
+        } else {
+            None
         }
     }
-    cx.active_window()
-        .and_then(|w| {
-            w.update(cx, |_, window, cx| window.display(cx).map(|d| d.id()))
-                .ok()
-        })
-        .flatten()
+}
+
+#[cfg(target_os = "windows")]
+fn pointer_display() -> Option<gpui::DisplayId> {
+    #[repr(C)]
+    struct Point {
+        x: i32,
+        y: i32,
+    }
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn GetCursorPos(point: *mut Point) -> i32;
+        fn MonitorFromPoint(point: Point, flags: u32) -> *mut std::ffi::c_void;
+    }
+    // No monitor at the point stays "no monitor", rather than the primary.
+    const MONITOR_DEFAULTTONULL: u32 = 0;
+    unsafe {
+        let mut point = Point { x: 0, y: 0 };
+        if GetCursorPos(&mut point) == 0 {
+            return None;
+        }
+        let monitor = MonitorFromPoint(point, MONITOR_DEFAULTTONULL);
+        if monitor.is_null() {
+            return None;
+        }
+        Some(gpui::DisplayId::new(monitor as usize as u64))
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn pointer_display() -> Option<gpui::DisplayId> {
+    None
 }
 
 /// Grow a remembered bound back up to `MIN_SIZE`.
@@ -971,6 +1086,42 @@ mod tests {
     fn the_first_window_is_not_cascaded() {
         let b = bounds_at(100., 100.);
         assert_eq!(cascade(b, 0).origin, b.origin);
+    }
+
+    #[test]
+    fn a_key_window_outranks_the_pointer_and_a_cold_launch_follows_it() {
+        let monitor_a = gpui::DisplayId::new(1);
+        let monitor_b = gpui::DisplayId::new(2);
+        let known = |id: gpui::DisplayId| id == monitor_a || id == monitor_b;
+
+        assert_eq!(
+            screen_for_new_window(
+                ScreenChoice::Focused(Some(monitor_b)),
+                Some(monitor_a),
+                known
+            ),
+            Some(monitor_b),
+            "⌘N follows the key window, not the pointer resting on another screen"
+        );
+        assert_eq!(
+            screen_for_new_window(ScreenChoice::Unfocused, Some(monitor_a), known),
+            Some(monitor_a),
+            "a Dock, Spotlight, or tray launch with no key window follows the pointer"
+        );
+        assert_eq!(
+            screen_for_new_window(
+                ScreenChoice::Focused(Some(gpui::DisplayId::new(9))),
+                Some(monitor_a),
+                known
+            ),
+            None,
+            "an unplugged display is not invented, and the pointer does not sneak in"
+        );
+        assert_eq!(
+            screen_for_new_window(ScreenChoice::Focused(None), Some(monitor_a), known),
+            None,
+            "a key window whose display gpui has not named still outranks the pointer"
+        );
     }
 
     #[test]
