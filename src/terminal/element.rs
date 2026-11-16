@@ -215,6 +215,8 @@ fn snapshot_cell(
     } else {
         if flags.contains(Flags::HIDDEN) {
             fgc = bgc;
+        } else if !bg_default && colors.legible_dim && is_bright_ansi(cell.fg) {
+            fgc = legible_bright_fg(fgc, bgc);
         }
         (fgc, bgc, !bg_default)
     };
@@ -258,6 +260,32 @@ fn snapshot_cell(
     }
     osc8_underline::mark(&mut rc, cell);
     rc
+}
+
+fn is_bright_ansi(color: AnsiColor) -> bool {
+    match color {
+        AnsiColor::Indexed(8..=15) => true,
+        AnsiColor::Named(named) => (8..=15).contains(&(named as usize)),
+        _ => false,
+    }
+}
+
+/// Clears a bright ANSI foreground (`8..=15`) against the cell's own background
+/// when that background is not the terminal default `active_palette` solved for.
+fn legible_bright_fg(fg: Rgb, under: Rgb) -> Rgb {
+    thread_local! {
+        static LAST: std::cell::Cell<Option<(u32, u32, Rgb)>> =
+            const { std::cell::Cell::new(None) };
+    }
+    let (ink, bg) = (pack_rgb(fg), pack_rgb(under));
+    LAST.with(|last| match last.get() {
+        Some((i, b, s)) if i == ink && b == bg => s,
+        _ => {
+            let s = unpack_rgb(crate::ui::presets::legible_bright(ink, bg));
+            last.set(Some((ink, bg, s)));
+            s
+        }
+    })
 }
 
 /// SGR 2's colour: the ink at `DIM_OPACITY` over its cell, or — on a light
@@ -4213,6 +4241,43 @@ mod tests {
                 fade.a *= DIM_OPACITY;
                 assert_eq!(faint.fg, fade, "{}/{name}: switch off still rescued", t.id);
             }
+        }
+    }
+
+    #[test]
+    fn bright_ansi_foreground_clears_the_floor_on_painted_cells() {
+        use crate::ui::presets::{builtins, contrast};
+        let point = AlacPoint::new(AlacLine(0), AlacColumn(0));
+        for t in builtins() {
+            let (mut colors, palette) = builtin_colors(&t);
+            for bg_slot in [0u8, 7, 8, 15] {
+                for fg_slot in 8..16u8 {
+                    let cell = Cell {
+                        c: 'x',
+                        fg: AnsiColor::Indexed(fg_slot),
+                        bg: AnsiColor::Indexed(bg_slot),
+                        ..Cell::default()
+                    };
+                    let rc = snapshot_cell(&cell, point, &palette, &colors, None);
+                    let fg = pack_rgb(super::super::palette::hsla_to_rgb(rc.fg));
+                    let bg = pack_rgb(super::super::palette::hsla_to_rgb(rc.bg));
+                    assert!(
+                        contrast(fg, bg) >= 4.5 - 0.05,
+                        "{}: ansi{fg_slot} on ansi{bg_slot} only {:.2}:1",
+                        t.id,
+                        contrast(fg, bg)
+                    );
+                }
+            }
+            colors.legible_dim = false;
+            let cell = Cell {
+                c: 'x',
+                fg: AnsiColor::Named(NamedColor::BrightWhite),
+                bg: AnsiColor::Named(NamedColor::BrightBlack),
+                ..Cell::default()
+            };
+            let rc = snapshot_cell(&cell, point, &palette, &colors, None);
+            assert_eq!(rc.fg, to_hsla(palette[15]));
         }
     }
 
