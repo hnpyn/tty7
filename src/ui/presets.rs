@@ -746,6 +746,10 @@ fn at_least(ink: u32, toward: u32, surface: u32, target: f32) -> u32 {
     legible_ink(surface, lifted, target)
 }
 
+pub(crate) fn legible_bright(ink: u32, bg: u32) -> u32 {
+    legible_ink(bg, ink, TEXT_FLOOR)
+}
+
 fn legible_ink(bg: u32, seed: u32, floor: f32) -> u32 {
     if contrast(seed, bg) >= floor {
         return seed;
