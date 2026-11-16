@@ -215,7 +215,11 @@ fn snapshot_cell(
     } else {
         if flags.contains(Flags::HIDDEN) {
             fgc = bgc;
-        } else if !bg_default && colors.legible_dim && is_bright_ansi(cell.fg) {
+        } else if !bg_default
+            && colors.legible_dim
+            && is_bright_ansi(cell.fg)
+            && !fg_is_fill(cell.c)
+        {
             fgc = legible_bright_fg(fgc, bgc);
         }
         (fgc, bgc, !bg_default)
@@ -260,6 +264,14 @@ fn snapshot_cell(
     }
     osc8_underline::mark(&mut rc, cell);
     rc
+}
+
+/// Powerline separators and block elements are fills, not text. The triangle
+/// `` is painted so its foreground meets the next segment's background, and
+/// `▀▄█░▒▓` are swatches and bars. Lifting either colour to a text-contrast
+/// floor opens a seam against the cell beside it.
+fn fg_is_fill(c: char) -> bool {
+    PowerlineShape::of(c).is_some() || ('\u{2580}'..='\u{259F}').contains(&c)
 }
 
 fn is_bright_ansi(color: AnsiColor) -> bool {
@@ -4281,6 +4293,64 @@ mod tests {
             };
             let rc = snapshot_cell(&cell, point, &palette, &colors, None);
             assert_eq!(rc.fg, to_hsla(palette[15]));
+        }
+    }
+
+    #[test]
+    fn powerline_and_block_fills_keep_their_bright_palette_color() {
+        use crate::ui::presets::{builtins, contrast};
+        let point = AlacPoint::new(AlacLine(0), AlacColumn(0));
+        //  is a powerline triangle; ▀ is a block-element fill. Both are
+        // drawn as solid colour, so the authored bright slot has to survive.
+        let fills = ['\u{e0b0}', '\u{2580}'];
+        let inks = [
+            (NamedColor::BrightBlack, 8usize),
+            (NamedColor::BrightWhite, 15usize),
+        ];
+        for t in builtins() {
+            let (colors, palette) = builtin_colors(&t);
+            assert!(colors.legible_dim, "{} starts with the floor on", t.id);
+            for (named, slot) in inks {
+                let fg = AnsiColor::Named(named);
+                // The same slot behind the glyph is 1:1, so text must move
+                // and a fill must not.
+                let bg = AnsiColor::Indexed(slot as u8);
+                let authored = to_hsla(palette[slot]);
+                for c in fills {
+                    let cell = Cell {
+                        c,
+                        fg,
+                        bg,
+                        ..Cell::default()
+                    };
+                    let rc = snapshot_cell(&cell, point, &palette, &colors, None);
+                    assert_eq!(
+                        rc.fg, authored,
+                        "{}: U+{:04X} bright slot {slot} was contrast-shifted",
+                        t.id, c as u32
+                    );
+                }
+                let text = Cell {
+                    c: 'A',
+                    fg,
+                    bg,
+                    ..Cell::default()
+                };
+                let rc = snapshot_cell(&text, point, &palette, &colors, None);
+                let painted = pack_rgb(super::super::palette::hsla_to_rgb(rc.fg));
+                let under = pack_rgb(super::super::palette::hsla_to_rgb(rc.bg));
+                assert!(
+                    contrast(painted, under) >= 4.5 - 0.05,
+                    "{}: 'A' bright slot {slot} only {:.2}:1",
+                    t.id,
+                    contrast(painted, under)
+                );
+                assert_ne!(
+                    rc.fg, authored,
+                    "{}: 'A' on its own bright slot has to leave the 1:1 pair",
+                    t.id
+                );
+            }
         }
     }
 
