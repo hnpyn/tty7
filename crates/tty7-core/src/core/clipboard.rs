@@ -264,7 +264,6 @@ impl ClipboardSniffer {
         self.parser.available = epoch.is_some();
     }
 
-    /// Between sequences. See [`crate::core::osc::contains_esc`].
     pub fn is_ground(&self) -> bool {
         self.tokenizer.ground()
     }

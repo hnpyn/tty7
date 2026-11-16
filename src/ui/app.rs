@@ -1900,6 +1900,9 @@ impl Tty7App {
             crate::ui::windows::note_focused_display(window, cx);
         })
         .detach();
+        // The window is often already key before this observer exists, and
+        // activation only reports a later change.
+        crate::ui::windows::note_focused_display(window, cx);
 
         // With focus on nothing, or on a handle whose element is gone (a panel
         // closed under it, a context menu that dismissed), gpui dispatches keys
@@ -7026,10 +7029,7 @@ impl Tty7App {
         match kind {
             NewTab => self.new_tab(window, cx),
             NewWorkspace => self.open_workspace_form(window, cx),
-            NewWindow => {
-                crate::ui::windows::note_focused_display(window, cx);
-                self.new_window(cx);
-            }
+            NewWindow => self.new_window(cx),
             OpenWorkspacePicker => self.open_switcher(window, cx),
             StopWorkspace => self.stop_workspace(self.workspace, window, cx),
             DeleteWorkspace => self.delete_workspace(self.workspace, window, cx),
@@ -7619,11 +7619,8 @@ impl Tty7App {
     ) {
         let owner = window.window_handle();
         let app = cx.entity();
-        // Captured while this window is on the stack. The open is deferred,
-        // and by then a re-entrant `w.update` still cannot see a window that
-        // the current turn has borrowed.
+        // This window is borrowed for the turn, so the deferred open cannot ask it again.
         let on_display = window.display(cx).map(|display| display.id());
-        crate::ui::windows::note_focused_display(window, cx);
         // Deferred: the new window's state is built by updating this entity,
         // which cannot happen while this call still holds it.
         cx.defer(move |cx| {
@@ -9632,7 +9629,6 @@ impl Render for Tty7App {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         #[cfg(test)]
         render_probe::record();
-        crate::ui::windows::note_focused_display(window, cx);
         let prof = crate::ui::perf::enabled().then(std::time::Instant::now);
         // Every window's root is this view, so setting the rem here is what
         // makes `ui_font_size` reach the whole interface — the rem ladder
@@ -10134,10 +10130,7 @@ impl Render for Tty7App {
                 .on_action(cx.listener(|this, _: &NewWorkspace, window, cx| {
                     this.open_workspace_form(window, cx);
                 }))
-                .on_action(cx.listener(|this, _: &NewWindow, window, cx| {
-                    crate::ui::windows::note_focused_display(window, cx);
-                    this.new_window(cx);
-                }))
+                .on_action(cx.listener(|this, _: &NewWindow, _, cx| this.new_window(cx)))
                 .on_action(
                     cx.listener(|this, _: &CloseWindow, window, cx| this.close_window(window, cx)),
                 )

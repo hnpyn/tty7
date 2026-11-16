@@ -117,8 +117,6 @@ impl ApcTokenizer {
         }
     }
 
-    /// Between sequences. Ground only leaves on `0x1b` (an APC is `ESC _`);
-    /// 8-bit C1 `0x9f` is not an introducer here.
     pub fn is_ground(&self) -> bool {
         matches!(self.state, State::Ground)
     }
@@ -345,8 +343,6 @@ impl GraphicsSniffer {
         }
     }
 
-    /// Between sequences. Ground only leaves on `0x1b` (an APC is `ESC _`);
-    /// 8-bit C1 `0x9f` is not an introducer here.
     pub fn is_ground(&self) -> bool {
         self.tokenizer.is_ground()
     }
