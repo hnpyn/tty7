@@ -94,12 +94,7 @@ fn spawn_config_watcher(cx: &mut App) {
     .detach();
 }
 
-/// One watcher tick, once the debounce is out: what a reload does to the
-/// running app.
-///
-/// `announced` is the one-toast-per-breakage latch, which lives across ticks
-/// in the watcher. Returns whether the keymap was rebuilt — the watcher has no
-/// use for that; it is how a test asks which branch ran.
+/// Applies one debounced config reload. Returns whether the keymap was rebuilt.
 fn apply_reloaded_config(
     cx: &mut App,
     load: (Config, crate::core::config::LoadOutcome),
@@ -107,46 +102,23 @@ fn apply_reloaded_config(
 ) -> bool {
     let (config, outcome) = load;
     if outcome.failed() {
-        // Keep the settings the app is running on: swapping the stand-in
-        // defaults in would flash the whole UI onto defaults, and the load
-        // already parked the broken file beside the original. It reloads
-        // itself the moment the file parses again.
+        // Keep the running config. Swapping in defaults would flash the UI, and the broken file is already parked.
         if !*announced {
             *announced = true;
             notify_config_load_failed(cx, outcome, false);
         }
-        // The theme files this same watcher covers must keep hot-reloading: a
-        // typo in config.json is no reason for theme editing to go dead until
-        // the app restarts. They read the global config, which is deliberately
-        // still the one the app is running on.
+        // Theme files share this watcher and must still reload while config.json is broken.
         reload_themes(cx);
         cx.refresh_windows();
         return false;
     }
     *announced = false;
-    // The keymap is rebuilt only when a binding actually moved. This watcher
-    // fires for every write under the config dir — including the app's own
-    // `save()`, which a sidebar drag or a palette open triggers — so reloading
-    // bindings on each tick would rebuild the whole keymap for nothing, and
-    // (before `rebind` cleared first) leak a full table per tick (#548).
-    // Read past the early return above: a load that failed leaves the global
-    // alone, so there is nothing to compare and the user's keys stay in the
-    // keymap the app is dispatching on.
+    // Rebuild bindings only when one actually moved. This fires on every config write.
     let keymap_before = crate::ui::keymap::keybinding_config(cx);
-    // Explorer's verbs live in the registry rather than in this process, so a
-    // hand-edited `gui_language` leaves them behind unless something restates
-    // them. Gated on the language actually moving, for the same reason the
-    // keymap below is: this watcher fires on every config write, and a sidebar
-    // drag has no business touching the registry.
     crate::ui::i18n::set_locale(&config.gui_language);
     cx.set_global(config);
     reload_themes(cx);
     crate::ui::theme::apply_cursor_hide_mode(cx);
-    // A hand-edited keybinding shows up in the settings list off the live
-    // global immediately; without this it never reaches the keymap gpui
-    // actually dispatches against, so the key looks bound and does nothing
-    // until restart. Gated on the triple so an unrelated save does not churn
-    // it.
     let rebound = crate::ui::keymap::keybinding_config(cx) != keymap_before;
     if rebound {
         crate::ui::keymap::rebind(cx);
@@ -164,18 +136,13 @@ fn is_theme_file(p: &std::path::Path) -> bool {
         })
 }
 
-/// Re-reads what the theme files on disk say. The config watcher covers the
-/// themes directory too, so this has to run even when config.json itself did
-/// not load — editing a theme cannot go dead because of a typo elsewhere.
+/// Re-reads theme files. Runs even when config.json failed, so a typo there cannot freeze theme edits.
 fn reload_themes(cx: &mut App) {
     crate::ui::presets::load_registry(cx);
     crate::ui::theme::apply_theme(None, cx);
 }
 
-/// Says out loud that config.json did not load and, when there is one, where
-/// its contents were parked. Without this the symptom is "my settings are
-/// gone" (startup) or "my edit did nothing" (reload) — both read as data loss,
-/// and neither points at the file that needs fixing.
+/// Reports that config.json did not load, and where its contents were parked.
 fn notify_config_load_failed(
     _cx: &mut App,
     outcome: crate::core::config::LoadOutcome,
@@ -470,13 +437,13 @@ fn note_external_opens(urls: Vec<String>) {
             *OPENED_PATH.lock().unwrap_or_else(|e| e.into_inner()) = Some(first);
         }
         for extra in dirs {
-            spawn_new_instance(Some(&extra));
+            spawn_new_instance(Some(&extra), None);
         }
         return;
     }
     if window_is_live() {
         for dir in dirs {
-            spawn_new_instance(Some(&dir));
+            spawn_new_instance(Some(&dir), None);
         }
         return;
     }
@@ -487,7 +454,7 @@ fn note_external_opens(urls: Vec<String>) {
     }
     drop(pending);
     for dir in dirs {
-        spawn_new_instance(Some(&dir));
+        spawn_new_instance(Some(&dir), None);
     }
 }
 
@@ -846,32 +813,15 @@ pub(crate) fn new_instance_args(
     args
 }
 
-/// Display the parent window asked this process to open on. `solo::open`
-/// runs before any window exists, so the id has to arrive on the command line.
-static INHERITED_DISPLAY: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+/// Display the parent window asked this process to open on.
+static INHERITED_DISPLAY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 
-pub(crate) fn note_inherited_display(id: Option<u64>) {
+pub(crate) fn note_inherited_display(id: u64) {
     let _ = INHERITED_DISPLAY.set(id);
 }
 
 pub(crate) fn inherited_display() -> Option<u64> {
-    INHERITED_DISPLAY.get().copied().flatten()
-}
-
-/// Display of the ntty7 window that is key right now. Another window is
-/// another process, and that process starts with nothing to ask.
-static SPAWN_DISPLAY: std::sync::Mutex<Option<u64>> = std::sync::Mutex::new(None);
-
-pub(crate) fn set_spawn_display(id: Option<u64>) {
-    *SPAWN_DISPLAY
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner()) = id;
-}
-
-fn spawn_display() -> Option<u64> {
-    *SPAWN_DISPLAY
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner())
+    INHERITED_DISPLAY.get().copied()
 }
 
 pub(crate) fn display_from_args(mut args: impl Iterator<Item = std::ffi::OsString>) -> Option<u64> {
@@ -912,14 +862,14 @@ fn detach(cmd: &mut std::process::Command) {
     cmd.creation_flags(DETACHED_PROCESS | CREATE_NO_WINDOW);
 }
 
-pub(crate) fn spawn_new_instance(cwd: Option<&std::path::Path>) {
+pub(crate) fn spawn_new_instance(cwd: Option<&std::path::Path>, display: Option<u64>) {
     let Ok(exe) = std::env::current_exe() else {
         log::warn!("could not locate ntty7 to open another window");
         return;
     };
     let config = crate::core::config::config_dir_path();
     let mut cmd = std::process::Command::new(exe);
-    cmd.args(new_instance_args(cwd, config.as_deref(), spawn_display()));
+    cmd.args(new_instance_args(cwd, config.as_deref(), display));
     strip_inherited_terminal_env(&mut cmd);
     cmd.stdin(std::process::Stdio::null());
     cmd.stdout(std::process::Stdio::null());
@@ -936,7 +886,9 @@ fn main() {
     scrub_inherited_terminal_env();
 
     let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
-    note_inherited_display(display_from_args(args.iter().cloned()));
+    if let Some(id) = display_from_args(args.iter().cloned()) {
+        note_inherited_display(id);
+    }
 
     apply_config_dir_arg(&args);
     // A killed window never retires. Drop files whose process is gone; a

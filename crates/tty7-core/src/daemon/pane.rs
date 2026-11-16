@@ -670,44 +670,22 @@ pub(crate) struct ReplaySegment {
 
 const REMOTE_CONTEXT_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
-/// How often a sustained flood may call `tcgetpgrp`. A read smaller than
-/// [`GROUP_FLOOD_BYTES`], or one that spent [`GROUP_IDLE_GAP`] blocked in
-/// `read`, checks immediately, as do prompt and command marks (`OSC 133`
-/// `B`/`C`/`D`) and a cwd report.
+/// Minimum gap between `tcgetpgrp` calls during a sustained flood.
 const GROUP_CHECK_INTERVAL: Duration = Duration::from_millis(50);
 
-/// A read this small is a prompt, an echo, or a `preexec` line. A sustained
-/// burst is anything larger that `read` returned without blocking: one Darwin
-/// packet is about 1 KiB (often a few bytes under that when `ONLCR` would
-/// have to split `\n` → `\r\n` across the boundary), and a slave racing the
-/// drain commonly leaves only the next packet queued as well. Those must not
-/// call `tcgetpgrp` on every read. A child that took the tty and then went
-/// quiet still shows up, because a pause of [`GROUP_IDLE_GAP`], a prompt
-/// mark, or a group that is not settled yet checks immediately.
+/// Reads smaller than this, or after a pause, check the foreground group immediately.
 const GROUP_FLOOD_BYTES: usize = 512;
 
-/// How long `read` itself may block before the next chunk counts as a pause.
-/// A flood that is already queued returns at once, so it stays on the 50 ms
-/// timer; a shell that produced nothing for this long does not.
+/// A `read` that blocked this long counts as a pause, not a flood.
 const GROUP_IDLE_GAP: Duration = Duration::from_millis(2);
 
-/// Largest `Output` payload held as one `Vec` on the in-process pipe. Adjacent
-/// output is appended in place up to this, then a fresh `Vec` starts. Control
-/// messages are never merged into it.
+/// Cap for appending adjacent `Output` into one in-process buffer.
 const OUTPUT_COALESCE_MAX: usize = 256 * 1024;
 
-/// One PTY read, after draining output the kernel has already queued.
-/// Matches [`OUTPUT_COALESCE_MAX`] so a burst becomes one buffer instead of
-/// a 1 KiB syscall per iteration.
+/// One PTY read after draining bytes the kernel has already queued.
 const READ_BURST: usize = OUTPUT_COALESCE_MAX;
 
-/// Smallest master `read` that is a packet rather than a keystroke. Darwin
-/// stops a PTY delivery at about 1 KiB, but `OPOST|ONLCR` often returns a few
-/// bytes under that when `\n` → `\r\n` would cross the boundary, and a reader
-/// that keeps up with the slave sees a few hundred bytes of whatever is
-/// already queued. A threshold of 1024 never enters the drain for those, so
-/// every read stays one packet. Prompts and echoes are smaller than this and
-/// must not pay for another syscall.
+/// Below this, a read is a keystroke, not a packet worth draining.
 #[cfg_attr(not(unix), allow(dead_code))]
 const PTY_CHUNK: usize = 256;
 
@@ -1022,11 +1000,7 @@ struct SizeLease {
     desk: WinSize,
 }
 
-/// Clipboard controller the reader applies to the chunk it just woke up
-/// with. Epoch and permission share one word, so a publish and a load
-/// cannot tear into `(old epoch, new permission)`. `0` is no controller.
-/// A live one (`epoch >= 1`) is `(epoch << 1) | allowed`. The reader holds
-/// its own `Arc` and never takes the pane lock to read this.
+/// Clipboard epoch and permission in one word: `0` is none, else `(epoch << 1) | allowed`.
 struct ClipPermit {
     word: AtomicU64,
 }
@@ -1427,13 +1401,7 @@ fn fan_out_output(st: &mut PaneState, bytes: &[u8], frames: Vec<GraphicsFrame>, 
 }
 
 struct ForegroundProbes {
-    /// The pty's foreground process group. A sustained flood
-    /// ([`GROUP_FLOOD_BYTES`] or more, with `read` returning inside
-    /// [`GROUP_IDLE_GAP`]) asks at most every [`GROUP_CHECK_INTERVAL`]. Any
-    /// smaller read, any pause, an OSC 133 `B`/`C`/`D`, or a cwd report asks
-    /// immediately, and the read after a `C` whose group has not moved yet
-    /// asks again — the child often takes the tty on that next chunk. A change
-    /// is what says the probes below would now answer differently.
+    /// Foreground process group. A change means the probes below would now answer differently.
     group: Box<dyn Fn() -> Option<i32> + Send>,
     remote: Box<dyn Fn() -> Option<RemoteContext> + Send>,
     agent: Box<dyn Fn() -> Option<Option<(crate::core::cli_agent::CLIAgent, Vec<String>)>> + Send>,
@@ -1892,17 +1860,8 @@ fn lift_out_of_band<'a>(
     }
 }
 
-/// Split one PTY chunk into passthrough bytes, out-of-band frames, and OSC
-/// signals.
-///
-/// When clipboard, graphics, the OSC sniffer, and the mode tracker are all in
-/// ground and the chunk holds no `0x1b`, one SIMD scan skips every state
-/// machine. Ground only advances on `0x1b` (none of these parsers treat 8-bit
-/// C1 as an introducer — see [`crate::core::osc::contains_esc`]). A sequence
-/// split across reads leaves its machine *outside* ground, so the following
-/// chunk is still fed when it has no ESC: the rest of an OSC can be payload
-/// plus BEL, and the rest of a kitty APC can be the `\` of an ST whose ESC
-/// arrived in the previous chunk.
+/// Split one chunk into passthrough, out-of-band frames, and OSC signals.
+/// Ground machines with no `0x1b` skip the parsers; a sequence split across reads stays outside ground.
 fn scan_chunk<'a>(
     raw: &'a [u8],
     clipboard: &mut ClipboardSniffer,
@@ -1949,24 +1908,8 @@ fn scan_chunk<'a>(
     (passthrough, frames, signals, fed_modes)
 }
 
-/// PTY reader that, after a blocking read of a full packet, drains output
-/// the kernel has already queued. macOS hands back ~1 KiB per `read` even
-/// when the slave wrote megabytes, so one call returns up to [`READ_BURST`].
-///
-/// A short read returns immediately: a prompt or a keystroke is not followed
-/// by another syscall. The continuation never sets `O_NONBLOCK`. `dup`
-/// shares the open file description with [`PtyWriter`], and a non-blocking
-/// master would make `write_all` return `EAGAIN` when the input buffer is
-/// full. The drain `poll`s with a zero timeout and, while `POLLIN` is set,
-/// reads another packet. `XOFF` (`TS_TTSTOP`) already clears `POLLIN` — a
-/// follow-up `read` would block until `Ctrl-Q` — so a stopped queue never
-/// starts one.
-///
-/// Darwin's `TIOCOUTQ` is the wrong size for that packet. A saturated master
-/// holds one 1024-byte clist block, `FIONREAD` stays 0 for it, and the ioctl
-/// itself once per block made a flooded `cat` take about twice as long. A
-/// continuation asks for at most that block. Asking for the rest of a
-/// 256 KiB buffer instead makes `ONLCR` occasionally emit a second CR.
+/// After a full packet, drains output the kernel already queued, up to [`READ_BURST`].
+/// A short read returns immediately, and the master stays blocking: `dup` shares the fd with [`PtyWriter`].
 struct BurstRead {
     inner: Box<dyn Read + Send>,
     poll_fd: Option<i32>,
@@ -1993,9 +1936,7 @@ impl Read for BurstRead {
         if filled == 0 || filled == buf.len() {
             return Ok(filled);
         }
-        // A short packet is the whole delivery. Draining it would be an
-        // extra syscall on every echo, and the only `read` that can block
-        // with bytes already in `buf`.
+        // A short read is the whole delivery: draining it is another syscall, and the only read that can block with bytes in hand.
         #[cfg(unix)]
         if filled >= PTY_CHUNK
             && let Some(fd) = self.poll_fd
@@ -2008,6 +1949,7 @@ impl Read for BurstRead {
     }
 }
 
+/// While `POLLIN` is set, read the next packet. `XOFF` clears `POLLIN` while `TIOCOUTQ` stays positive, so a stopped queue is not read.
 #[cfg(unix)]
 fn drain_queued(
     inner: &mut dyn Read,
@@ -2015,9 +1957,6 @@ fn drain_queued(
     buf: &mut [u8],
     mut filled: usize,
 ) -> std::io::Result<usize> {
-    // `POLLIN` is the only gate. Flow control (`Ctrl-S` / `tcflow(TCOOFF)`)
-    // clears it while `TIOCOUTQ` stays positive, and a zero-timeout `poll`
-    // does not consume the byte a later `read` has to return.
     while filled < buf.len() && pty_readable(fd) {
         let want = drain_read_len(buf.len() - filled);
         match inner.read(&mut buf[filled..filled + want]) {
@@ -2031,36 +1970,16 @@ fn drain_queued(
     Ok(filled)
 }
 
-/// Bytes the next continuation may ask the kernel for.
-///
-/// On Darwin that is one clist block. A larger request is not faster — the
-/// master never returns more than the block — and it is the request that
-/// makes `ONLCR` insert an extra CR. Other kernels will return a big buffer
-/// in one `read`, so the cap would only add syscalls.
+/// Darwin returns at most one 1024-byte clist block; a larger ask makes `ONLCR` insert a CR.
 #[cfg(unix)]
 fn drain_read_len(remaining: usize) -> usize {
-    #[cfg(any(
-        target_os = "macos",
-        target_os = "ios",
-        target_os = "tvos",
-        target_os = "watchos"
-    ))]
-    {
-        remaining.min(1024)
-    }
-    #[cfg(not(any(
-        target_os = "macos",
-        target_os = "ios",
-        target_os = "tvos",
-        target_os = "watchos"
-    )))]
-    {
-        remaining
-    }
+    #[cfg(target_vendor = "apple")]
+    return remaining.min(1024);
+    #[cfg(not(target_vendor = "apple"))]
+    remaining
 }
 
-/// `POLLIN` with a zero timeout. False when the master is `XOFF`'d: the
-/// output queue may still hold bytes, and `read` would block until `XON`.
+/// Zero-timeout `POLLIN`. It does not consume the byte a later `read` returns.
 #[cfg(unix)]
 fn pty_readable(fd: i32) -> bool {
     let mut pfd = libc::pollfd {
@@ -2080,17 +1999,11 @@ fn pty_readable(fd: i32) -> bool {
     }
 }
 
-/// Bytes of slave output waiting on the master. `None` means the queue is
-/// empty or the ioctl failed. Kept for the `XOFF` test: the count stays
-/// positive while output is stopped, which is exactly why the drain must
-/// not treat it as "safe to read".
+/// Slave bytes waiting on the master, for tests. `None` if the queue is empty or the ioctl failed.
 #[cfg(all(unix, test))]
 fn queued_pty_output(fd: i32) -> Option<usize> {
     let mut avail: libc::c_int = 0;
-    // macOS reports the master's readable output through `TIOCOUTQ`.
-    // `FIONREAD` stays 0 for that data and instead counts keystrokes the
-    // slave has not read yet. Linux reports the readable output through
-    // `FIONREAD`.
+    // macOS counts readable output with `TIOCOUTQ`; `FIONREAD` there is unread keystrokes. Linux uses `FIONREAD`.
     #[cfg(any(
         target_os = "macos",
         target_os = "ios",
@@ -2646,9 +2559,7 @@ impl DaemonPane {
                     }
                     gate.wait_below_high_water();
                     let tr0 = trace.then(std::time::Instant::now);
-                    // Only the time spent blocked in `read`. A flood that is
-                    // already queued returns immediately; backpressure waits
-                    // above are not an idle gap.
+                    // Blocked time in `read` only; backpressure above is not an idle gap.
                     let waited = std::time::Instant::now();
                     match reader.read(&mut buf) {
                         Ok(0) => break,
@@ -2660,11 +2571,7 @@ impl DaemonPane {
                                 tr_bytes += n as u64;
                             }
                             let raw = &buf[..n];
-                            // Loaded after `read` returns. An attach or detach
-                            // that landed while this read was blocked has
-                            // already published, so the first byte of this
-                            // chunk sees it. The cache from the previous
-                            // iteration would still say the old controller.
+                            // After `read`, so an attach during the block is already published.
                             let (clip_epoch, clip_allowed) = clip_permit.load();
                             clipboard.set_controller(clip_epoch, clip_allowed);
                             let (passthrough, frames, mut signals, fed_modes) = scan_chunk(
@@ -2678,41 +2585,13 @@ impl DaemonPane {
                             );
                             let bytes: &[u8] = &passthrough;
 
-                            // `any` first: `foreground_running` is a syscall,
-                            // and most reads carry no prompt mark at all.
                             if signals.shell.iter().any(|s| s.at_prompt) && foreground_running() {
                                 suppress_relayed_prompt_marks(&mut signals.shell);
                             }
 
-                            // A prompt mark that survived the suppression above
-                            // is the shell saying the command it ran is over, so
-                            // the foreground has just gone back to being the
-                            // shell itself. Probe right then rather than waiting
-                            // out the interval: the probe is what clears the
-                            // remote context an `ssh` left behind, and the
-                            // interval alone can miss it forever. Polling only
-                            // runs on output, and the prompt the shell just drew
-                            // is the last output a pane produces until the user
-                            // types again — so a pane whose `ssh` exited inside
-                            // the interval kept reporting itself as remote, and
-                            // everything keyed off that (the history scope ↑
-                            // reads, most visibly) stayed on the far end until
-                            // some unrelated output arrived (#817).
+                            // A prompt is the shell reclaiming the tty; probe now, or a quiet pane keeps the old remote.
                             let back_at_prompt = signals.shell.iter().any(|s| s.at_prompt);
-                            // `tcgetpgrp` on every PTY packet dominated a plain
-                            // burst. A flood — anything of [`GROUP_FLOOD_BYTES`]
-                            // or more that did not block in `read` — asks on a
-                            // timer. One Darwin packet is already that big,
-                            // including the `ONLCR` deliveries that come back a
-                            // few bytes under 1 KiB and the one-or-two packets
-                            // a racing slave has queued when the drain stops.
-                            // A short read or a pause asks every time: an
-                            // uninstrumented shell, and a `preexec` line that
-                            // lands before the child calls `tcsetpgrp`, both
-                            // look settled until that next small chunk. A `C`
-                            // whose group has not moved yet leaves the next
-                            // read unsettled too — the child often takes the
-                            // tty on the following chunk.
+                            // Floods ask on a timer. A short read, a pause, or an unsettled group asks immediately.
                             let now = std::time::Instant::now();
                             let check_group = bytes.len() < GROUP_FLOOD_BYTES
                                 || idle_gap >= GROUP_IDLE_GAP

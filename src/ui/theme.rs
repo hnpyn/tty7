@@ -434,14 +434,7 @@ pub(crate) fn resolved_background_appearance(
     }
     #[cfg(not(target_os = "windows"))]
     {
-        // `window_backdrop` is a Windows-only setting and this platform has
-        // no UI to change or clear it (only "Reset window overrides", which
-        // also clobbers opacity). If any variant pinned the appearance
-        // here, the local blur switch would silently show a checked state
-        // that isn't rendered — so every variant, including Off and Blur,
-        // defers to the legacy toggle. (A Windows-synced "off" therefore
-        // does not force transparency on macOS/Linux; the local blur switch
-        // stays authoritative.)
+        // `window_backdrop` has no UI here, so the local blur switch stays authoritative.
         if blur {
             WindowBackgroundAppearance::Blurred
         } else {
@@ -450,19 +443,8 @@ pub(crate) fn resolved_background_appearance(
     }
 }
 
-/// Whether the resolved backdrop on this platform is actually a material —
-/// i.e. the window content sits over a blur/mica layer instead of plain
-/// transparency. Derived from `resolved_background_appearance` so the
-/// opacity defaulting and the appearance resolution can never disagree: on
-/// very old builds `Blur`/`Acrylic` fall back to `Transparent`, and a
-/// see-through window with no material behind it gets no special opacity.
-///
-/// `Auto` never counts, even when the legacy blur toggle resolves it to
-/// `Blurred`. It is the default for every config written before this
-/// setting existed, and those windows were opaque with opaque sidebars —
-/// treating them as materials would silently turn an untouched install
-/// see-through on first launch after an update. Only an explicit pick in
-/// the backdrop dropdown opts a window into the translucent defaults.
+/// True when this platform is actually compositing a material, not plain transparency.
+/// `Auto` never counts: it is the pre-setting default, and those windows stayed opaque.
 pub(crate) fn material_active(backdrop: WindowBackdrop, blur: bool) -> bool {
     cfg!(target_os = "windows")
         && backdrop != WindowBackdrop::Auto
@@ -496,18 +478,7 @@ fn effective_window_opacity(config: &Config, theme: &presets::Theme, blur: bool)
         .unwrap_or_else(|| default_window_opacity(config.window_backdrop, blur))
 }
 
-/// What a window is actually handed: the resolved backdrop, except that on
-/// Windows a fully opaque fill over no DWM material is reported as
-/// `Opaque`.
-///
-/// gpui only rasterizes ClearType (subpixel) glyphs into an `Opaque` window
-/// — subpixel coverage cannot be alpha-blended onto whatever is behind a
-/// translucent one — so asking for `Transparent` (or the WCA blur) while
-/// painting every pixel at alpha 1 silently drops every glyph to grayscale
-/// antialiasing for nothing: nothing behind the window can show through
-/// anyway (#1120). The DWM materials (Mica / Mica Alt / Acrylic) are left as
-/// they are: switching away from one through `Opaque` would not clear the
-/// system backdrop type, and they default to a translucent fill regardless.
+/// Opaque Windows fills are reported as `Opaque` so ClearType stays on. DWM materials stay as they are.
 pub(crate) fn windows_window_appearance(
     resolved: WindowBackgroundAppearance,
     opacity: f32,
@@ -543,16 +514,8 @@ pub(crate) fn background_appearance(cx: &App) -> WindowBackgroundAppearance {
     window_appearance(config.window_backdrop, blur, opacity)
 }
 
-/// The appearance last handed to each live window, so `apply_theme` can skip
-/// a `set_background_appearance` that would change nothing.
-///
-/// Worth the bookkeeping because the call is no longer cheap: with a DWM
-/// material selected, gpui answers it by re-setting
-/// `DWMWA_SYSTEMBACKDROP_TYPE` and forcing a non-client frame recalculation
-/// (`SetWindowPos` with `SWP_FRAMECHANGED`). `apply_theme` runs on *every*
-/// `Config` mutation in *every* window, so dragging the opacity slider —
-/// which never changes the appearance — would otherwise recalc the frame
-/// once per mouse-move sample and visibly stutter the drag.
+/// Last appearance handed to each window, so `apply_theme` can skip a no-op `set_background_appearance`.
+/// With a DWM material that call recalculates the non-client frame, which stutters an opacity drag.
 #[derive(Default)]
 struct AppliedAppearance(std::collections::HashMap<gpui::WindowId, WindowBackgroundAppearance>);
 
@@ -854,27 +817,12 @@ pub(crate) fn apply_theme(mut window: Option<&mut Window>, cx: &mut App) {
     t.tokens.scrollbar_thumb = scrollbar_thumb.into();
     t.tokens.scrollbar_thumb_hover = scrollbar_thumb_hover.into();
 
-    // Not `should_auto_hide_scrollbars()`. That preference answers a question
-    // about *legacy* scrollbars — the ones that take a gutter out of the layout
-    // — and macOS says "don't hide them" for anyone with a mouse plugged in.
-    // Ours are overlay bars painted on top of the content, so honouring it
-    // parked an opaque bar over the switcher's tab column for the whole time
-    // the panel was open, with nothing to fade it out. Every list in the app
-    // gets the same bar, so it fades everywhere or nowhere.
+    // Overlay bars, so they fade rather than taking a layout gutter.
     t.scrollbar_show = ScrollbarShow::Scrolling;
 
     t.radius = px(8.);
 
-    // Flat controls, floating panels. `Theme::shadow` gates exactly one thing —
-    // the `shadow_xs` an inline control (button, input, select trigger,
-    // checkbox, radio, slider knob) paints under itself — and never the drop
-    // shadow on a menu, tooltip or popover, which every one of those draws
-    // unconditionally. Left on, every field and button in the window carried a
-    // faint lift that nothing else here has: this chrome separates surfaces with
-    // low-contrast fills and hairlines, so a control sitting a millimetre above
-    // the panel was the one place claiming depth, and it read as a rendering
-    // artefact rather than as a material. Panels that really do float keep
-    // their shadow.
+    // `Theme::shadow` is only the lift under inline controls. This chrome uses fills and hairlines, so that lift reads as a glitch.
     t.shadow = false;
 
     let sidebar_bg = Hsla::from(rgb(m.sidebar));
@@ -925,23 +873,7 @@ pub(crate) fn apply_theme(mut window: Option<&mut Window>, cx: &mut App) {
     // ring and the on-switch.
     t.drag_border = rgb(m.accent).into();
 
-    // The code editor's gutter fill and current-line band do not come from
-    // `Theme` at all — gpui-component reads them off the *syntax* theme, which
-    // is still its stock one. So the editor painted a #0a0a0a strip down the
-    // line-number column and a #171717 band across the cursor's line, on top of
-    // a preset background that is nowhere near either. That is the black edge.
-    //
-    // Cleared to transparent rather than repainted with the preset's own fill:
-    // the code panel sits on the window background, which may be a gradient or
-    // a wallpaper image, and any flat colour would show as a seam against it.
-    // The current line and the invisibles become translucent ink for the same
-    // reason — they read correctly on light and dark presets alike.
-    //
-    // A transparent gutter is only safe because our gpui-component fork clips
-    // the editor's scrolling content to the right of the line-number column.
-    // Upstream leans on the opaque gutter fill to hide horizontally scrolled
-    // text, so on a stock build clearing this key lets the text run straight
-    // across the line numbers.
+    // Transparent gutter and active line: the panel sits on a gradient or wallpaper, and a flat fill would seam.
     let ink: Hsla = rgb(m.foreground).into();
     let mut highlight = (*t.highlight_theme).clone();
     highlight.style.editor_background = Some(gpui::transparent_black());

@@ -28,9 +28,6 @@ impl OscTokenizer {
         }
     }
 
-    /// Between sequences. Ground only leaves on `0x1b` — 8-bit C1 controls
-    /// are ordinary payload bytes here, so a chunk with no ESC cannot move
-    /// an idle tokenizer.
     pub fn is_ground(&self) -> bool {
         matches!(self.state, State::Ground)
     }
@@ -132,13 +129,7 @@ impl OscTokenizer {
     }
 }
 
-/// Whether `bytes` contains an ESC introducer (`0x1b`).
-///
-/// Ground in [`OscTokenizer`], [`crate::core::term_modes::TerminalModes`],
-/// the clipboard tokenizer, and the kitty APC tokenizer all wait on `0x1b`
-/// alone. None of them treat 8-bit C1 (`0x90` DCS, `0x9b` CSI, `0x9d` OSC,
-/// `0x9f` APC) as an introducer, so one SIMD scan is enough to prove a
-/// chunk is plain text for every idle machine on the output path.
+/// `0x1b` only. Idle ground states wait on ESC; 8-bit C1 is not an introducer.
 pub fn contains_esc(bytes: &[u8]) -> bool {
     memchr::memchr(0x1b, bytes).is_some()
 }

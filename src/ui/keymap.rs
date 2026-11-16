@@ -44,18 +44,8 @@ fn fixed_bindings() -> Vec<KeyBinding> {
     ]
 }
 
-/// Replaces the keymap with the full set: the bindings tty7 inherited, then
-/// the ones the live config asks for, then the fixed ones.
-///
-/// gpui's `Keymap::add_bindings` only ever pushes — it never dedups and
-/// nothing retires a binding — so rebinding by *appending* (the old `rebind`)
-/// leaked one full table per call, and every keystroke walks the whole map.
-/// Clearing first makes a rebind O(map) instead of O(map × calls), and makes
-/// it safe to drive from the config watcher: a hand edit that only reorders
-/// or re-comments the file reloads to an identical triple and never reaches
-/// here, while a real change rebuilds once (#548). The order is the order
-/// `init` bound them in, and gpui reads the map back to front, so tty7's
-/// bindings still win over the inherited ones.
+/// Replaces the keymap: inherited bindings, then the live config, then the fixed ones.
+/// gpui only appends, so this clears first; otherwise every reload leaks a full table.
 fn rebuild_keymap(cx: &mut App) {
     let effective = effective_bindings(cx);
     let mut bindings: Vec<KeyBinding> = cx
@@ -73,11 +63,7 @@ pub fn rebind(cx: &mut App) {
     set_menus(cx);
 }
 
-/// The three config fields `effective_bindings` reads, as one comparable
-/// value. The config watcher reloads on every write — including the app's
-/// own `save()`, which fires on a sidebar drag — so it compares the triple
-/// before and after and only rebinds when one of these actually moved;
-/// otherwise each save would rebuild the keymap for nothing (#548).
+/// The three config fields `effective_bindings` reads. The watcher rebinds only when one of them moved.
 pub(crate) fn keybinding_config(cx: &App) -> (Vec<(String, KeybindingOverride)>, String, String) {
     let cfg = cx.global::<Config>();
     let mut overrides: Vec<(String, KeybindingOverride)> = cfg
@@ -172,20 +158,7 @@ fn action_bindings(effective: &[(String, String)]) -> Vec<KeyBinding> {
             log::warn!("ignoring keybinding for '{action}': invalid keystroke '{key}'");
             continue;
         }
-        // Said once, and the binding still installs: a chord the user asked
-        // for by name is the user's to spend, the way the tmux preset spends
-        // Ctrl+B. The invariant this guards is that no *default* spends one
-        // without saying so — `no_default_binding_sits_on_a_terminal_control_code`
-        // is the half of it that fails a build. A single chord only, since a
-        // prefix like `ctrl-b n` is that choice made deliberately.
-        // Over both spellings that reach the keymap, because the fold is what
-        // decides which of them the shell actually loses. `steals_a_control_code`
-        // only ever recognises a bare Ctrl, so it waves `ctrl-shift-2` through —
-        // and then the fold installs `ctrl-@` beside it, which is NUL. The chord
-        // was dead before it was folded and stole nothing; now that it is live
-        // the warning has to follow it (#750). At most one of the two can trip:
-        // a written chord that folds carries Shift, and one that carries Shift
-        // is never a control code.
+        // Warn when a user chord takes a C0 byte the shell is owed, including the folded spelling.
         let folded = folded_spec(key);
         for chord in [Some(key.as_str()), folded.as_deref()]
             .into_iter()
@@ -539,48 +512,9 @@ const SHIFTED_GLYPHS: [(char, char); 21] = [
     ('/', '?'),
 ];
 
-/// Rewrites one chord into the shape the platform actually delivers, or
-/// returns `None` when it is already that shape.
-///
-/// Every gpui backend carries Shift as a modifier for letters only. Over the
-/// digits and the punctuation it spends the modifier on the character instead
-/// and clears the flag: that is the `chars_with_shift` branch on macOS,
-/// `need_to_convert_to_shifted_key` in the Windows mapper, and Linux's "we
-/// only include the shift for upper-case letters by convention". So the chord
-/// written `secondary-shift-]` arrives as `secondary-}` and the two never
-/// meet — the binding installs and is unreachable, which is why Ctrl+Shift+]
-/// stopped cycling panes off macOS and why hand-editing a config to that
-/// spelling changed nothing (#750).
-///
-/// Folding the spec the same way on the lookup side closes the round trip.
-/// The recorder already writes `secondary-}`, because that is what
-/// `spec_from_keystroke` was handed; a default or a config written the other
-/// way now installs the very same binding, so both spellings keep working and
-/// nobody's config comes undone. `secondary-shift-}`, which people also reach
-/// for, folds onto it too — the flag is simply redundant there.
-///
-/// The table is US-layout, and a chord it does not know is left alone rather
-/// than guessed at. It cannot be layout-aware from here: `?` is Shift+ß on a
-/// German keyboard and Shift+, on a French one, and the only mapper that knows
-/// which is gpui's, reached through `KeyBinding::load` rather than the
-/// `KeyBinding::new` that `make_binding` uses — and it exists on Windows only,
-/// where `MacKeyboardMapper` does no shift folding at all. So off a US layout
-/// the fold is a widening that may not land: `ctrl-shift-4` picks up `ctrl-$`,
-/// which on AZERTY is a key of its own. Harmless, because the fold only ever
-/// adds — the spec as written stays bound whatever the layout — but it is why
-/// this is not the last word on #750.
-///
-/// The fold is *added* to a spec's bindings, never substituted for them,
-/// because the convention is not universal. Windows leaves Shift intact on
-/// the numpad's `/ * + -`: `need_to_convert_to_shifted_key` lists the OEM
-/// keys and `VK_0..VK_9` but none of `VK_DIVIDE`/`VK_MULTIPLY`/`VK_ADD`/
-/// `VK_SUBTRACT`, so `get_keystroke_key` falls through to `get_key_from_vkey`
-/// and Ctrl+Shift+numpad-/ really does arrive as `ctrl-shift-/`. Substituting
-/// `ctrl-?` for it would unbind a chord that works today — the same class of
-/// bug this is fixing. macOS clears the flag there anyway (the numpad glyph
-/// is the same shifted or not, so `chars_with_shift` takes the branch that
-/// drops it) and Linux names those keys `divide`/`multiply`/`add`/`subtract`,
-/// which are not one character and never reach this.
+/// The glyph the platform delivers for shifted punctuation, or `None` when nothing changes.
+/// Digits and punctuation arrive with Shift cleared (`shift-]` → `}`), so the folded form is bound too.
+/// The table is US-layout and only ever adds — substituting would drop Windows numpad chords that still carry Shift.
 fn fold_shift_into_glyph(chord: &str) -> Option<String> {
     let mut ks = Keystroke::parse(chord).ok()?;
     if !ks.modifiers.shift {

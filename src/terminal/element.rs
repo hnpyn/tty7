@@ -266,24 +266,29 @@ fn snapshot_cell(
     rc
 }
 
-/// Powerline separators and block elements are fills, not text. The triangle
-/// `` is painted so its foreground meets the next segment's background, and
-/// `▀▄█░▒▓` are swatches and bars. Lifting either colour to a text-contrast
-/// floor opens a seam against the cell beside it.
+/// Powerline separators and block elements are fills; lifting them for contrast opens a seam.
 fn fg_is_fill(c: char) -> bool {
     PowerlineShape::of(c).is_some() || ('\u{2580}'..='\u{259F}').contains(&c)
 }
 
 fn is_bright_ansi(color: AnsiColor) -> bool {
-    match color {
-        AnsiColor::Indexed(8..=15) => true,
-        AnsiColor::Named(named) => (8..=15).contains(&(named as usize)),
-        _ => false,
-    }
+    matches!(
+        color,
+        AnsiColor::Indexed(8..=15)
+            | AnsiColor::Named(
+                NamedColor::BrightBlack
+                    | NamedColor::BrightRed
+                    | NamedColor::BrightGreen
+                    | NamedColor::BrightYellow
+                    | NamedColor::BrightBlue
+                    | NamedColor::BrightMagenta
+                    | NamedColor::BrightCyan
+                    | NamedColor::BrightWhite
+            )
+    )
 }
 
-/// Clears a bright ANSI foreground (`8..=15`) against the cell's own background
-/// when that background is not the terminal default `active_palette` solved for.
+/// Lifts a bright ANSI foreground so it stays readable on this cell's own background.
 fn legible_bright_fg(fg: Rgb, under: Rgb) -> Rgb {
     thread_local! {
         static LAST: std::cell::Cell<Option<(u32, u32, Rgb)>> =

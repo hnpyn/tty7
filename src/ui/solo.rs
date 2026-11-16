@@ -62,18 +62,23 @@ pub(crate) fn quit_route(window_live: bool, prompt_open: bool) -> QuitRoute {
 }
 
 pub(crate) fn route_new_window(cx: &mut App) {
-    let cwd = cx.try_global::<LiveSolo>().cloned().and_then(|live| {
-        live.window
-            .update(cx, |_root, window, cx| {
-                remember_spawn_display(window, cx);
-                live.solo
-                    .upgrade()
-                    .and_then(|solo| solo.read(cx).terminal.read(cx).local_cwd())
-            })
-            .ok()
-            .flatten()
-    });
-    crate::spawn_new_instance(cwd.as_deref());
+    let (cwd, display) = cx
+        .try_global::<LiveSolo>()
+        .cloned()
+        .and_then(|live| {
+            live.window
+                .update(cx, |_root, window, cx| {
+                    let display = window.display(cx).map(|d| u64::from(d.id()));
+                    let cwd = live
+                        .solo
+                        .upgrade()
+                        .and_then(|solo| solo.read(cx).terminal.read(cx).local_cwd());
+                    (cwd, display)
+                })
+                .ok()
+        })
+        .unwrap_or((None, None));
+    crate::spawn_new_instance(cwd.as_deref(), display);
 }
 
 pub(crate) fn route_quit(cx: &mut App) {
@@ -119,12 +124,6 @@ impl SoloWindow {
         }
         let child_exit = Self::quit_when_the_shell_exits(&terminal, cx);
         let config_watch = cx.observe_global::<Config>(|this, cx| this.apply_config(cx));
-        let bounds = cx.observe_window_bounds(window, |_, window, cx| {
-            remember_spawn_display(window, cx);
-        });
-        let activation = cx.observe_window_activation(window, |_, window, cx| {
-            remember_spawn_display(window, cx);
-        });
         let appearance = window.observe_window_appearance(|window, cx| {
             crate::ui::theme::note_system_appearance(window, cx);
             if cx.global::<Config>().theme_follow_system {
@@ -151,10 +150,9 @@ impl SoloWindow {
             terminal,
             _child_exit: child_exit,
             close_prompt_open: false,
-            _subs: vec![config_watch, appearance, bounds, activation],
+            _subs: vec![config_watch, appearance],
         };
         this.apply_config(cx);
-        remember_spawn_display(window, cx);
         if launched_without_path {
             // `open -a ntty7 /dir` delivers the URL on the next turn of the
             // main loop, after this window already exists. Poll across the
@@ -195,8 +193,8 @@ impl SoloWindow {
     /// start, becomes another process so this one stays where it is.
     fn retarget(&mut self, cwd: std::path::PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         if self.terminal.read(cx).busy().is_some() {
-            remember_spawn_display(window, cx);
-            crate::spawn_new_instance(Some(&cwd));
+            let display = window.display(cx).map(|d| u64::from(d.id()));
+            crate::spawn_new_instance(Some(&cwd), display);
             return;
         }
         let parts = match TerminalView::spawn_shell_terminal_in(
@@ -294,9 +292,9 @@ impl SoloWindow {
     }
 
     fn spawn_another(&mut self, window: &Window, cx: &mut Context<Self>) {
-        remember_spawn_display(window, cx);
+        let display = window.display(cx).map(|d| u64::from(d.id()));
         let cwd = self.terminal.read(cx).local_cwd();
-        crate::spawn_new_instance(cwd.as_deref());
+        crate::spawn_new_instance(cwd.as_deref(), display);
     }
 
     fn set_font_size(&mut self, next: f32, cx: &mut Context<Self>) {
@@ -318,7 +316,6 @@ impl Focusable for SoloWindow {
 
 impl Render for SoloWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        remember_spawn_display(window, cx);
         div()
             .size_full()
             .bg(crate::ui::theme::workspace_background(cx))
@@ -490,8 +487,7 @@ impl StartupFailure {
 }
 
 impl Render for StartupFailure {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        remember_spawn_display(window, cx);
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         div().size_full()
     }
 }
@@ -534,11 +530,7 @@ fn window_options(cx: &mut App) -> WindowOptions {
     }
 }
 
-/// The screen under the pointer. A brand-new ntty7 process has no window yet
-/// — `solo::open` is what creates it — so `cx.active_window()` is always
-/// `None` here and cannot say which monitor `⌘N` was pressed on. The parent
-/// passes that with `--display`. The pointer is the cold launch (Dock,
-/// Spotlight, taskbar) when nobody did.
+/// Parent `--display` wins when this process can see it. A cold launch follows the pointer.
 fn focused_display_id(cx: &mut App) -> Option<gpui::DisplayId> {
     let inherited = crate::inherited_display().map(gpui::DisplayId::new);
     screen_for_spawn(inherited, pointer_display(), |id| {
@@ -546,9 +538,7 @@ fn focused_display_id(cx: &mut App) -> Option<gpui::DisplayId> {
     })
 }
 
-/// `inherited` is the display the parent window handed over. It wins even
-/// when the pointer is resting on another screen. A missing or unplugged id
-/// falls through to the pointer.
+/// `inherited` wins when it is still plugged in; otherwise the pointer.
 fn screen_for_spawn(
     inherited: Option<gpui::DisplayId>,
     cursor: Option<gpui::DisplayId>,
@@ -557,14 +547,6 @@ fn screen_for_spawn(
     inherited
         .filter(|id| known(*id))
         .or_else(|| cursor.filter(|id| known(*id)))
-}
-
-fn remember_spawn_display(window: &Window, cx: &App) {
-    if window.is_window_active() {
-        crate::set_spawn_display(window.display(cx).map(|display| u64::from(display.id())));
-    } else {
-        crate::set_spawn_display(None);
-    }
 }
 
 #[cfg(target_os = "macos")]
