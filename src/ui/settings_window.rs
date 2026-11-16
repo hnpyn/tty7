@@ -21,8 +21,13 @@ use crate::ui::app::Tty7App;
 const DEFAULT_SIZE: (f32, f32) = (960., 700.);
 const MIN_SIZE: (f32, f32) = (720., 480.);
 
-pub(crate) fn window_options(cx: &mut App) -> WindowOptions {
-    let display_id = crate::ui::windows::focused_display_id(cx);
+pub(crate) fn window_options(cx: &mut App, on_display: Option<gpui::DisplayId>) -> WindowOptions {
+    // The workspace window passed its own display in. Prefer that over asking
+    // again: this open is deferred from inside that window, and `w.update`
+    // cannot re-enter a window the current turn has borrowed.
+    let display_id = on_display
+        .filter(|id| cx.find_display(*id).is_some())
+        .or_else(|| crate::ui::windows::focused_display_id(cx));
     WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(gpui::Bounds::centered(
             display_id,
@@ -61,6 +66,14 @@ impl SettingsWindow {
         // The close button asks the same question Escape does: a half-edited
         // form or theme draft gets its prompt, and the window only goes once
         // it is answered.
+        cx.observe_window_activation(window, |_, window, cx| {
+            crate::ui::windows::note_focused_display(window, cx);
+        })
+        .detach();
+        cx.observe_window_bounds(window, |_, window, cx| {
+            crate::ui::windows::note_focused_display(window, cx);
+        })
+        .detach();
         let weak = app.downgrade();
         window.on_window_should_close(cx, move |window, cx| match weak.upgrade() {
             Some(app) => {
@@ -88,6 +101,7 @@ impl Render for SettingsWindow {
         // The workspace window sets this in its own render; a second window
         // has to, or the page lays out against the default 16px rem.
         window.set_rem_size(px(cx.global::<Config>().ui_font_size));
+        crate::ui::windows::note_focused_display(window, cx);
         crate::ui::settings::kit::note_scale(window);
         let page = self.app.upgrade().map(|app| {
             let page = app.update(cx, |this, cx| {
