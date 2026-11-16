@@ -22,8 +22,7 @@ const DEFAULT_SIZE: (f32, f32) = (960., 700.);
 const MIN_SIZE: (f32, f32) = (720., 480.);
 
 pub(crate) fn window_options(cx: &mut App, on_display: Option<gpui::DisplayId>) -> WindowOptions {
-    // The workspace window passed its own display in. Prefer that over asking
-    // again: this open is deferred from inside that window, and `w.update`
+    // The workspace passed its display in. This open is deferred, and `w.update`
     // cannot re-enter a window the current turn has borrowed.
     let display_id = on_display
         .filter(|id| cx.find_display(*id).is_some())
@@ -74,6 +73,8 @@ impl SettingsWindow {
             crate::ui::windows::note_focused_display(window, cx);
         })
         .detach();
+        // Often already key before this observer exists; activation only reports a later change.
+        crate::ui::windows::note_focused_display(window, cx);
         let weak = app.downgrade();
         window.on_window_should_close(cx, move |window, cx| match weak.upgrade() {
             Some(app) => {
@@ -101,7 +102,6 @@ impl Render for SettingsWindow {
         // The workspace window sets this in its own render; a second window
         // has to, or the page lays out against the default 16px rem.
         window.set_rem_size(px(cx.global::<Config>().ui_font_size));
-        crate::ui::windows::note_focused_display(window, cx);
         crate::ui::settings::kit::note_scale(window);
         let page = self.app.upgrade().map(|app| {
             let page = app.update(cx, |this, cx| {

@@ -321,8 +321,6 @@ impl TerminalModes {
         Some(out)
     }
 
-    /// Between sequences. The text state only leaves on `0x1b`; 8-bit C1
-    /// controls are not introducers.
     pub fn is_ground(&self) -> bool {
         self.state == State::Text
     }

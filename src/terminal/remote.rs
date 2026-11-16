@@ -38,8 +38,7 @@ use super::size::TermSize;
 pub struct EventProxy {
     tx: smol::channel::Sender<AlacEvent>,
     replaying: Arc<AtomicBool>,
-    /// A `Wakeup` is already queued. The reader used to enqueue one per ~1 KiB
-    /// batch, and the UI frame drains them long after the pane has moved on.
+    /// One `Wakeup` is queued until the view dequeues it, so a burst does not enqueue one per batch.
     wakeup_pending: Arc<AtomicBool>,
 }
 
@@ -58,8 +57,7 @@ impl EventListener for EventProxy {
         {
             return;
         }
-        // Cleared when the event is dequeued, before the view reads the grid,
-        // so a write that lands during that frame still schedules another.
+        // A second `Wakeup` waits until this one is dequeued, which is before the view reads the grid.
         if matches!(event, AlacEvent::Wakeup) && self.wakeup_pending.swap(true, Ordering::AcqRel) {
             return;
         }
@@ -1388,12 +1386,7 @@ impl RemoteTerminal {
                     macro_rules! flush_batch {
                         () => {
                             if !out_batch.is_empty() {
-                                // One SIMD scan. Each machine below is skipped
-                                // only while it is idle: an ESC split across
-                                // reads leaves it mid-sequence, and the next
-                                // chunk can be the payload plus BEL, or the
-                                // `\` of an ST, with no `0x1b` of its own.
-                                // Ground states here wait on `0x1b` alone.
+                                // One scan. An idle machine waits on `0x1b`; one left mid-sequence still has to see the next chunk.
                                 let has_esc = crate::core::osc::contains_esc(&out_batch);
                                 if has_esc || !modes.is_ground() {
                                     super::color_scheme::fold(
@@ -1474,45 +1467,49 @@ impl RemoteTerminal {
                                 }
                                 if has_esc || !zle_tok.is_ground() {
                                     zle_tok.feed(&out_batch, |payload| {
-                                    if let Some(mark) = payload.strip_prefix(b"133;") {
-                                        match mark.first() {
-                                            Some(b'B') => {
-                                                zle_reading.store(true, Ordering::Relaxed);
-                                                // Back at a prompt: whatever
-                                                // ran is over, so the name of
-                                                // it must not outlive it into
-                                                // the next close question.
-                                                if let Ok(mut cmd) = running_command.lock() {
-                                                    cmd.clear();
+                                        if let Some(mark) = payload.strip_prefix(b"133;") {
+                                            match mark.first() {
+                                                Some(b'B') => {
+                                                    zle_reading.store(true, Ordering::Relaxed);
+                                                    // Back at a prompt: whatever
+                                                    // ran is over, so the name of
+                                                    // it must not outlive it into
+                                                    // the next close question.
+                                                    if let Ok(mut cmd) = running_command.lock() {
+                                                        cmd.clear();
+                                                    }
                                                 }
-                                            }
-                                            Some(b'V') => {
-                                                shell_vi_mode.store(
-                                                    mark.strip_prefix(b"V;")
-                                                        .is_some_and(|v| v.first() == Some(&b'1')),
-                                                    Ordering::Relaxed,
-                                                );
-                                            }
-                                            Some(b'C') => {
-                                                zle_reading.store(false, Ordering::Relaxed);
-                                                // `C` alone is a command start
-                                                // with no line to report — the
-                                                // PowerShell path sends that —
-                                                // and leaves the field empty
-                                                // rather than holding a stale
-                                                // one.
-                                                let line = mark
-                                                    .strip_prefix(b"C;")
-                                                    .map(|c| String::from_utf8_lossy(c).into_owned())
-                                                    .unwrap_or_default();
-                                                if let Ok(mut cmd) = running_command.lock() {
-                                                    *cmd = line;
+                                                Some(b'V') => {
+                                                    shell_vi_mode.store(
+                                                        mark.strip_prefix(b"V;")
+                                                            .is_some_and(|v| {
+                                                                v.first() == Some(&b'1')
+                                                            }),
+                                                        Ordering::Relaxed,
+                                                    );
                                                 }
+                                                Some(b'C') => {
+                                                    zle_reading.store(false, Ordering::Relaxed);
+                                                    // `C` alone is a command start
+                                                    // with no line to report — the
+                                                    // PowerShell path sends that —
+                                                    // and leaves the field empty
+                                                    // rather than holding a stale
+                                                    // one.
+                                                    let line = mark
+                                                        .strip_prefix(b"C;")
+                                                        .map(|c| {
+                                                            String::from_utf8_lossy(c).into_owned()
+                                                        })
+                                                        .unwrap_or_default();
+                                                    if let Ok(mut cmd) = running_command.lock() {
+                                                        *cmd = line;
+                                                    }
+                                                }
+                                                _ => zle_reading.store(false, Ordering::Relaxed),
                                             }
-                                            _ => zle_reading.store(false, Ordering::Relaxed),
                                         }
-                                    }
-                                });
+                                    });
                                 }
                                 if (has_esc || !title_tok.is_ground())
                                     && chunk_retires_the_title!(&out_batch)
@@ -3902,29 +3899,12 @@ fn command_cuts(tok: &mut OscTokenizer, bytes: &[u8], cuts: &mut Vec<(usize, Rea
     }
 }
 
-/// How much output the reader parses per hold of the grid lock. Every UI-thread
-/// handler that touches the grid — a scroll, a selection drag, a keystroke —
-/// queues on this lock, and one UI thread serves every window, so a hold is how
-/// long all of them can stall. A coalesced PTY burst is one 256 KiB batch;
-/// holding the fair lock across that batch is one acquisition instead of a
-/// wake per kilobyte, and the next handler still runs before the following
-/// batch.
+/// Bytes parsed per hold of the grid lock, so a UI handler queued on it can run between slices.
 const MAX_LOCKED_FEED: usize = 256 * 1024;
 
-/// Parses `bytes` into the emulator, stopping at each of `cuts` for `on_cut` to
-/// act on the state the bytes before it left behind — and letting go of the
-/// grid every [`MAX_LOCKED_FEED`] bytes, so a waiting handler gets its turn
-/// between slices rather than after the whole batch. A relink replays up to
-/// 8 MB in one frame; parsed in one hold, that froze every window for as long
-/// as it took.
-///
-/// The lock is fair, so re-taking it queues behind whoever arrived meanwhile.
-/// vte keeps its own state across `advance` calls, so where a slice ends — mid
-/// escape sequence, mid UTF-8 — makes no difference to what is parsed.
-///
-/// Returns how long it spent waiting for the lock, or `None` if `quit` was
-/// raised while it waited: a retired reader must not write into a grid its
-/// successor now owns.
+/// Parses `bytes`, running `on_cut` at each cut, and dropping the grid lock every [`MAX_LOCKED_FEED`] bytes.
+/// The lock is fair, and vte keeps its state across slices. Returns `None` if `quit` fired while waiting:
+/// a retired reader must not write a grid its successor owns.
 fn feed_grid<T: EventListener>(
     term: &FairMutex<Term<T>>,
     processor: &mut ansi::Processor,

@@ -878,12 +878,8 @@ fn window_options(cx: &mut App, workspace: Option<WorkspaceId>) -> WindowOptions
     }
 }
 
-/// Display of the tty7 window the OS currently considers key.
-///
-/// Recorded from that window while it is on the stack. A shortcut such as
-/// `⌘N` runs inside `App::update_window`, which has already taken that
-/// window out of `cx.windows`, so asking it again with `w.update` returns
-/// `Err` and would otherwise drop the new window on the primary screen.
+/// Key window and the display it was on, noted while that window was on the stack.
+/// `⌘N` runs inside `update_window`, which cannot re-enter the borrowed window.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct FocusedDisplay {
     window: gpui::WindowId,
@@ -892,9 +888,7 @@ struct FocusedDisplay {
 
 impl Global for FocusedDisplay {}
 
-/// Remember `window`'s display when it is the key window. Callers that
-/// already hold `&Window` — a key binding, the switcher, settings — record
-/// it on the way into `open`, which cannot re-enter `w.update`.
+/// Remember `window`'s display when it is key.
 pub(crate) fn note_focused_display(window: &Window, cx: &mut App) {
     if !window.is_window_active() {
         return;
@@ -911,68 +905,52 @@ pub(crate) fn note_focused_display(window: &Window, cx: &mut App) {
     }
 }
 
-/// Where a new window should open.
-///
-/// A key window of ours wins, including while that window is borrowed by the
-/// action that is opening the new one. The pointer is only the answer when
-/// nothing of ours is key: a Dock, Spotlight, tray, or CLI launch, which is
-/// the screen the user is looking at.
+/// Where a new window should open. A key window of ours wins; the pointer is
+/// only the answer when nothing of ours is key.
 pub(crate) fn focused_display_id(cx: &mut App) -> Option<gpui::DisplayId> {
-    let choice = match cx.active_window() {
-        Some(window) => match window.update(cx, |_, window, cx| window.display(cx).map(|d| d.id()))
-        {
-            Ok(display) => {
-                if let Some(display) = display {
-                    cx.set_global(FocusedDisplay {
-                        window: window.window_id(),
-                        display,
-                    });
+    let active = match cx.active_window() {
+        Some(window) => {
+            match window.update(cx, |_, window, cx| window.display(cx).map(|d| d.id())) {
+                Ok(display) => {
+                    if let Some(display) = display {
+                        cx.set_global(FocusedDisplay {
+                            window: window.window_id(),
+                            display,
+                        });
+                    }
+                    Some(display)
                 }
-                ScreenChoice::Focused(display)
-            }
-            Err(_) => {
-                let remembered = cx.try_global::<FocusedDisplay>().and_then(|focused| {
+                Err(_) => Some(cx.try_global::<FocusedDisplay>().and_then(|focused| {
                     (focused.window == window.window_id()).then_some(focused.display)
-                });
-                ScreenChoice::Focused(remembered)
+                })),
             }
-        },
-        None => ScreenChoice::Unfocused,
+        }
+        None => None,
     };
-    let cursor = match choice {
-        ScreenChoice::Unfocused => pointer_display(),
-        ScreenChoice::Focused(_) => None,
+    let cursor = if active.is_none() {
+        pointer_display()
+    } else {
+        None
     };
-    screen_for_new_window(choice, cursor, |id| cx.find_display(id).is_some())
+    pick_display(active, cursor, |id| cx.find_display(id).is_some())
 }
 
-/// `Focused` means one of our windows is key. `None` inside it means gpui
-/// has not named that window's display; the pointer must not fill in, or a
-/// window on monitor B opens on monitor A because the mouse rested there.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ScreenChoice {
-    Focused(Option<gpui::DisplayId>),
-    Unfocused,
-}
-
-fn screen_for_new_window(
-    choice: ScreenChoice,
+/// `Some` is a key window (`Some(None)` when its display is unnamed and must
+/// not fall through). `None` means nothing of ours is key, so use the pointer.
+fn pick_display(
+    active: Option<Option<gpui::DisplayId>>,
     cursor: Option<gpui::DisplayId>,
     known: impl Fn(gpui::DisplayId) -> bool,
 ) -> Option<gpui::DisplayId> {
-    match choice {
-        ScreenChoice::Focused(Some(id)) if known(id) => Some(id),
-        ScreenChoice::Focused(_) => None,
-        ScreenChoice::Unfocused => cursor.filter(|id| known(*id)),
+    match active {
+        Some(Some(id)) if known(id) => Some(id),
+        Some(_) => None,
+        None => cursor.filter(|id| known(*id)),
     }
 }
 
-/// The screen under the pointer. macOS names it with a display id. Windows
-/// names it with the `HMONITOR` gpui already uses as `DisplayId`; the bounds
-/// of that monitor are the virtual screen, which is the same space
-/// `GetCursorPos` reports. Linux reports one X screen at the origin, and a
-/// Wayland pointer is surface-local until a window exists, so a cold launch
-/// there stays on the primary display.
+/// The screen under the pointer. On Windows that is the `HMONITOR` gpui uses as `DisplayId`.
+/// Linux has no pointer display until a window exists, so a cold launch stays on the primary.
 #[cfg(target_os = "macos")]
 fn pointer_display() -> Option<gpui::DisplayId> {
     #[repr(C)]
@@ -1095,30 +1073,22 @@ mod tests {
         let known = |id: gpui::DisplayId| id == monitor_a || id == monitor_b;
 
         assert_eq!(
-            screen_for_new_window(
-                ScreenChoice::Focused(Some(monitor_b)),
-                Some(monitor_a),
-                known
-            ),
+            pick_display(Some(Some(monitor_b)), Some(monitor_a), known),
             Some(monitor_b),
             "⌘N follows the key window, not the pointer resting on another screen"
         );
         assert_eq!(
-            screen_for_new_window(ScreenChoice::Unfocused, Some(monitor_a), known),
+            pick_display(None, Some(monitor_a), known),
             Some(monitor_a),
             "a Dock, Spotlight, or tray launch with no key window follows the pointer"
         );
         assert_eq!(
-            screen_for_new_window(
-                ScreenChoice::Focused(Some(gpui::DisplayId::new(9))),
-                Some(monitor_a),
-                known
-            ),
+            pick_display(Some(Some(gpui::DisplayId::new(9))), Some(monitor_a), known),
             None,
             "an unplugged display is not invented, and the pointer does not sneak in"
         );
         assert_eq!(
-            screen_for_new_window(ScreenChoice::Focused(None), Some(monitor_a), known),
+            pick_display(Some(None), Some(monitor_a), known),
             None,
             "a key window whose display gpui has not named still outranks the pointer"
         );

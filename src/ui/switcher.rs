@@ -1142,10 +1142,7 @@ impl Tty7App {
         self.close_switcher(window, cx);
         match row.adopt {
             Some((target, remote)) => self.open_remote_workspace(target, *remote, window, cx),
-            None if new_window => {
-                crate::ui::windows::note_focused_display(window, cx);
-                crate::ui::windows::open(cx, Some(row.id));
-            }
+            None if new_window => crate::ui::windows::open(cx, Some(row.id)),
             None => self.reveal_workspace(row.id, window, cx),
         }
     }
@@ -1721,7 +1718,6 @@ impl Tty7App {
         cx: &mut Context<Self>,
     ) {
         if new_window {
-            crate::ui::windows::note_focused_display(window, cx);
             crate::ui::windows::open_at_tab(cx, ws, tab);
             return;
         }
@@ -3387,7 +3383,6 @@ fn row_menu(
                     move |_, window, cx| {
                         let _ = a2.update(cx, |this, cx| {
                             this.close_switcher(window, cx);
-                            crate::ui::windows::note_focused_display(window, cx);
                             crate::ui::windows::open(cx, Some(id));
                         });
                     },
