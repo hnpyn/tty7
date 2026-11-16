@@ -491,7 +491,8 @@ fn window_options(cx: &mut App) -> WindowOptions {
                 .map(|image| std::sync::Arc::new(image.thumbnail(256, 256).into_rgba8()))
         });
 
-    let bounds = Bounds::centered(None, size(px(800.), px(600.)), cx);
+    let display_id = focused_display_id(cx);
+    let bounds = Bounds::centered(display_id, size(px(800.), px(600.)), cx);
     let window_bounds = match cx.global::<Config>().startup_mode {
         StartupMode::Normal => WindowBounds::Windowed(bounds),
         StartupMode::Maximized => WindowBounds::Maximized(bounds),
@@ -499,6 +500,7 @@ fn window_options(cx: &mut App) -> WindowOptions {
     };
     WindowOptions {
         window_bounds: Some(window_bounds),
+        display_id,
         app_id: Some("ntty7".to_owned()),
         #[cfg(any(target_os = "linux", target_os = "freebsd"))]
         icon: APP_ICON.as_ref().cloned(),
@@ -516,6 +518,50 @@ fn window_options(cx: &mut App) -> WindowOptions {
         window_min_size: Some(size(px(320.), px(200.))),
         ..Default::default()
     }
+}
+
+fn focused_display_id(cx: &mut App) -> Option<gpui::DisplayId> {
+    #[cfg(target_os = "macos")]
+    {
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct CGPoint {
+            x: f64,
+            y: f64,
+        }
+        #[link(name = "CoreGraphics", kind = "framework")]
+        unsafe extern "C" {
+            fn CGEventCreate(source: *const std::ffi::c_void) -> *mut std::ffi::c_void;
+            fn CGEventGetLocation(event: *mut std::ffi::c_void) -> CGPoint;
+            fn CGGetDisplaysWithPoint(
+                point: CGPoint,
+                max_displays: u32,
+                displays: *mut u32,
+                matching_display_count: *mut u32,
+            ) -> i32;
+        }
+        unsafe {
+            let ev = CGEventCreate(std::ptr::null());
+            if !ev.is_null() {
+                let pt = CGEventGetLocation(ev);
+                core_foundation::base::CFRelease(ev as _);
+                let mut id: u32 = 0;
+                let mut count: u32 = 0;
+                if CGGetDisplaysWithPoint(pt, 1, &mut id, &mut count) == 0 && count > 0 {
+                    let candidate = gpui::DisplayId::new(id as u64);
+                    if cx.find_display(candidate).is_some() {
+                        return Some(candidate);
+                    }
+                }
+            }
+        }
+    }
+    cx.active_window()
+        .and_then(|w| {
+            w.update(cx, |_, window, cx| window.display(cx).map(|d| d.id()))
+                .ok()
+        })
+        .flatten()
 }
 
 #[cfg(target_os = "macos")]
