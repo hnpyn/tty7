@@ -828,17 +828,24 @@ fn window_options(cx: &mut App, workspace: Option<WorkspaceId>) -> WindowOptions
         })
         .flatten();
 
+    let display_id = focused_display_id(cx);
     let existing = WindowRegistry::count(cx);
     let bounds = match remembered {
         Some(state) => {
             let bounds = at_least_min_size(state.bounds());
-            if cx.displays().iter().any(|d| d.bounds().intersects(&bounds)) {
+            let target_bounds = display_id
+                .and_then(|id| cx.find_display(id))
+                .map(|d| d.bounds());
+            if target_bounds.map_or_else(
+                || cx.displays().iter().any(|d| d.bounds().intersects(&bounds)),
+                |d| d.intersects(&bounds),
+            ) {
                 bounds
             } else {
-                Bounds::centered(None, bounds.size, cx)
+                Bounds::centered(display_id, bounds.size, cx)
             }
         }
-        None => Bounds::centered(None, size(px(DEFAULT_SIZE.0), px(DEFAULT_SIZE.1)), cx),
+        None => Bounds::centered(display_id, size(px(DEFAULT_SIZE.0), px(DEFAULT_SIZE.1)), cx),
     };
     let bounds = cascade(bounds, existing);
 
@@ -851,6 +858,7 @@ fn window_options(cx: &mut App, workspace: Option<WorkspaceId>) -> WindowOptions
 
     WindowOptions {
         window_bounds: Some(window_bounds),
+        display_id,
         app_id: Some("tty7".to_owned()),
         #[cfg(any(target_os = "linux", target_os = "freebsd"))]
         icon: APP_ICON.as_ref().cloned(),
@@ -868,6 +876,54 @@ fn window_options(cx: &mut App, workspace: Option<WorkspaceId>) -> WindowOptions
         window_min_size: Some(size(px(MIN_SIZE.0), px(MIN_SIZE.1))),
         ..Default::default()
     }
+}
+
+/// The display the user is currently working on: the one under the pointer on
+/// macOS ( falling back to the active window's display), so a launch or `⌘N`
+/// opens on the screen in front of the user instead of always jumping to the
+/// primary menu-bar display.
+pub(crate) fn focused_display_id(cx: &mut App) -> Option<gpui::DisplayId> {
+    #[cfg(target_os = "macos")]
+    {
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct CGPoint {
+            x: f64,
+            y: f64,
+        }
+        #[link(name = "CoreGraphics", kind = "framework")]
+        unsafe extern "C" {
+            fn CGEventCreate(source: *const std::ffi::c_void) -> *mut std::ffi::c_void;
+            fn CGEventGetLocation(event: *mut std::ffi::c_void) -> CGPoint;
+            fn CGGetDisplaysWithPoint(
+                point: CGPoint,
+                max_displays: u32,
+                displays: *mut u32,
+                matching_display_count: *mut u32,
+            ) -> i32;
+        }
+        unsafe {
+            let ev = CGEventCreate(std::ptr::null());
+            if !ev.is_null() {
+                let pt = CGEventGetLocation(ev);
+                core_foundation::base::CFRelease(ev as _);
+                let mut id: u32 = 0;
+                let mut count: u32 = 0;
+                if CGGetDisplaysWithPoint(pt, 1, &mut id, &mut count) == 0 && count > 0 {
+                    let candidate = gpui::DisplayId::new(id as u64);
+                    if cx.find_display(candidate).is_some() {
+                        return Some(candidate);
+                    }
+                }
+            }
+        }
+    }
+    cx.active_window()
+        .and_then(|w| {
+            w.update(cx, |_, window, cx| window.display(cx).map(|d| d.id()))
+                .ok()
+        })
+        .flatten()
 }
 
 /// Grow a remembered bound back up to `MIN_SIZE`.

@@ -22,12 +22,14 @@ const DEFAULT_SIZE: (f32, f32) = (960., 700.);
 const MIN_SIZE: (f32, f32) = (720., 480.);
 
 pub(crate) fn window_options(cx: &mut App) -> WindowOptions {
+    let display_id = crate::ui::windows::focused_display_id(cx);
     WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(gpui::Bounds::centered(
-            None,
+            display_id,
             size(px(DEFAULT_SIZE.0), px(DEFAULT_SIZE.1)),
             cx,
         ))),
+        display_id,
         app_id: Some("tty7".to_owned()),
         titlebar: Some(TitlebarOptions {
             // Not drawn (the title bar is the window's own), but it is the
