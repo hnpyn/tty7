@@ -234,8 +234,9 @@ fn open_path_from(
                 .map(std::path::PathBuf::from)
                 .and_then(nonempty_path);
         }
-        // `--config-dir <path>` is a value, not the directory to open.
-        if arg == std::ffi::OsStr::new("--config-dir") {
+        // `--config-dir <path>` and `--display <id>` are values, not the
+        // directory to open.
+        if arg == std::ffi::OsStr::new("--config-dir") || arg == std::ffi::OsStr::new("--display") {
             let _ = args.next();
             continue;
         }
@@ -827,6 +828,7 @@ pub(crate) fn cleanup_and_quit(cx: &mut App) {
 pub(crate) fn new_instance_args(
     cwd: Option<&std::path::Path>,
     config_dir: Option<&std::path::Path>,
+    display: Option<u64>,
 ) -> Vec<std::ffi::OsString> {
     let mut args = Vec::new();
     if let Some(cwd) = cwd {
@@ -837,7 +839,56 @@ pub(crate) fn new_instance_args(
         args.push("--config-dir".into());
         args.push(dir.as_os_str().to_os_string());
     }
+    if let Some(display) = display {
+        args.push("--display".into());
+        args.push(display.to_string().into());
+    }
     args
+}
+
+/// Display the parent window asked this process to open on. `solo::open`
+/// runs before any window exists, so the id has to arrive on the command line.
+static INHERITED_DISPLAY: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+
+pub(crate) fn note_inherited_display(id: Option<u64>) {
+    let _ = INHERITED_DISPLAY.set(id);
+}
+
+pub(crate) fn inherited_display() -> Option<u64> {
+    INHERITED_DISPLAY.get().copied().flatten()
+}
+
+/// Display of the ntty7 window that is key right now. Another window is
+/// another process, and that process starts with nothing to ask.
+static SPAWN_DISPLAY: std::sync::Mutex<Option<u64>> = std::sync::Mutex::new(None);
+
+pub(crate) fn set_spawn_display(id: Option<u64>) {
+    *SPAWN_DISPLAY
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner()) = id;
+}
+
+fn spawn_display() -> Option<u64> {
+    *SPAWN_DISPLAY
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+}
+
+pub(crate) fn display_from_args(mut args: impl Iterator<Item = std::ffi::OsString>) -> Option<u64> {
+    while let Some(arg) = args.next() {
+        if let Some(raw) = strip_os_arg_prefix(&arg, "--display=") {
+            return parse_display_id(&raw);
+        }
+        if arg == std::ffi::OsStr::new("--display") {
+            let raw = args.next()?;
+            return parse_display_id(&raw);
+        }
+    }
+    None
+}
+
+fn parse_display_id(raw: &std::ffi::OsStr) -> Option<u64> {
+    raw.to_str()?.parse().ok()
 }
 
 #[cfg(unix)]
@@ -868,7 +919,7 @@ pub(crate) fn spawn_new_instance(cwd: Option<&std::path::Path>) {
     };
     let config = crate::core::config::config_dir_path();
     let mut cmd = std::process::Command::new(exe);
-    cmd.args(new_instance_args(cwd, config.as_deref()));
+    cmd.args(new_instance_args(cwd, config.as_deref(), spawn_display()));
     strip_inherited_terminal_env(&mut cmd);
     cmd.stdin(std::process::Stdio::null());
     cmd.stdout(std::process::Stdio::null());
@@ -885,6 +936,7 @@ fn main() {
     scrub_inherited_terminal_env();
 
     let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    note_inherited_display(display_from_args(args.iter().cloned()));
 
     apply_config_dir_arg(&args);
     // A killed window never retires. Drop files whose process is gone; a
@@ -1234,15 +1286,47 @@ mod argument_tests {
         let cwd = std::path::Path::new("/work/app");
         let cfg = std::path::Path::new("/home/me/.config/ntty7");
         assert_eq!(
-            super::new_instance_args(Some(cwd), Some(cfg)),
+            super::new_instance_args(Some(cwd), Some(cfg), Some(42)),
             vec![
                 std::ffi::OsString::from("--open-path"),
                 std::ffi::OsString::from("/work/app"),
                 std::ffi::OsString::from("--config-dir"),
                 std::ffi::OsString::from("/home/me/.config/ntty7"),
+                std::ffi::OsString::from("--display"),
+                std::ffi::OsString::from("42"),
             ]
         );
-        assert!(super::new_instance_args(None, None).is_empty());
+        assert!(super::new_instance_args(None, None, None).is_empty());
+    }
+
+    #[test]
+    fn a_display_flag_is_not_the_directory_to_open() {
+        assert_eq!(
+            open_path_from(["--display", "42", "/work"].into_iter().map(OsString::from)),
+            Some(PathBuf::from("/work"))
+        );
+        assert_eq!(
+            super::display_from_args(
+                ["--display", "42", "--open-path", "/work"]
+                    .into_iter()
+                    .map(OsString::from)
+            ),
+            Some(42)
+        );
+        assert_eq!(
+            super::display_from_args([OsString::from("--display=7")].into_iter()),
+            Some(7)
+        );
+        assert_eq!(
+            super::display_from_args([OsString::from("--display=nope")].into_iter()),
+            None
+        );
+        assert_eq!(
+            super::display_from_args(
+                [OsString::from("--open-path"), OsString::from("/work")].into_iter()
+            ),
+            None
+        );
     }
 
     #[test]

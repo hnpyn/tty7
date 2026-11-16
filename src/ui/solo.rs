@@ -64,7 +64,8 @@ pub(crate) fn quit_route(window_live: bool, prompt_open: bool) -> QuitRoute {
 pub(crate) fn route_new_window(cx: &mut App) {
     let cwd = cx.try_global::<LiveSolo>().cloned().and_then(|live| {
         live.window
-            .update(cx, |_root, _window, cx| {
+            .update(cx, |_root, window, cx| {
+                remember_spawn_display(window, cx);
                 live.solo
                     .upgrade()
                     .and_then(|solo| solo.read(cx).terminal.read(cx).local_cwd())
@@ -118,6 +119,12 @@ impl SoloWindow {
         }
         let child_exit = Self::quit_when_the_shell_exits(&terminal, cx);
         let config_watch = cx.observe_global::<Config>(|this, cx| this.apply_config(cx));
+        let bounds = cx.observe_window_bounds(window, |_, window, cx| {
+            remember_spawn_display(window, cx);
+        });
+        let activation = cx.observe_window_activation(window, |_, window, cx| {
+            remember_spawn_display(window, cx);
+        });
         let appearance = window.observe_window_appearance(|window, cx| {
             crate::ui::theme::note_system_appearance(window, cx);
             if cx.global::<Config>().theme_follow_system {
@@ -144,9 +151,10 @@ impl SoloWindow {
             terminal,
             _child_exit: child_exit,
             close_prompt_open: false,
-            _subs: vec![config_watch, appearance],
+            _subs: vec![config_watch, appearance, bounds, activation],
         };
         this.apply_config(cx);
+        remember_spawn_display(window, cx);
         if launched_without_path {
             // `open -a ntty7 /dir` delivers the URL on the next turn of the
             // main loop, after this window already exists. Poll across the
@@ -187,6 +195,7 @@ impl SoloWindow {
     /// start, becomes another process so this one stays where it is.
     fn retarget(&mut self, cwd: std::path::PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         if self.terminal.read(cx).busy().is_some() {
+            remember_spawn_display(window, cx);
             crate::spawn_new_instance(Some(&cwd));
             return;
         }
@@ -284,7 +293,8 @@ impl SoloWindow {
         .detach();
     }
 
-    fn spawn_another(&mut self, cx: &mut Context<Self>) {
+    fn spawn_another(&mut self, window: &Window, cx: &mut Context<Self>) {
+        remember_spawn_display(window, cx);
         let cwd = self.terminal.read(cx).local_cwd();
         crate::spawn_new_instance(cwd.as_deref());
     }
@@ -308,13 +318,16 @@ impl Focusable for SoloWindow {
 
 impl Render for SoloWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        remember_spawn_display(window, cx);
         div()
             .size_full()
             .bg(crate::ui::theme::workspace_background(cx))
             .children(crate::ui::theme::window_background_image_layer(cx))
             .child(self.terminal.clone())
-            .on_action(cx.listener(|this, _: &NewWindow, _, cx| this.spawn_another(cx)))
-            .on_action(cx.listener(|this, _: &NewTab, _, cx| this.spawn_another(cx)))
+            .on_action(
+                cx.listener(|this, _: &NewWindow, window, cx| this.spawn_another(window, cx)),
+            )
+            .on_action(cx.listener(|this, _: &NewTab, window, cx| this.spawn_another(window, cx)))
             .on_action(
                 cx.listener(|this, _: &CloseWindow, window, cx| this.request_close(window, cx)),
             )
@@ -477,7 +490,8 @@ impl StartupFailure {
 }
 
 impl Render for StartupFailure {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        remember_spawn_display(window, cx);
         div().size_full()
     }
 }
@@ -520,48 +534,107 @@ fn window_options(cx: &mut App) -> WindowOptions {
     }
 }
 
+/// The screen under the pointer. A brand-new ntty7 process has no window yet
+/// — `solo::open` is what creates it — so `cx.active_window()` is always
+/// `None` here and cannot say which monitor `⌘N` was pressed on. The parent
+/// passes that with `--display`. The pointer is the cold launch (Dock,
+/// Spotlight, taskbar) when nobody did.
 fn focused_display_id(cx: &mut App) -> Option<gpui::DisplayId> {
-    #[cfg(target_os = "macos")]
-    {
-        #[repr(C)]
-        #[derive(Clone, Copy)]
-        struct CGPoint {
-            x: f64,
-            y: f64,
+    let inherited = crate::inherited_display().map(gpui::DisplayId::new);
+    screen_for_spawn(inherited, pointer_display(), |id| {
+        cx.find_display(id).is_some()
+    })
+}
+
+/// `inherited` is the display the parent window handed over. It wins even
+/// when the pointer is resting on another screen. A missing or unplugged id
+/// falls through to the pointer.
+fn screen_for_spawn(
+    inherited: Option<gpui::DisplayId>,
+    cursor: Option<gpui::DisplayId>,
+    known: impl Fn(gpui::DisplayId) -> bool,
+) -> Option<gpui::DisplayId> {
+    inherited
+        .filter(|id| known(*id))
+        .or_else(|| cursor.filter(|id| known(*id)))
+}
+
+fn remember_spawn_display(window: &Window, cx: &App) {
+    if window.is_window_active() {
+        crate::set_spawn_display(window.display(cx).map(|display| u64::from(display.id())));
+    } else {
+        crate::set_spawn_display(None);
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn pointer_display() -> Option<gpui::DisplayId> {
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct CGPoint {
+        x: f64,
+        y: f64,
+    }
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGEventCreate(source: *const std::ffi::c_void) -> *mut std::ffi::c_void;
+        fn CGEventGetLocation(event: *mut std::ffi::c_void) -> CGPoint;
+        fn CGGetDisplaysWithPoint(
+            point: CGPoint,
+            max_displays: u32,
+            displays: *mut u32,
+            matching_display_count: *mut u32,
+        ) -> i32;
+    }
+    unsafe {
+        let event = CGEventCreate(std::ptr::null());
+        if event.is_null() {
+            return None;
         }
-        #[link(name = "CoreGraphics", kind = "framework")]
-        unsafe extern "C" {
-            fn CGEventCreate(source: *const std::ffi::c_void) -> *mut std::ffi::c_void;
-            fn CGEventGetLocation(event: *mut std::ffi::c_void) -> CGPoint;
-            fn CGGetDisplaysWithPoint(
-                point: CGPoint,
-                max_displays: u32,
-                displays: *mut u32,
-                matching_display_count: *mut u32,
-            ) -> i32;
-        }
-        unsafe {
-            let ev = CGEventCreate(std::ptr::null());
-            if !ev.is_null() {
-                let pt = CGEventGetLocation(ev);
-                core_foundation::base::CFRelease(ev as _);
-                let mut id: u32 = 0;
-                let mut count: u32 = 0;
-                if CGGetDisplaysWithPoint(pt, 1, &mut id, &mut count) == 0 && count > 0 {
-                    let candidate = gpui::DisplayId::new(id as u64);
-                    if cx.find_display(candidate).is_some() {
-                        return Some(candidate);
-                    }
-                }
-            }
+        let point = CGEventGetLocation(event);
+        core_foundation::base::CFRelease(event as _);
+        let mut id: u32 = 0;
+        let mut count: u32 = 0;
+        if CGGetDisplaysWithPoint(point, 1, &mut id, &mut count) == 0 && count > 0 {
+            Some(gpui::DisplayId::new(id as u64))
+        } else {
+            None
         }
     }
-    cx.active_window()
-        .and_then(|w| {
-            w.update(cx, |_, window, cx| window.display(cx).map(|d| d.id()))
-                .ok()
-        })
-        .flatten()
+}
+
+#[cfg(target_os = "windows")]
+fn pointer_display() -> Option<gpui::DisplayId> {
+    #[repr(C)]
+    struct Point {
+        x: i32,
+        y: i32,
+    }
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn GetCursorPos(point: *mut Point) -> i32;
+        fn MonitorFromPoint(point: Point, flags: u32) -> *mut std::ffi::c_void;
+    }
+    // No monitor at the point stays "no monitor", rather than the primary.
+    const MONITOR_DEFAULTTONULL: u32 = 0;
+    unsafe {
+        let mut point = Point { x: 0, y: 0 };
+        if GetCursorPos(&mut point) == 0 {
+            return None;
+        }
+        let monitor = MonitorFromPoint(point, MONITOR_DEFAULTTONULL);
+        if monitor.is_null() {
+            return None;
+        }
+        // gpui's Windows display id is this HMONITOR. Its bounds are the
+        // virtual screen, the same space `GetCursorPos` reports.
+        Some(gpui::DisplayId::new(monitor as usize as u64))
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn pointer_display() -> Option<gpui::DisplayId> {
+    None
 }
 
 #[cfg(target_os = "macos")]
@@ -623,6 +696,28 @@ mod tests {
         assert_eq!(quit_route(false, true), QuitRoute::ExitNow);
         assert_eq!(quit_route(true, true), QuitRoute::LeavePrompt);
         assert_eq!(quit_route(true, false), QuitRoute::Confirm);
+    }
+
+    #[test]
+    fn a_spawned_window_stays_on_the_parent_screen() {
+        let parent = gpui::DisplayId::new(2);
+        let pointer = gpui::DisplayId::new(1);
+        let known = |id: gpui::DisplayId| id == parent || id == pointer;
+        assert_eq!(
+            super::screen_for_spawn(Some(parent), Some(pointer), known),
+            Some(parent),
+            "⌘N on monitor B opens there even when the pointer rests on A"
+        );
+        assert_eq!(
+            super::screen_for_spawn(None, Some(pointer), known),
+            Some(pointer),
+            "a Dock or taskbar launch with no parent display follows the pointer"
+        );
+        assert_eq!(
+            super::screen_for_spawn(Some(gpui::DisplayId::new(9)), Some(pointer), known),
+            Some(pointer),
+            "a display this process cannot see falls through to the pointer"
+        );
     }
 
     #[test]
