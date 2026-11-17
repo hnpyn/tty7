@@ -2724,7 +2724,10 @@ impl TerminalView {
             }
             AlacEvent::Title(title) => self.set_title_when_settled(title, cx),
             AlacEvent::ResetTitle => self.set_title_when_settled(self.default_title.clone(), cx),
-            AlacEvent::PtyWrite(text) => self.terminal.write(text.into_bytes()),
+            AlacEvent::PtyWrite(text) => self.terminal.write(super::color_scheme::decrqm_reply(
+                text,
+                self.terminal.color_scheme_updates(),
+            )),
             AlacEvent::ChildExit(_) | AlacEvent::Exit => {
                 self.terminal.exited = true;
                 // Nothing is left to settle, and a title still waiting its turn
@@ -12947,13 +12950,27 @@ mod gpui_tests {
         let (_plain_window, mut plain) = harness(cx);
         set_background(cx, gpui::white());
 
-        DaemonMsg::Output(b"\x1b[?2031h\x1b[?996n".to_vec())
+        DaemonMsg::Output(b"\x1b[?2031$p".to_vec())
+            .encode(&mut asked)
+            .unwrap();
+        assert_eq!(
+            pumped_input(cx, &mut asked, 20).as_deref(),
+            Some("\x1b[?2031;2$y"),
+            "DECRQM reports 2031 as supported and reset before ?2031h"
+        );
+
+        DaemonMsg::Output(b"\x1b[?2031h\x1b[?2031$p\x1b[?996n".to_vec())
             .encode(&mut asked)
             .unwrap();
         assert_eq!(
             pumped_input(cx, &mut asked, 20).as_deref(),
             Some("\x1b[?997;2n"),
             "996 answers the current scheme"
+        );
+        assert_eq!(
+            pumped_input(cx, &mut asked, 20).as_deref(),
+            Some("\x1b[?2031;1$y"),
+            "DECRQM reports 2031 as set after ?2031h"
         );
 
         set_background(cx, gpui::black());
