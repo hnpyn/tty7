@@ -197,6 +197,9 @@ pub enum Query {
     DeviceAttributes,
     /// `CSI ? 996 n`: is the colour scheme dark or light?
     ColorScheme,
+    /// `CSI ? 2031 $ p`: DECRQM for colour-scheme update notifications, with
+    /// whether mode 2031 was on at the point in the stream the query arrived.
+    ColorSchemeMode { set: bool },
 }
 
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
@@ -207,9 +210,11 @@ enum State {
     /// A CSI whose parameter bytes are being read. `marker` is the private
     /// marker it opened with, `0` for none: `?` makes it a DEC private mode
     /// rather than an ANSI one, and `>`, `<` and `=` before a `u` are the
-    /// kitty keyboard push, pop and set.
+    /// kitty keyboard push, pop and set. `dollar` is the `$` intermediate of
+    /// a DECRQM (`CSI ? Ps $ p`).
     Csi {
         marker: u8,
+        dollar: bool,
     },
     Osc,
     OscEsc,
@@ -345,7 +350,10 @@ impl TerminalModes {
                 State::Esc => match b {
                     b'[' => {
                         self.params.clear();
-                        self.state = State::Csi { marker: 0 };
+                        self.state = State::Csi {
+                            marker: 0,
+                            dollar: false,
+                        };
                     }
                     b']' => {
                         self.params.clear();
@@ -361,43 +369,59 @@ impl TerminalModes {
                     0x1b => {}
                     _ => self.state = State::Text,
                 },
-                State::Csi { marker } => match b {
-                    b'?' | b'>' | b'<' | b'=' if marker == 0 && self.params.is_empty() => {
-                        self.state = State::Csi { marker: b }
+                State::Csi { marker, dollar } => match b {
+                    b'?' | b'>' | b'<' | b'='
+                        if marker == 0 && !dollar && self.params.is_empty() =>
+                    {
+                        self.state = State::Csi {
+                            marker: b,
+                            dollar: false,
+                        }
                     }
-                    b'0'..=b'9' | b';' | b':' => {
+                    b'0'..=b'9' | b';' | b':' if !dollar => {
                         self.params.push(b);
                         if self.params.len() > MAX_PARAMS {
                             self.state = State::Text;
                         }
                     }
-                    b'h' | b'l' => {
+                    b'$' if !dollar => {
+                        self.state = State::Csi {
+                            marker,
+                            dollar: true,
+                        }
+                    }
+                    b'p' if dollar => {
+                        if marker == b'?' && self.params == b"2031" {
+                            self.queries.push(Query::ColorSchemeMode {
+                                set: self.is_on(COLOR_SCHEME_UPDATES),
+                            });
+                        }
+                        self.state = State::Text;
+                    }
+                    b'h' | b'l' if !dollar => {
                         if marker == b'?' {
                             self.apply(b == b'h');
                         }
                         self.state = State::Text;
                     }
-                    b'u' => {
+                    b'u' if !dollar => {
                         self.keyboard_op(marker);
                         self.state = State::Text;
                     }
-                    b'n' => {
+                    b'n' if !dollar => {
                         if marker == b'?' && self.params == b"996" {
                             self.queries.push(Query::ColorScheme);
                         }
                         self.state = State::Text;
                     }
-                    b'c' => {
+                    b'c' if !dollar => {
                         if marker == 0 && matches!(self.params.as_slice(), b"" | b"0") {
                             self.queries.push(Query::DeviceAttributes);
                         }
                         self.state = State::Text;
                     }
-                    // Any other final byte — or an intermediate such as the `$`
-                    // of a DECRQM query — ends a sequence that is not a mode
-                    // set. Intermediates are lumped in with finals on purpose:
-                    // `?…$p` is a *request*, and answering it is the emulator's
-                    // job, not ours.
+                    // Any other final or intermediate byte ends a sequence that
+                    // is neither a tracked mode set nor a tracked query.
                     _ => self.state = State::Text,
                 },
                 State::Osc => match b {
@@ -779,13 +803,17 @@ mod tests {
     #[test]
     fn follows_colour_scheme_updates_and_spots_its_queries() {
         let mut modes = TerminalModes::new();
-        modes.feed(b"\x1b[?2031h\x1b[?99");
+        modes.feed(b"\x1b[?2031$p\x1b[?2031h\x1b[?2031$");
         assert!(modes.is_on(COLOR_SCHEME_UPDATES));
-        modes.feed(b"6n\x1b[?996n\x1b[996n\x1b[?997;1n");
+        modes.feed(b"p\x1b[?996n\x1b[996n\x1b[?997;1n\x1b[?2004$p");
         assert_eq!(
             modes.take_queries(),
-            [Query::ColorScheme; 2],
-            "a split query counts, a non-private one does not"
+            [
+                Query::ColorSchemeMode { set: false },
+                Query::ColorSchemeMode { set: true },
+                Query::ColorScheme,
+            ],
+            "DECRQM for 2031 reports the mode state at the query; other modes stay with the emulator"
         );
         assert!(modes.take_queries().is_empty());
         modes.feed(b"\x1b[?2031l");
