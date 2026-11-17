@@ -30,6 +30,16 @@ pub(super) fn fold(modes: &mut TerminalModes, bytes: &[u8], on: &AtomicBool) {
     on.store(modes.is_on(COLOR_SCHEME_UPDATES), Ordering::Relaxed);
 }
 
+/// `alacritty_terminal` answers `CSI ? 2031 $ p` with `0` (not recognized);
+/// replace it with `1` (set) or `2` (reset).
+pub(super) fn decrqm_reply(text: String, on: bool) -> Vec<u8> {
+    match (text.as_str(), on) {
+        ("\x1b[?2031;0$y", true) => b"\x1b[?2031;1$y".to_vec(),
+        ("\x1b[?2031;0$y", false) => b"\x1b[?2031;2$y".to_vec(),
+        _ => text.into_bytes(),
+    }
+}
+
 /// The answer to a `CSI ? 996 n`. Routed as a background colour request so
 /// the view answers it from the theme it is drawing now, and a replay drops it
 /// like every other reply.

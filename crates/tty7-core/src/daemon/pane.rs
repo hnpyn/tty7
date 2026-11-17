@@ -3187,6 +3187,8 @@ fn detached_reply(query: Query, dark: bool) -> &'static [u8] {
         Query::DeviceAttributes => b"\x1b[?6c",
         Query::ColorScheme if dark => b"\x1b[?997;1n",
         Query::ColorScheme => b"\x1b[?997;2n",
+        Query::ColorSchemeMode { set: true } => b"\x1b[?2031;1$y",
+        Query::ColorSchemeMode { set: false } => b"\x1b[?2031;2$y",
     }
 }
 
