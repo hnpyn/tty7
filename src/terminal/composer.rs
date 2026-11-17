@@ -595,6 +595,15 @@ fn is_rule(row: &str, width: usize) -> bool {
     t.chars().count() >= width * 3 / 5 && t.chars().all(|c| c == '─')
 }
 
+/// The first row [`input_area`] and its helpers search from: [`INPUT_AREA_MAX_ROWS`]
+/// above the last non-blank line on the screen, so a tall pane whose agent
+/// drew its input near the top (with empty rows below it) still reaches it.
+fn input_area_floor(rows: &[String]) -> usize {
+    rows.iter()
+        .rposition(|r| !r.trim().is_empty())
+        .map_or(0, |last| (last + 1).saturating_sub(INPUT_AREA_MAX_ROWS))
+}
+
 /// Find `agent`'s input area in `rows`, the screen's lines top to bottom.
 ///
 /// - **Claude Code** draws its input between two full-width rules with `❯`
@@ -624,7 +633,7 @@ fn is_rule(row: &str, width: usize) -> bool {
 /// `None` is the agent showing something else there — which is exactly when
 /// the box must get out of the way.
 pub(super) fn input_area(agent: CLIAgent, rows: &[String], width: usize) -> Option<InputArea> {
-    let floor = rows.len().saturating_sub(INPUT_AREA_MAX_ROWS);
+    let floor = input_area_floor(rows);
     let starts = |i: usize, p: char| rows[i].trim_start().starts_with(p);
     match agent {
         CLIAgent::Claude => {
@@ -894,7 +903,7 @@ fn copilot_list_over(rows: &[String], top: usize) -> bool {
 /// Qwen Code and CodeBuddy stay in after a `!` command has run, their prompt
 /// a `!`, until Esc takes them out.
 fn in_shell_mode(agent: CLIAgent, rows: &[String], width: usize) -> bool {
-    let floor = rows.len().saturating_sub(INPUT_AREA_MAX_ROWS);
+    let floor = input_area_floor(rows);
     match agent {
         CLIAgent::Qwen | CLIAgent::CodeBuddy => {
             ruled_input_top(rows, floor, width, ruled_prompts(agent))
@@ -1185,7 +1194,7 @@ const CRUSH_PLACEHOLDERS: [&str; 11] = [
 /// closed with Esc — in its input; Crush, Goose and Amp keep whatever was
 /// typed into them before the box was opened over them.
 fn held_lines(agent: CLIAgent, rows: &[String], width: usize) -> usize {
-    let floor = rows.len().saturating_sub(INPUT_AREA_MAX_ROWS);
+    let floor = input_area_floor(rows);
     // Lines `first..` hold text; how many, down to the last that does.
     let count = |lines: Vec<&str>| {
         lines

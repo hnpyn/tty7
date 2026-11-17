@@ -6421,7 +6421,7 @@ impl TerminalView {
         let theme = cx.theme();
         let fg = theme.foreground;
         let caret_col = theme.caret;
-        let muted = theme.muted_foreground;
+        let ghost_col = theme.muted_foreground.opacity(0.55);
         let mut sel_bg = theme.selection;
         sel_bg.a = 0.55;
         let cell_w = self.cell_width;
@@ -6589,7 +6589,7 @@ impl TerminalView {
             let flat: Vec<char> = rem.chars().map(one_line_char).collect();
             for (gi, gc) in input_cells(&flat).into_iter().enumerate() {
                 let caret = gi == 0 && cursor == len && cursor_on;
-                last.push(cell(muted, gc.text, gc.width, false, caret, false));
+                last.push(cell(ghost_col, gc.text, gc.width, false, caret, false));
             }
         }
 
