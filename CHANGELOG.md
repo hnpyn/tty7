@@ -68,7 +68,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   could be answered before an earlier `?2031$p`. The reply now follows the
   query in the byte stream, names the mode as it stood there, and is sent
   once. Other queries in the same burst (device attributes included) keep
-  that order.
+  that order. `?02031` is the same mode, a query split across reads is
+  answered where it ends, and the emulator's "not recognized" reply is
+  dropped before it is queued.
 
 - **macOS no longer inserts a stray CR on a 1024-byte newline** — The first
   read of a pane's output asked for the whole 256 KiB buffer. Darwin's PTY

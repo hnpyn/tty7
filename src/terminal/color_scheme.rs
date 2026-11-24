@@ -42,19 +42,6 @@ pub(super) fn fold_reporting(
     on.store(modes.is_on(COLOR_SCHEME_UPDATES), Ordering::Relaxed);
 }
 
-/// Drop `alacritty_terminal`'s `CSI ? 2031 ; 0 $ y`.
-///
-/// The reader answers that DECRQM itself, with the mode state at the query.
-/// Forwarding this too would answer twice, and rewriting it from the mode bit
-/// would report the state at the end of the batch rather than at the query.
-pub(super) fn decrqm_reply(text: String) -> Vec<u8> {
-    if text == "\x1b[?2031;0$y" {
-        Vec::new()
-    } else {
-        text.into_bytes()
-    }
-}
-
 /// The answer to a `CSI ? 996 n`. Routed as a background colour request so
 /// the view answers it from the theme it is drawing now, and a replay drops it
 /// like every other reply.
@@ -83,12 +70,6 @@ pub(super) fn watch(cx: &mut Context<TerminalView>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn an_unrecognized_2031_decrqm_is_not_forwarded() {
-        assert!(decrqm_reply("\x1b[?2031;0$y".into()).is_empty());
-        assert_eq!(decrqm_reply("\x1b[?2026;2$y".into()), b"\x1b[?2026;2$y");
-    }
 
     #[test]
     fn a_dark_background_reports_dark_and_a_light_one_light() {

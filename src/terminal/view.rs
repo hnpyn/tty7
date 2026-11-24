@@ -2724,12 +2724,7 @@ impl TerminalView {
             }
             AlacEvent::Title(title) => self.set_title_when_settled(title, cx),
             AlacEvent::ResetTitle => self.set_title_when_settled(self.default_title.clone(), cx),
-            AlacEvent::PtyWrite(text) => {
-                let bytes = super::color_scheme::decrqm_reply(text);
-                if !bytes.is_empty() {
-                    self.terminal.write(bytes);
-                }
-            }
+            AlacEvent::PtyWrite(text) => self.terminal.write(text.into_bytes()),
             AlacEvent::ChildExit(_) | AlacEvent::Exit => {
                 self.terminal.exited = true;
                 // Nothing is left to settle, and a title still waiting its turn

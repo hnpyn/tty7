@@ -44,6 +44,12 @@ pub struct EventProxy {
 
 impl EventListener for EventProxy {
     fn send_event(&self, event: AlacEvent) {
+        // alacritty answers an unknown private mode with `CSI ? 2031 ; 0 $ y`.
+        // The reader has already queued the answer for the mode at that byte,
+        // so this copy must not reach the view or a test draining the channel.
+        if matches!(&event, AlacEvent::PtyWrite(text) if text == "\x1b[?2031;0$y") {
+            return;
+        }
         if self.replaying.load(Ordering::Relaxed)
             && matches!(
                 event,
@@ -6392,6 +6398,41 @@ mod tests {
             reply.as_deref(),
             Some("\x1b[?2026;2$y"),
             "DECRQM ?2026 must be answered as supported (2 = reset)"
+        );
+    }
+
+    #[test]
+    fn an_unrecognized_2031_reply_is_not_queued() {
+        crate::core::config::pin_test_config_dir();
+        let (client_side, mut daemon_side) = UnixStream::pair().unwrap();
+        let term = RemoteTerminal::from_stream(client_side, TermSize::new(80, 24)).unwrap();
+
+        DaemonMsg::Output(b"\x1b[?2031$p".to_vec())
+            .encode(&mut daemon_side)
+            .unwrap();
+        daemon_side.flush().unwrap();
+
+        let mut writes = Vec::new();
+        for _ in 0..200 {
+            while let Ok(ev) = term.events.try_recv() {
+                if let AlacEvent::PtyWrite(text) = ev {
+                    writes.push(text);
+                }
+            }
+            if !writes.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        while let Ok(ev) = term.events.try_recv() {
+            if let AlacEvent::PtyWrite(text) = ev {
+                writes.push(text);
+            }
+        }
+        assert_eq!(
+            writes,
+            vec!["\x1b[?2031;2$y".to_string()],
+            "the emulator's ?2031;0$y must be dropped before the channel, leaving the mode at the query"
         );
     }
 
