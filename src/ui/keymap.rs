@@ -4,7 +4,7 @@ use crate::core::actions::*;
 use crate::core::config::{Config, KeybindingOverride};
 use crate::terminal::view::{
     AlternatePaste, ClearScrollback, CopyRaw, CopyText, FindInTerminal, FindNext, FindPrevious,
-    InsertNewline, InsertNewlineFallback, PasteText, RunReverseSearchSelection, ToggleComposer,
+    InsertNewline, InsertNewlineFallback, PasteText, ToggleComposer,
 };
 use crate::ui::theme::set_menus;
 
@@ -29,18 +29,14 @@ pub fn init(cx: &mut App) {
     set_menus(cx);
 }
 
-/// Terminal keys the config table does not carry: Tab is input, and Cmd+Enter
-/// runs the open history-search row.
+/// Terminal keys the config table does not carry: Tab is input. Cmd+Enter
+/// while a completion or history-search menu is open falls through to the
+/// editor, which accepts the row and submits the line.
 fn fixed_bindings() -> Vec<KeyBinding> {
     vec![
         KeyBinding::new("secondary-+", IncreaseFontSize, None),
         KeyBinding::new("tab", SendTab, Some("Terminal")),
         KeyBinding::new("shift-tab", SendBackTab, Some("Terminal")),
-        KeyBinding::new(
-            "cmd-enter",
-            RunReverseSearchSelection,
-            Some("Terminal && reverse_search"),
-        ),
     ]
 }
 
