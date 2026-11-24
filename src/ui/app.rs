@@ -1888,6 +1888,13 @@ impl Tty7App {
             }
         })
         .detach();
+        // A window that closes while a pane is zoomed otherwise leaves its
+        // entity id in the process-wide registry, and a later pane that
+        // reused the id would read as zoomed.
+        cx.on_release(move |_, cx| {
+            crate::terminal::view::declare_zoomed(cx, app_id, None);
+        })
+        .detach();
         cx.on_app_quit(|app, cx| {
             app.save_session(cx);
             crate::core::window_state::WindowState::from_bounds(app.window_bounds).save();
@@ -5723,10 +5730,21 @@ impl Tty7App {
                     .map(crate::ui::keymap::key_tokens)
             })
             .map(|keys| crate::ui::dialog::chord(keys, cx));
+        // Vertical mode floats the title bar over the top of this column
+        // while the pointer is on that edge. The badge lives in the same
+        // corner, so drop it by the bar or the bar's buttons cover the
+        // click that un-zooms.
+        let floating_title = matches!(cx.global::<Config>().tab_bar_position, TabBarPosition::Left)
+            && self.strip_chrome_hover.get();
+        let top = if floating_title {
+            px(TITLE_BAR_HEIGHT + 8.)
+        } else {
+            px(8.)
+        };
         div()
             .id("zoom-badge")
             .absolute()
-            .top(px(8.))
+            .top(top)
             .right(px(14.))
             .occlude()
             .flex()

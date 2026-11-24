@@ -7302,6 +7302,43 @@ mod tests {
         assert!(st.agent_session.is_none(), "--last names no session");
         apply_agent(&mut st, Some((CLIAgent::Codex, argv("codex"))));
         assert!(st.agent_session.is_none(), "a fresh launch has no id yet");
+
+        let mut st = test_state(true);
+        apply_agent(
+            &mut st,
+            Some((CLIAgent::Codex, argv("codex --yolo resume 0199a1b2-c3d4"))),
+        );
+        assert_eq!(
+            st.agent_session
+                .as_ref()
+                .and_then(|s| s.session_id.as_deref()),
+            Some("0199a1b2-c3d4"),
+            "a global flag before resume still names the session"
+        );
+
+        let mut st = test_state(true);
+        apply_agent(
+            &mut st,
+            Some((CLIAgent::Codex, argv("codex fork 0199a1b2-c3d4"))),
+        );
+        assert!(
+            st.agent_session
+                .as_ref()
+                .and_then(|s| s.session_id.as_ref())
+                .is_none(),
+            "fork's source id is not the session this process is running"
+        );
+        apply_agent(
+            &mut st,
+            Some((CLIAgent::Codex, argv("codex --yolo fork 0199a1b2-c3d4"))),
+        );
+        assert!(
+            st.agent_session
+                .as_ref()
+                .and_then(|s| s.session_id.as_ref())
+                .is_none(),
+            "a global flag before fork does not change that"
+        );
     }
 
     #[test]

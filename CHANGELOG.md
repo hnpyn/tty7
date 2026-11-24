@@ -62,6 +62,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A resumed session keeps its id when flags precede `resume`** — `codex
+  --yolo resume <id>` (and the same shape for the other agents) is seeded
+  from the command line before the agent reports, so a second restore still
+  has an id. `fork <id>` is not: that id is the source session, and writing
+  it into the pane made the next restore reopen the source.
+
+- **The zoom badge stays clickable under the floating title bar** — With tabs
+  on the left, moving the pointer to the top edge shows the title bar over
+  the pane. The zoom badge now drops by the bar's height while that bar is
+  up, so its un-zoom click is not covered. Closing the window also drops its
+  entry from the zoom registry.
+
 - **The CLI resize e2e no longer fails on a correct capture** —
   `capture_still_answers_after_a_resize` now allows for the mode restore that
   the default `capture` form puts ahead of the newest segment. When the shell

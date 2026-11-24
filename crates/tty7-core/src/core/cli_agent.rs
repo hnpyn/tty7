@@ -373,6 +373,26 @@ impl CLIAgent {
     /// that has not yet fired another hook event still preserves its session id
     /// across subsequent server restarts.
     pub fn session_id_from_argv(self, argv: &[String]) -> Option<&str> {
+        self.argv_session_id(argv, true)
+    }
+
+    /// The session a running pane should adopt from its command line.
+    ///
+    /// The same scan as [`Self::session_id_from_argv`], so a global flag in
+    /// front of the subcommand still counts (`codex --yolo resume <id>`). A
+    /// `fork` subcommand is left out: it names the *source* session, and
+    /// writing that into the pane would make the next restore reopen the
+    /// source instead of the session this process is actually running.
+    /// `None` for `resume --last`, a bare `resume` picker, or anything that
+    /// is not an id.
+    pub fn resumed_session_id(self, argv: &[String]) -> Option<String> {
+        self.argv_session_id(argv, false).map(str::to_string)
+    }
+
+    /// `include_fork_subcommand` keeps `fork <id>` / `threads fork <id>`.
+    /// The seed path passes `false` so that source id never becomes the
+    /// pane's current session.
+    fn argv_session_id(self, argv: &[String], include_fork_subcommand: bool) -> Option<&str> {
         let valid_id = |id: &str| {
             !id.is_empty()
                 && !id.starts_with('-')
@@ -421,7 +441,7 @@ impl CLIAgent {
             {
                 return Some(val);
             } else if matches!(self, CLIAgent::Codex | CLIAgent::TraeCode | CLIAgent::Muse)
-                && matches!(tok, "resume" | "fork")
+                && (tok == "resume" || (include_fork_subcommand && tok == "fork"))
                 && let Some(&next) = iter.peek()
                 && valid_id(next)
             {
@@ -429,7 +449,8 @@ impl CLIAgent {
             } else if matches!(self, CLIAgent::Amp)
                 && matches!(tok, "threads" | "t")
                 && let Some(&verb) = iter.peek()
-                && matches!(verb, "continue" | "c" | "fork" | "f" | "handoff" | "h")
+                && (matches!(verb, "continue" | "c" | "handoff" | "h")
+                    || (include_fork_subcommand && matches!(verb, "fork" | "f")))
             {
                 iter.next();
                 if let Some(&next) = iter.peek()
@@ -502,37 +523,6 @@ impl CLIAgent {
             prev_was_flag = is_flag;
         }
         Some(tail.into_iter().map(String::from).collect())
-    }
-
-    /// The session `argv` resumes, for the agents that name it with a
-    /// positional id after a `resume` subcommand — `codex resume <id>`, which
-    /// is also what a restore types. Codex reports nothing until the first
-    /// turn of a resumed session, so without this a restored pane holds no id
-    /// until then, and a second restore before that turn has nothing to
-    /// resume (#1260). `None` for `resume --last`, a bare `resume` picker, or
-    /// anything that is not an id.
-    pub fn resumed_session_id(self, argv: &[String]) -> Option<String> {
-        if !matches!(self, CLIAgent::Codex | CLIAgent::TraeCode | CLIAgent::Muse) {
-            return None;
-        }
-        let names_self = |token: &str| {
-            token.split(['/', '\\']).any(|seg| {
-                CLIAgent::match_token(&base_stem(seg).to_ascii_lowercase()) == Some(self)
-            })
-        };
-        let argv = &argv[argv.iter().take_while(|t| is_env_assignment(t)).count()..];
-        let named = argv.iter().position(|t| names_self(t))?;
-        let mut tail = argv[named + 1..].iter().map(String::as_str);
-        if tail.next() != Some("resume") {
-            return None;
-        }
-        let id = tail.next()?;
-        (!id.is_empty()
-            && !id.starts_with('-')
-            && id
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.'))
-        .then(|| id.to_string())
     }
 
     /// What follows the agent's own name in `argv`, with everything that names
@@ -2972,6 +2962,72 @@ mod tests {
         assert_eq!(
             CLIAgent::Auggie.session_id_from_argv(&argv(&["auggie", "session", "resume", "au-88"])),
             Some("au-88")
+        );
+    }
+
+    #[test]
+    fn resumed_session_id_follows_argv_parsing_and_skips_a_fork_subcommand() {
+        let argv = |parts: &[&str]| parts.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+        assert_eq!(
+            CLIAgent::Codex.resumed_session_id(&argv(&["codex", "--yolo", "resume", "th_99"])),
+            Some("th_99".into()),
+            "global flags may precede the resume subcommand"
+        );
+        assert_eq!(
+            CLIAgent::Codex.resumed_session_id(&argv(&[
+                "codex",
+                "resume",
+                "0199a1b2-c3d4",
+                "--yolo"
+            ])),
+            Some("0199a1b2-c3d4".into())
+        );
+        assert_eq!(
+            CLIAgent::Codex.session_id_from_argv(&argv(&["codex", "fork", "src-1"])),
+            Some("src-1"),
+            "the general parser still sees a fork's source id"
+        );
+        assert_eq!(
+            CLIAgent::Codex.resumed_session_id(&argv(&["codex", "fork", "src-1"])),
+            None,
+            "fork names the source, not the session this process is running"
+        );
+        assert_eq!(
+            CLIAgent::Codex.resumed_session_id(&argv(&["codex", "--yolo", "fork", "src-1"])),
+            None
+        );
+        assert_eq!(
+            CLIAgent::TraeCode.resumed_session_id(&argv(&["traecli", "fork", "019c-123"])),
+            None
+        );
+        assert_eq!(
+            CLIAgent::Amp.session_id_from_argv(&argv(&["amp", "threads", "fork", "t-1"])),
+            Some("t-1")
+        );
+        assert_eq!(
+            CLIAgent::Amp.resumed_session_id(&argv(&["amp", "threads", "fork", "t-1"])),
+            None
+        );
+        assert_eq!(
+            CLIAgent::Amp.resumed_session_id(&argv(&["amp", "threads", "continue", "t-77"])),
+            Some("t-77".into())
+        );
+        assert_eq!(
+            CLIAgent::Codex.resumed_session_id(&argv(&["codex", "resume", "--last"])),
+            None,
+            "--last names no session"
+        );
+        assert_eq!(
+            CLIAgent::Cursor.resumed_session_id(&argv(&[
+                "cursor-agent",
+                "--use-system-ca",
+                "/Users/me/.local/share/cursor-agent/versions/x/index.js",
+                "--resume",
+                "sess-123",
+            ])),
+            Some("sess-123".into()),
+            "node launcher tokens do not hide a later --resume"
         );
     }
 
