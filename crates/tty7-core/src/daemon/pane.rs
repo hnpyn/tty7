@@ -11187,6 +11187,10 @@ mod tests {
                 match burst.read(&mut buf) {
                     Ok(0) => break Ok(got),
                     Ok(n) => got.extend_from_slice(&buf[..n]),
+                    // The slave is closed. Linux reports that as EIO on the
+                    // master; macOS reports it as a zero-length read.
+                    Err(err) if err.raw_os_error() == Some(libc::EIO) => break Ok(got),
+                    Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
                     Err(err) => break Err(err),
                 }
             };
