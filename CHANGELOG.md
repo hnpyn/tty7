@@ -90,8 +90,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **The zoom badge stays clickable under the floating title bar** — With tabs
   on the left, moving the pointer to the top edge shows the title bar over
   the pane. The zoom badge now drops by the bar's height while that bar is
-  up, so its un-zoom click is not covered. Closing the window also drops its
-  entry from the zoom registry.
+  up, so its un-zoom click is not covered. On Windows and Linux the bar
+  instead spans the window above a docked document or the right panel, and
+  the badge stays in the corner. Closing the window also drops its entry
+  from the zoom registry.
 
 - **The CLI resize e2e no longer fails on a correct capture** —
   `capture_still_answers_after_a_resize` now allows for the mode restore that

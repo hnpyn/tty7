@@ -5715,7 +5715,12 @@ impl Tty7App {
     /// The tab's own mark (#752) sits in the chip or the sidebar row, and
     /// neither is on screen with the sidebar collapsed — this one is in the
     /// content, where the eye already is. Clicking it un-zooms.
-    fn render_zoom_badge(&self, panes: usize, cx: &mut Context<Self>) -> gpui::AnyElement {
+    fn render_zoom_badge(
+        &self,
+        panes: usize,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
         let theme = cx.theme();
         let (fill, hover, ink) = (
             theme.secondary,
@@ -5733,9 +5738,14 @@ impl Tty7App {
         // Vertical mode floats the title bar over the top of this column
         // while the pointer is on that edge. The badge lives in the same
         // corner, so drop it by the bar or the bar's buttons cover the
-        // click that un-zooms.
+        // click that un-zooms. On Windows and Linux a docked document or the
+        // right panel puts that bar in the spanning row above the body, in
+        // the document flow, so the corner is already clear.
+        let title_bar_spans = !cfg!(target_os = "macos")
+            && (self.right_panel_open(cx) || self.document_dock_px(window, cx).is_some());
         let floating_title = matches!(cx.global::<Config>().tab_bar_position, TabBarPosition::Left)
-            && self.strip_chrome_hover.get();
+            && self.strip_chrome_hover.get()
+            && !title_bar_spans;
         let top = if floating_title {
             px(TITLE_BAR_HEIGHT + 8.)
         } else {
@@ -9764,7 +9774,7 @@ impl Render for Tty7App {
                         .size_full()
                         .overflow_hidden()
                         .child(leaf.clone())
-                        .child(self.render_zoom_badge(active_tab.pane.leaves().len(), cx))
+                        .child(self.render_zoom_badge(active_tab.pane.leaves().len(), window, cx))
                         .into_any_element(),
                     None => {
                         let several = active_tab.pane.leaves().len() > 1;
