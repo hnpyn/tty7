@@ -1461,6 +1461,29 @@ fn segment_has_room_after(row: &[RenderCell], start: usize, cells: usize, icon: 
     }
 }
 
+/// The `FontId` the shaper stamps on glyphs from `face`.
+///
+/// On macOS a face loaded under different feature or fallback keys gets
+/// distinct `FontId`s while CoreText runs map back to the latest one, so
+/// `resolve_font` can disagree with `shaped.runs[0].font_id` for the same face.
+fn shaped_font_id(window: &Window, face: &Font, font_size: Pixels) -> gpui::FontId {
+    let probe = [TextRun {
+        len: 1,
+        font: face.clone(),
+        color: Hsla::default(),
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+    }];
+    window
+        .text_system()
+        .shape_line(SharedString::new_static("M"), font_size, &probe, None)
+        .runs
+        .first()
+        .map(|r| r.font_id)
+        .unwrap_or_else(|| window.text_system().resolve_font(face))
+}
+
 fn paint_glyphs(
     window: &mut Window,
     cx: &mut App,
@@ -1648,7 +1671,7 @@ fn paint_glyphs(
                     && shaped.runs.first().is_some_and(|r| {
                         r.font_id
                             != *primary_ids[face_ix].get_or_insert_with(|| {
-                                window.text_system().resolve_font(&faces[face_ix])
+                                shaped_font_id(window, &faces[face_ix], font_size)
                             })
                     });
                 let (scale, room) = if icon {
