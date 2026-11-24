@@ -453,6 +453,45 @@ pub(crate) fn hover_sheet(id: &'static str, flag: &Rc<Cell<bool>>) -> gpui::Stat
         })
 }
 
+/// The floating title bar's "the pointer is still in the bar" sheet.
+///
+/// Painted after the top-row grips. Those grips occlude, and a sheet under
+/// them is told the pointer left the instant it reaches a grip, which closes
+/// the bar. This one is in front of the grips and blocks nothing, so the grip
+/// and the buttons keep their presses while the bar stays up.
+///
+/// The sheet only hears a leave after a move it was already hovered for, and
+/// it is created under the pointer. The move that then drops below the bar
+/// would not be reported. The canvas reads the pointer against the band and
+/// closes the bar on that frame.
+fn floating_chrome_hold(flag: &Rc<Cell<bool>>) -> gpui::Div {
+    let flag_sheet = flag.clone();
+    let flag_band = flag.clone();
+    div()
+        .absolute()
+        .top_0()
+        .left_0()
+        .right_0()
+        .h(px(TITLE_BAR_HEIGHT))
+        .child(hover_sheet("strip-chrome-hover", &flag_sheet))
+        .child(
+            gpui::canvas(
+                move |bounds, window, cx| {
+                    if flag_band.get() && !bounds.contains(&window.mouse_position()) {
+                        flag_band.set(false);
+                        // `refresh` during prepaint is ignored while this
+                        // window is drawing. The deferred one is the frame
+                        // that paints the bar down.
+                        window.defer(cx, |window, _cx| window.refresh());
+                    }
+                },
+                |_, _, _, _| {},
+            )
+            .absolute()
+            .inset_0(),
+        )
+}
+
 /// Whether a group of title-bar tiles paints this frame: always, unless
 /// `auto_hide_titlebar_buttons` is on, and then only while the pointer is over
 /// the bar the group sits in.
@@ -1139,6 +1178,9 @@ pub struct Tty7App {
     pub(crate) reorder: Rc<RefCell<Option<crate::ui::reorder::Reorder>>>,
     /// The pane the pointer is over, so only that one offers its drag handle.
     pub(crate) pane_hover: Rc<Cell<Option<gpui::EntityId>>>,
+    /// Set for the one move that enters a grip drawn above its reveal band.
+    /// See [`crate::ui::pane::PaneChrome::grip_claim`].
+    pane_grip_claim: Rc<Cell<Option<gpui::EntityId>>>,
     pub(crate) pane_drag: crate::ui::pane_drag::PaneDragState,
     /// Where a tab held over the layout would be grafted in, as the last
     /// painted frame read it. The same bargain the pane drag's landing keeps:
@@ -1841,6 +1883,7 @@ impl Tty7App {
             sidebar_reveal: Rc::new(Cell::new(None)),
             reorder: Rc::new(RefCell::new(None)),
             pane_hover: Rc::new(Cell::new(None)),
+            pane_grip_claim: Rc::new(Cell::new(None)),
             pane_drag: Rc::new(RefCell::new(None)),
             tab_merge: Cell::new(None),
             pane_detach: Cell::new(None),
@@ -4979,6 +5022,76 @@ impl Tty7App {
         }
     }
 
+    /// A pane drag, a tab drag, or any other gpui drag. The floating title bar
+    /// is summoned by a hover on the same edge a drop lands on, and
+    /// `has_active_drag` is what the hover listener itself already refuses —
+    /// checked here as well so a flag set on the move that *starts* the drag
+    /// is cleared before that move's frame paints.
+    fn drag_hides_floating_chrome(&self, cx: &App) -> bool {
+        cx.has_active_drag() || self.pane_drag.borrow().is_some() || self.reorder.borrow().is_some()
+    }
+
+    fn top_grip_plan(&self) -> Vec<(gpui::EntityId, Bounds<Pixels>)> {
+        let Some(area) = self.pane_area.get() else {
+            return Vec::new();
+        };
+        let Some(tab) = self.tabs.get(self.active) else {
+            return Vec::new();
+        };
+        // While the bar is open the grip is only the dot strip. That ends at
+        // 7px; the bar's tiles start at 7.5 and its search at 9.5, so the
+        // two never share a pixel even when a column is centred on the search.
+        // This list is every top-row leaf, before the window controls clip a
+        // grip away: a leaf that drops out here paints its own dots again,
+        // under those controls.
+        let height = if self.strip_chrome_hover.get() {
+            crate::ui::pane_drag::HANDLE_STRIP
+        } else {
+            crate::ui::pane_drag::GRIP_H
+        };
+        crate::ui::pane_drag::top_grips(&tab.pane, area, height)
+            .into_iter()
+            .map(|(slot, bounds)| (slot.entity_id(), bounds))
+            .collect()
+    }
+
+    /// Top-row grips, in the terminal column's coordinates, above whatever
+    /// floating chrome this frame drew.
+    fn render_top_grips(&self, window: &Window, cx: &App) -> Vec<gpui::AnyElement> {
+        let Some(area) = self.pane_area.get() else {
+            return Vec::new();
+        };
+        let hovered = self.pane_hover.clone();
+        let claim = self.pane_grip_claim.clone();
+        let state = self.pane_drag.clone();
+        // The window controls, unlike the tiles, fill the bar's whole height,
+        // so an open bar keeps the painted grips out of their trailing width.
+        let clear = if self.strip_chrome_hover.get() {
+            window_controls_w(window.is_fullscreen())
+        } else {
+            0.
+        };
+        crate::ui::pane_drag::clip_past_trailing(self.top_grip_plan(), area, clear)
+            .into_iter()
+            .map(|(id, bounds)| {
+                crate::ui::pane_drag::overlay_grip(
+                    id,
+                    hovered.get() == Some(id),
+                    &state,
+                    &hovered,
+                    &claim,
+                    bounds.size.width.as_f32(),
+                    bounds.size.height.as_f32(),
+                    cx,
+                )
+                .absolute()
+                .left(bounds.origin.x - area.origin.x)
+                .top(bounds.origin.y - area.origin.y)
+                .into_any_element()
+            })
+            .collect()
+    }
+
     /// The patch of the layout a pane being dragged would land on, lit up.
     ///
     /// Also records that landing as the one a drop would take, so the drop and
@@ -5718,7 +5831,7 @@ impl Tty7App {
     fn render_zoom_badge(
         &self,
         panes: usize,
-        window: &Window,
+        bar_spans: bool,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let theme = cx.theme();
@@ -5738,14 +5851,13 @@ impl Tty7App {
         // Vertical mode floats the title bar over the top of this column
         // while the pointer is on that edge. The badge lives in the same
         // corner, so drop it by the bar or the bar's buttons cover the
-        // click that un-zooms. On Windows and Linux a docked document or the
-        // right panel puts that bar in the spanning row above the body, in
-        // the document flow, so the corner is already clear.
-        let title_bar_spans = !cfg!(target_os = "macos")
-            && (self.right_panel_open(cx) || self.document_dock_px(window, cx).is_some());
+        // click that un-zooms. `bar_spans` is the same decision the layout
+        // made: on Windows and Linux a docked document or the right panel
+        // puts that bar in the spanning row above the body, so the corner
+        // is already clear.
         let floating_title = matches!(cx.global::<Config>().tab_bar_position, TabBarPosition::Left)
             && self.strip_chrome_hover.get()
-            && !title_bar_spans;
+            && !bar_spans;
         let top = if floating_title {
             px(TITLE_BAR_HEIGHT + 8.)
         } else {
@@ -9727,6 +9839,10 @@ impl Render for Tty7App {
         }
         let vertical = matches!(cx.global::<Config>().tab_bar_position, TabBarPosition::Left)
             && !self.tabs.is_empty();
+        // The claim only has to survive the move that enters the grip. The
+        // next move starts from empty, or a band the pointer has left could
+        // not take its dots down.
+        self.pane_grip_claim.set(None);
         // Asked through the predicate the right panel sizes itself against —
         // two spellings of "is the rail up" is one more than the layout can
         // afford to have disagree.
@@ -9744,131 +9860,15 @@ impl Render for Tty7App {
         if !auto_hide_chrome && !vertical {
             self.strip_chrome_hover.set(false);
         }
-        // Both read before the strip and the sidebar are built: a tab held out
-        // over the layout suspends the reorder, which is what those two ask
-        // what to draw, and a pane held over *them* is measured against where
-        // they put their tabs last frame — which is what they are about to
-        // blank and write again.
-        let tab_landing = self.tab_landing(window, cx);
-        let detach_caret = self.detach_caret(window, cx);
-        let strip = self.tab_strip(!vertical, window, cx);
-        let sidebar = rail.then(|| self.tab_sidebar(window, cx));
-        let ssh_status = self
-            .tabs
-            .get(self.active)
-            .and_then(|t| t.pane.focused_or_first(window, cx))
-            .and_then(|leaf| self.render_ssh_status_strip(&leaf, cx));
-        let body = match self.tabs.get(self.active) {
-            None => self.render_home(cx).into_any_element(),
-            Some(active_tab) => {
-                let maximized = self.maximized.as_ref().filter(|leaf| {
-                    active_tab
-                        .pane
-                        .leaves()
-                        .iter()
-                        .any(|l| l.entity_id() == leaf.entity_id())
-                });
-                match maximized {
-                    Some(leaf) => div()
-                        .relative()
-                        .size_full()
-                        .overflow_hidden()
-                        .child(leaf.clone())
-                        .child(self.render_zoom_badge(active_tab.pane.leaves().len(), window, cx))
-                        .into_any_element(),
-                    None => {
-                        let several = active_tab.pane.leaves().len() > 1;
-                        let chrome = crate::ui::pane::PaneChrome {
-                            dim_inactive: several && cx.global::<Config>().dim_inactive_panes,
-                            rearrangeable: several,
-                            hovered: self.pane_hover.clone(),
-                            lifted: crate::ui::pane_drag::lifted(&self.pane_drag),
-                            drag: self.pane_drag.clone(),
-                        };
-                        active_tab.pane.render(&chrome, window, cx)
-                    }
-                }
-            }
-        };
-
-        // No window buttons in fullscreen, where they cannot work: the window
-        // has no caption for the platform to hit-test, so they would draw,
-        // light up under the pointer and do nothing when clicked. `TitleBar`
-        // always draws them, so the strip goes into a plain row of the same
-        // geometry instead — the row itself stays, since it holds the tabs,
-        // the chrome tiles and the docked document's header.
-        let title_bar =
-            if window_controls_drawn(window.is_fullscreen()) || cfg!(target_os = "macos") {
-                // `TitleBar` pads its own fixed 80pt; the lead is ours, since
-                // it follows where the traffic lights are put.
-                TitleBar::new()
-                    .h(px(TITLE_BAR_HEIGHT))
-                    .pl(px(TITLE_BAR_LEAD))
-                    .bg(cx.theme().transparent)
-                    .border_color(cx.theme().transparent)
-                    .child(strip)
-                    .into_any_element()
-            } else {
-                div()
-                    .flex_shrink_0()
-                    .flex()
-                    .flex_row()
-                    .pl(px(TITLE_BAR_LEAD))
-                    .title_strip_row(px(TITLE_BAR_BORDER), cx.theme().transparent)
-                    .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .h_full()
-                            .flex_1()
-                            .child(strip),
-                    )
-                    .into_any_element()
-            };
-        let body_area = div()
-            .flex_1()
-            .relative()
-            .overflow_hidden()
-            .child(
-                gpui::canvas(
-                    {
-                        let area = self.pane_area.clone();
-                        move |bounds, _window, _cx| area.set(Some(bounds))
-                    },
-                    |_, _, _, _| {},
-                )
-                .absolute()
-                .inset_0(),
-            )
-            .child(body)
-            .when_some(self.pane_landing(window, cx), |this, el| this.child(el))
-            .when_some(tab_landing, |this, el| this.child(el))
-            .when_some(self.render_remote_workspace_strip(cx), |this, el| {
-                this.child(el)
-            })
-            // Both of these used to anchor themselves at `bottom_4` and centre
-            // themselves, as siblings here — so a remote workspace whose ssh
-            // link had also dropped drew them one on top of the other. One
-            // anchor now, and it stacks. The ssh strip goes last because it is
-            // the one carrying buttons.
-            .when_some(
-                crate::ui::notice::anchor(
-                    [self.render_remote_input_notice(cx), ssh_status]
-                        .into_iter()
-                        .flatten()
-                        .chain(self.render_lease_notices(cx))
-                        .collect(),
-                ),
-                |this, el| this.child(el),
-            );
-
-        // One decision for the whole document surface. Docked, exactly one of
-        // the two surfaces is drawn — a column has one child, and two `flex_1`
-        // siblings would split it and fight — so `overlay_top` stops ordering a
-        // pair and starts choosing between them. Filling, nothing changes: both
-        // are rendered, ordered by `overlay_top`, and the front one wins on
-        // paint order as it always has.
+        // One decision for the whole document surface, taken before the body
+        // and the strip. Docked, exactly one of the two surfaces is drawn — a
+        // column has one child, and two `flex_1` siblings would split it and
+        // fight — so `overlay_top` stops ordering a pair and starts choosing
+        // between them. Filling, nothing changes: both are rendered, ordered
+        // by `overlay_top`, and the front one wins on paint order as it always
+        // has. The title bar floats only when that column (or the detail
+        // panel) was not actually drawn: `document_dock_px` can be `Some`
+        // while the column itself comes back empty, and the two have to agree.
         let document_dock_px = self.document_dock_px(window, cx);
         // Where the docked header sits. Everywhere but macOS the title bar
         // spans the workspace and leaves the strip above the column empty, so
@@ -9921,7 +9921,6 @@ impl Render for Tty7App {
         let document_px = document_column
             .as_ref()
             .map_or(0., |_| document_dock_px.unwrap_or_default());
-
         let right_panel = self.render_right_panel(window, cx);
         // A docked document takes the same fork the right panel does: on
         // Windows and Linux the window controls live at the right end of the
@@ -9929,6 +9928,169 @@ impl Render for Tty7App {
         // inside the terminal column with a column drawn to the right of it.
         let panel_below_title_bar =
             (right_panel.is_some() || document_column.is_some()) && !cfg!(target_os = "macos");
+        // The title bar floats over the terminal column only in the left-rail
+        // layout, and only when it is not that spanning row. A drag in flight
+        // has to keep the float down: the 6px edge that summons it is also
+        // the top drop band, and a bar painted over the band hides the landing.
+        let floating_title = vertical && !panel_below_title_bar;
+        let suppress_floating = floating_title && self.drag_hides_floating_chrome(cx);
+        if suppress_floating {
+            self.strip_chrome_hover.set(false);
+        }
+        // One sheet, after the grips. The strip must not also carry one, or
+        // the two fight over this flag the moment a grip occludes the inner.
+        let external_hover_sheet = floating_title && self.strip_chrome_hover.get();
+        // A single pane, a zoomed pane, and a drag in flight draw no overlay.
+        // The overlay occludes, so one of those would cover the first line of
+        // text, drag a pane that is not a split, or eat a drop on the top edge.
+        let top_grips_on = floating_title
+            && !suppress_floating
+            && self.maximized.is_none()
+            && self
+                .tabs
+                .get(self.active)
+                .is_some_and(|tab| tab.pane.leaves().len() > 1)
+            && crate::ui::pane_drag::lifted(&self.pane_drag).is_none();
+        // Both read before the strip and the sidebar are built: a tab held out
+        // over the layout suspends the reorder, which is what those two ask
+        // what to draw, and a pane held over *them* is measured against where
+        // they put their tabs last frame — which is what they are about to
+        // blank and write again.
+        let tab_landing = self.tab_landing(window, cx);
+        let detach_caret = self.detach_caret(window, cx);
+        let strip = self.tab_strip(!vertical, external_hover_sheet, window, cx);
+        let sidebar = rail.then(|| self.tab_sidebar(window, cx));
+        let ssh_status = self
+            .tabs
+            .get(self.active)
+            .and_then(|t| t.pane.focused_or_first(window, cx))
+            .and_then(|leaf| self.render_ssh_status_strip(&leaf, cx));
+        let body = match self.tabs.get(self.active) {
+            None => self.render_home(cx).into_any_element(),
+            Some(active_tab) => {
+                let maximized = self.maximized.as_ref().filter(|leaf| {
+                    active_tab
+                        .pane
+                        .leaves()
+                        .iter()
+                        .any(|l| l.entity_id() == leaf.entity_id())
+                });
+                match maximized {
+                    Some(leaf) => div()
+                        .relative()
+                        .size_full()
+                        .overflow_hidden()
+                        .child(leaf.clone())
+                        .child(self.render_zoom_badge(
+                            active_tab.pane.leaves().len(),
+                            panel_below_title_bar,
+                            cx,
+                        ))
+                        .into_any_element(),
+                    None => {
+                        let several = active_tab.pane.leaves().len() > 1;
+                        let external_grips = if top_grips_on {
+                            self.top_grip_plan().into_iter().map(|(id, _)| id).collect()
+                        } else {
+                            Vec::new()
+                        };
+                        let chrome = crate::ui::pane::PaneChrome {
+                            dim_inactive: several && cx.global::<Config>().dim_inactive_panes,
+                            rearrangeable: several,
+                            hovered: self.pane_hover.clone(),
+                            grip_claim: self.pane_grip_claim.clone(),
+                            external_grips,
+                            lifted: crate::ui::pane_drag::lifted(&self.pane_drag),
+                            drag: self.pane_drag.clone(),
+                        };
+                        active_tab.pane.render(&chrome, window, cx)
+                    }
+                }
+            }
+        };
+
+        // No window buttons in fullscreen, where they cannot work: the window
+        // has no caption for the platform to hit-test, so they would draw,
+        // light up under the pointer and do nothing when clicked. `TitleBar`
+        // always draws them, so the strip goes into a plain row of the same
+        // geometry instead — the row itself stays, since it holds the tabs,
+        // the chrome tiles and the docked document's header.
+        let title_bar =
+            if window_controls_drawn(window.is_fullscreen()) || cfg!(target_os = "macos") {
+                // `TitleBar` pads its own fixed 80pt; the lead is ours, since
+                // it follows where the traffic lights are put.
+                TitleBar::new()
+                    .h(px(TITLE_BAR_HEIGHT))
+                    .pl(px(TITLE_BAR_LEAD))
+                    .bg(cx.theme().transparent)
+                    .border_color(cx.theme().transparent)
+                    .child(strip)
+                    .into_any_element()
+            } else {
+                div()
+                    .flex_shrink_0()
+                    .flex()
+                    .flex_row()
+                    .pl(px(TITLE_BAR_LEAD))
+                    .title_strip_row(px(TITLE_BAR_BORDER), cx.theme().transparent)
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .h_full()
+                            .flex_1()
+                            .child(strip),
+                    )
+                    .into_any_element()
+            };
+        let body_area = div()
+            .flex_1()
+            .relative()
+            .overflow_hidden()
+            .child(
+                gpui::canvas(
+                    {
+                        let area = self.pane_area.clone();
+                        move |bounds, window, cx| {
+                            if area.get() != Some(bounds) {
+                                area.set(Some(bounds));
+                                // `refresh` during prepaint is ignored while
+                                // this window is drawing. The deferred one is
+                                // the frame that places the grips on the
+                                // bounds just recorded, instead of leaving
+                                // them on the previous frame's.
+                                window.defer(cx, |window, _cx| window.refresh());
+                            }
+                        }
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .inset_0(),
+            )
+            .child(body)
+            .when_some(self.pane_landing(window, cx), |this, el| this.child(el))
+            .when_some(tab_landing, |this, el| this.child(el))
+            .when_some(self.render_remote_workspace_strip(cx), |this, el| {
+                this.child(el)
+            })
+            // Both of these used to anchor themselves at `bottom_4` and centre
+            // themselves, as siblings here — so a remote workspace whose ssh
+            // link had also dropped drew them one on top of the other. One
+            // anchor now, and it stacks. The ssh strip goes last because it is
+            // the one carrying buttons.
+            .when_some(
+                crate::ui::notice::anchor(
+                    [self.render_remote_input_notice(cx), ssh_status]
+                        .into_iter()
+                        .flatten()
+                        .chain(self.render_lease_notices(cx))
+                        .collect(),
+                ),
+                |this, el| this.child(el),
+            );
+
         let (column_title_bar, spanning_title_bar) = if panel_below_title_bar {
             (None, Some(title_bar))
         } else {
@@ -9947,6 +10109,18 @@ impl Render for Tty7App {
         let terminal_column = if vertical {
             let strip_hovered = self.strip_chrome_hover.get();
             let hover_flag = self.strip_chrome_hover.clone();
+            // Top-row grips, painted after the float so a press on the dots
+            // hits them and not the bar. The bar's window-drag and this
+            // handle are both under the same pixels; whichever is painted
+            // later runs first, and without `occlude` the bar arms
+            // `should_move` before the handle can stop it.
+            let top_grips = if top_grips_on {
+                self.render_top_grips(window, cx)
+            } else {
+                Vec::new()
+            };
+            let chrome_hold =
+                external_hover_sheet.then(|| floating_chrome_hold(&self.strip_chrome_hover));
             div()
                 .flex_1()
                 .min_w_0()
@@ -9954,27 +10128,42 @@ impl Render for Tty7App {
                 .flex_col()
                 .relative()
                 .child(body_area)
-                .when_some(column_title_bar, move |this, bar| {
-                    if strip_hovered {
-                        this.child(div().absolute().top_0().left_0().right_0().child(bar))
-                    } else {
-                        this.child(
-                            div()
-                                .id("strip-chrome-edge-trigger")
-                                .absolute()
-                                .top_0()
-                                .left_0()
-                                .right_0()
-                                .h(px(6.))
-                                .on_hover(move |over, window, _cx| {
-                                    if *over && !hover_flag.get() {
-                                        hover_flag.set(true);
-                                        window.refresh();
-                                    }
-                                }),
-                        )
-                    }
-                })
+                .when_some(
+                    column_title_bar.filter(|_| !suppress_floating),
+                    move |this, bar| {
+                        if strip_hovered {
+                            this.child(
+                                div()
+                                    .id("floating-column-title-bar")
+                                    .debug_selector(|| "floating-column-title-bar".into())
+                                    .absolute()
+                                    .top_0()
+                                    .left_0()
+                                    .right_0()
+                                    .child(bar),
+                            )
+                        } else {
+                            this.child(
+                                div()
+                                    .id("strip-chrome-edge-trigger")
+                                    .debug_selector(|| "strip-chrome-edge-trigger".into())
+                                    .absolute()
+                                    .top_0()
+                                    .left_0()
+                                    .right_0()
+                                    .h(px(6.))
+                                    .on_hover(move |over, window, _cx| {
+                                        if *over && !hover_flag.get() {
+                                            hover_flag.set(true);
+                                            window.refresh();
+                                        }
+                                    }),
+                            )
+                        }
+                    },
+                )
+                .children(top_grips)
+                .when_some(chrome_hold, |this, hold| this.child(hold))
                 .children(column_overlays)
         } else {
             div()
@@ -11976,6 +12165,661 @@ mod window_drag_tests {
             window.dispatch_event(moved(point(px(312.), px(60.)), false), cx);
         });
         vcx.run_until_parked();
+    }
+}
+
+/// The floating title bar and a top-row pane grip occupy the same pixels.
+/// These lock the resolution: a grip drag never moves the window, the bar
+/// stays out of a drop aimed at the top edge, and the bar's own controls
+/// still take a click.
+#[cfg(test)]
+mod floating_title_grip_tests {
+    use super::test_window::harness;
+    use crate::core::config::Config;
+    use crate::terminal::view::quiet_test_pane;
+    use crate::ui::pane::{Dir, Pane, PaneSlot};
+    use crate::ui::pane_drag::{self, DropZone, GRIP_H, HANDLE_STRIP};
+    use gpui::{
+        Bounds, Entity, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+        Pixels, PlatformInput, Point, TestAppContext, VisualTestContext, point, px,
+    };
+
+    fn split(
+        cx: &mut TestAppContext,
+        axis: gpui::Axis,
+        collapse_sidebar: bool,
+    ) -> (
+        Entity<super::Tty7App>,
+        VisualTestContext,
+        Vec<crate::daemon::transport::Stream>,
+    ) {
+        let (app, mut vcx) = harness(cx);
+        vcx.update(|_, cx| {
+            let mut cfg = cx.global::<Config>().clone();
+            cfg.cursor_blink = false;
+            cx.set_global(cfg);
+        });
+        let streams = app.update_in(&mut vcx, |app, window, cx| {
+            if collapse_sidebar {
+                app.toggle_left_panel(cx);
+            }
+            let (left, left_stream) = quiet_test_pane(1, window, cx);
+            let (right, right_stream) = quiet_test_pane(2, window, cx);
+            app.tabs.push(super::Tab::new(Pane::split_node(
+                axis,
+                0.5,
+                Pane::leaf(PaneSlot::Ready(left)),
+                Pane::leaf(PaneSlot::Ready(right)),
+            )));
+            app.active = 0;
+            cx.notify();
+            vec![left_stream, right_stream]
+        });
+        // The canvas records `pane_area` during the frame that first lays the
+        // body out, and the grips are placed from the area the previous frame
+        // recorded. One more draw and they are on screen.
+        vcx.update(|window, _| window.refresh());
+        vcx.run_until_parked();
+        (app, vcx, streams)
+    }
+
+    fn layout(
+        cx: &mut TestAppContext,
+        collapse_sidebar: bool,
+        make: impl FnOnce(
+            &mut gpui::Window,
+            &mut gpui::Context<super::Tty7App>,
+        ) -> (Pane, Vec<crate::daemon::transport::Stream>),
+    ) -> (
+        Entity<super::Tty7App>,
+        VisualTestContext,
+        Vec<crate::daemon::transport::Stream>,
+    ) {
+        let (app, mut vcx) = harness(cx);
+        vcx.update(|_, cx| {
+            let mut cfg = cx.global::<Config>().clone();
+            cfg.cursor_blink = false;
+            cx.set_global(cfg);
+        });
+        let streams = app.update_in(&mut vcx, |app, window, cx| {
+            if collapse_sidebar {
+                app.toggle_left_panel(cx);
+            }
+            let (pane, streams) = make(window, cx);
+            app.tabs.push(super::Tab::new(pane));
+            app.active = 0;
+            cx.notify();
+            streams
+        });
+        vcx.update(|window, _| window.refresh());
+        vcx.run_until_parked();
+        (app, vcx, streams)
+    }
+
+    fn leaf_ids(app: &Entity<super::Tty7App>, vcx: &VisualTestContext) -> Vec<u64> {
+        app.read_with(vcx, |app, _| {
+            app.tabs[0]
+                .pane
+                .leaves()
+                .iter()
+                .map(|leaf| leaf.entity_id().as_u64())
+                .collect()
+        })
+    }
+
+    fn area_and_panes(
+        app: &Entity<super::Tty7App>,
+        vcx: &VisualTestContext,
+    ) -> (Bounds<Pixels>, Vec<Bounds<Pixels>>) {
+        app.read_with(vcx, |app, _| {
+            let area = app.pane_area.get().expect("the body has been laid out");
+            let panes = pane_drag::leaf_bounds(&app.tabs[0].pane, area);
+            (area, panes)
+        })
+    }
+
+    fn painted(vcx: &mut VisualTestContext, selector: &str) -> Option<Bounds<Pixels>> {
+        let key: &'static str = Box::leak(selector.to_string().into_boxed_str());
+        vcx.debug_bounds(key)
+    }
+
+    fn must_paint(vcx: &mut VisualTestContext, selector: &str) -> Bounds<Pixels> {
+        painted(vcx, selector).unwrap_or_else(|| panic!("{selector} was not painted"))
+    }
+
+    fn grip(vcx: &mut VisualTestContext, id: u64) -> Bounds<Pixels> {
+        must_paint(vcx, &format!("pane-drag-handle-{id}"))
+    }
+
+    fn dot(bounds: Bounds<Pixels>) -> Point<Pixels> {
+        point(
+            bounds.origin.x + bounds.size.width / 2.,
+            bounds.origin.y + px(3.5),
+        )
+    }
+
+    fn center(bounds: Bounds<Pixels>) -> Point<Pixels> {
+        point(
+            bounds.origin.x + bounds.size.width / 2.,
+            bounds.origin.y + bounds.size.height / 2.,
+        )
+    }
+
+    /// A point on the pane's top edge, just left of its grip.
+    ///
+    /// Inside the 6px strip that summons the bar, and far enough into the
+    /// column to sit on the bar's hover sheet once the bar is open. The
+    /// column's left padding is the traffic-light lead, which is title-bar
+    /// drag surface and not part of that sheet, so a point there dismisses
+    /// the bar instead of keeping it.
+    fn beside_grip(pane: Bounds<Pixels>, grip: Bounds<Pixels>) -> Point<Pixels> {
+        let at = point(
+            (grip.origin.x - px(4.)).max(pane.origin.x + px(1.)),
+            pane.origin.y + px(3.),
+        );
+        assert!(
+            !grip.contains(&at),
+            "the summon point {at:?} landed inside the grip {grip:?}"
+        );
+        at
+    }
+
+    fn overlaps(a: Bounds<Pixels>, b: Bounds<Pixels>) -> bool {
+        a.origin.x < b.origin.x + b.size.width
+            && b.origin.x < a.origin.x + a.size.width
+            && a.origin.y < b.origin.y + b.size.height
+            && b.origin.y < a.origin.y + a.size.height
+    }
+
+    fn down(at: Point<Pixels>) -> PlatformInput {
+        PlatformInput::MouseDown(MouseDownEvent {
+            button: MouseButton::Left,
+            position: at,
+            modifiers: Modifiers::none(),
+            click_count: 1,
+            first_mouse: false,
+        })
+    }
+
+    fn up(at: Point<Pixels>) -> PlatformInput {
+        PlatformInput::MouseUp(MouseUpEvent {
+            button: MouseButton::Left,
+            position: at,
+            modifiers: Modifiers::none(),
+            click_count: 1,
+        })
+    }
+
+    fn moved(at: Point<Pixels>, held: bool) -> PlatformInput {
+        PlatformInput::MouseMove(MouseMoveEvent {
+            position: at,
+            pressed_button: held.then_some(MouseButton::Left),
+            modifiers: Modifiers::none(),
+        })
+    }
+
+    fn hover(vcx: &mut VisualTestContext, at: Point<Pixels>) {
+        vcx.update(|window, cx| window.dispatch_event(moved(at, false), cx));
+        vcx.run_until_parked();
+    }
+
+    fn click(vcx: &mut VisualTestContext, at: Point<Pixels>) {
+        hover(vcx, at);
+        vcx.update(|window, cx| {
+            window.dispatch_event(down(at), cx);
+            window.dispatch_event(up(at), cx);
+        });
+        vcx.run_until_parked();
+    }
+
+    fn bar_open(vcx: &mut VisualTestContext) -> bool {
+        vcx.debug_bounds("floating-column-title-bar").is_some()
+    }
+
+    fn trigger_painted(vcx: &mut VisualTestContext) -> bool {
+        vcx.debug_bounds("strip-chrome-edge-trigger").is_some()
+    }
+
+    fn chrome_hover(app: &Entity<super::Tty7App>, vcx: &VisualTestContext) -> bool {
+        app.read_with(vcx, |app, _| app.strip_chrome_hover.get())
+    }
+
+    fn summon(app: &Entity<super::Tty7App>, vcx: &mut VisualTestContext) -> Point<Pixels> {
+        let (_, panes) = area_and_panes(app, vcx);
+        let id = leaf_ids(app, vcx)[0];
+        let at = beside_grip(panes[0], grip(vcx, id));
+        hover(vcx, at);
+        assert!(
+            bar_open(vcx),
+            "the top edge beside a grip summons the floating bar"
+        );
+        assert!(
+            !trigger_painted(vcx),
+            "the edge trigger is the bar's stand-in, not its companion"
+        );
+        at
+    }
+
+    #[gpui::test]
+    fn a_top_grip_drag_swaps_panes_without_raising_the_bar(cx: &mut TestAppContext) {
+        let (app, mut vcx, _streams) = split(cx, gpui::Axis::Horizontal, false);
+        let before = leaf_ids(&app, &vcx);
+        let (_, panes) = area_and_panes(&app, &vcx);
+        let painted_grip = grip(&mut vcx, before[0]);
+        let expected = app.read_with(&vcx, |app, _| {
+            let area = app.pane_area.get().unwrap();
+            pane_drag::top_grips(&app.tabs[0].pane, area, GRIP_H)
+                .into_iter()
+                .find(|(leaf, _)| leaf.entity_id().as_u64() == before[0])
+                .map(|(_, bounds)| bounds)
+                .unwrap()
+        });
+        assert_eq!(painted_grip.size, expected.size);
+        assert_eq!(painted_grip.origin.y, expected.origin.y);
+        // The layout grid snaps a fractional centre by a fraction of a pixel.
+        // The grip is still the fitted centre of that pane, not the ratio one.
+        let dx = (painted_grip.origin.x - expected.origin.x).abs();
+        assert!(
+            dx <= px(0.5),
+            "the overlay is the pane's own top-centre grip, in window coordinates: \
+             painted {painted_grip:?}, expected {expected:?}"
+        );
+        assert_eq!(painted_grip.size.height, px(GRIP_H));
+
+        let at = dot(painted_grip);
+        hover(&mut vcx, at);
+        assert!(
+            !chrome_hover(&app, &vcx),
+            "the grip sits on the strip that summons the bar and must not"
+        );
+        assert!(!bar_open(&mut vcx));
+        assert!(
+            trigger_painted(&mut vcx),
+            "the rest of the top edge still has its trigger"
+        );
+        assert_eq!(
+            app.read_with(&vcx, |app, _| app.pane_hover.get().map(|id| id.as_u64())),
+            Some(before[0]),
+            "the dots come up under the pointer"
+        );
+
+        let target = center(panes[1]);
+        let nudge = point(at.x + px(4.), at.y + px(4.));
+        vcx.update(|window, cx| {
+            window.dispatch_event(moved(at, false), cx);
+            window.dispatch_event(down(at), cx);
+            window.dispatch_event(moved(nudge, true), cx);
+        });
+        vcx.update(|window, cx| window.dispatch_event(moved(target, true), cx));
+        assert!(
+            !chrome_hover(&app, &vcx),
+            "a drag in flight keeps the floating bar down"
+        );
+        assert!(!bar_open(&mut vcx));
+        assert!(!trigger_painted(&mut vcx));
+        assert_eq!(
+            app.read_with(&vcx, |app, _| pane_drag::offered(&app.pane_drag)),
+            Some(DropZone::Swap(app.read_with(&vcx, |app, _| {
+                app.tabs[0].pane.leaves()[1].entity_id()
+            }))),
+            "the other pane's middle is a swap"
+        );
+        vcx.update(|window, cx| window.dispatch_event(up(target), cx));
+        vcx.run_until_parked();
+        assert_eq!(
+            leaf_ids(&app, &vcx),
+            vec![before[1], before[0]],
+            "the panes traded places"
+        );
+
+        summon(&app, &mut vcx);
+    }
+
+    #[gpui::test]
+    fn an_open_bar_yields_its_top_grips_and_keeps_its_buttons(cx: &mut TestAppContext) {
+        let (app, mut vcx, _streams) = split(cx, gpui::Axis::Horizontal, true);
+        let before = leaf_ids(&app, &vcx);
+        summon(&app, &mut vcx);
+
+        let grips: Vec<_> = before.iter().map(|id| grip(&mut vcx, *id)).collect();
+        assert!(
+            grips.iter().all(|g| g.size.height == px(HANDLE_STRIP)),
+            "an open bar shortens the grip to the dot strip, clear of its controls: {grips:?}"
+        );
+        for (name, selector) in [
+            ("search", "titlebar-search"),
+            ("show sidebar", "titlebar-expand-sidebar"),
+            ("detail panel", "titlebar-panel-toggle"),
+        ] {
+            let control = must_paint(&mut vcx, selector);
+            for grip in &grips {
+                assert!(
+                    !overlaps(*grip, control),
+                    "the {name} at {control:?} is covered by a grip at {grip:?}"
+                );
+            }
+        }
+
+        // The bar is on screen for this press. The move, the down and the
+        // nudge share that frame, which is the one where the bar used to
+        // take the press and drag the window along with the pane. The nudge
+        // stays at the dot's y: an open bar's grip is only the 7px strip.
+        let at = dot(grip(&mut vcx, before[0]));
+        let nudge = point(at.x + px(4.), at.y);
+        vcx.update(|window, cx| {
+            window.dispatch_event(moved(at, false), cx);
+            window.dispatch_event(down(at), cx);
+            window.dispatch_event(moved(nudge, true), cx);
+            assert!(cx.has_active_drag(), "the grip took the press");
+            window.dispatch_event(up(nudge), cx);
+        });
+        vcx.run_until_parked();
+        assert_eq!(
+            leaf_ids(&app, &vcx),
+            before,
+            "releasing in place moves nothing"
+        );
+
+        // Press on the open bar's frame, let that press paint, then move.
+        // The bar's hover sheet can stay up — it does not take the press —
+        // and the drag that follows still has to be the pane's.
+        summon(&app, &mut vcx);
+        let at = dot(grip(&mut vcx, before[0]));
+        vcx.update(|window, cx| {
+            window.dispatch_event(moved(at, false), cx);
+            window.dispatch_event(down(at), cx);
+        });
+        let (_, panes) = area_and_panes(&app, &vcx);
+        let target = center(panes[1]);
+        let nudge = point(at.x + px(4.), at.y);
+        vcx.update(|window, cx| {
+            window.dispatch_event(moved(nudge, true), cx);
+            assert!(
+                cx.has_active_drag(),
+                "the press is still the grip's after the frame is painted again"
+            );
+        });
+        assert!(
+            !bar_open(&mut vcx) && !chrome_hover(&app, &vcx),
+            "once the pane is in hand the bar is gone"
+        );
+        vcx.update(|window, cx| window.dispatch_event(moved(target, true), cx));
+        vcx.update(|window, cx| window.dispatch_event(up(target), cx));
+        vcx.run_until_parked();
+        assert_eq!(leaf_ids(&app, &vcx), vec![before[1], before[0]]);
+
+        summon(&app, &mut vcx);
+        let show_sidebar = center(must_paint(&mut vcx, "titlebar-expand-sidebar"));
+        click(&mut vcx, show_sidebar);
+        assert!(
+            app.read_with(&vcx, |app, cx| app.left_panel_open(cx)),
+            "show sidebar still clicks"
+        );
+        summon(&app, &mut vcx);
+        let panel = center(must_paint(&mut vcx, "titlebar-panel-toggle"));
+        click(&mut vcx, panel);
+        assert!(
+            app.read_with(&vcx, |app, cx| app.right_panel_open(cx)),
+            "the detail panel still clicks"
+        );
+        summon(&app, &mut vcx);
+        let search = center(must_paint(&mut vcx, "titlebar-search"));
+        click(&mut vcx, search);
+        assert!(
+            app.read_with(&vcx, |app, _| app.search.is_some()),
+            "search everywhere still clicks"
+        );
+    }
+
+    #[gpui::test]
+    #[should_panic(expected = "not implemented")]
+    fn dragging_blank_title_bar_still_moves_the_window(cx: &mut TestAppContext) {
+        let (app, mut vcx, _streams) = split(cx, gpui::Axis::Horizontal, false);
+        summon(&app, &mut vcx);
+        let bar = must_paint(&mut vcx, "floating-column-title-bar");
+        let at = point(bar.origin.x + px(24.), center(bar).y);
+        assert!(
+            bar.contains(&at),
+            "the blank point has to be on the bar, not beside it"
+        );
+        for selector in ["titlebar-search", "titlebar-panel-toggle"] {
+            if let Some(control) = painted(&mut vcx, selector) {
+                assert!(
+                    !control.contains(&at),
+                    "{selector} occupies the point the test drags as blank: {control:?} vs {at:?}"
+                );
+            }
+        }
+        for id in leaf_ids(&app, &vcx) {
+            assert!(
+                !grip(&mut vcx, id).contains(&at),
+                "the blank point is on a grip"
+            );
+        }
+        let nudged = point(at.x + px(30.), at.y);
+        vcx.update(|window, cx| {
+            window.dispatch_event(moved(at, false), cx);
+            window.dispatch_event(down(at), cx);
+            window.dispatch_event(moved(nudged, true), cx);
+        });
+    }
+
+    #[gpui::test]
+    fn dragging_a_lower_pane_to_the_top_edge_does_not_raise_the_bar(cx: &mut TestAppContext) {
+        let (app, mut vcx, _streams) = split(cx, gpui::Axis::Vertical, false);
+        let before = leaf_ids(&app, &vcx);
+        let (area, _) = area_and_panes(&app, &vcx);
+        let from = dot(grip(&mut vcx, before[1]));
+        let to = point(area.origin.x + area.size.width / 2., area.origin.y + px(3.));
+
+        let nudge = point(from.x + px(4.), from.y + px(4.));
+        vcx.update(|window, cx| {
+            window.dispatch_event(moved(from, false), cx);
+            window.dispatch_event(down(from), cx);
+            window.dispatch_event(moved(nudge, true), cx);
+            assert!(cx.has_active_drag());
+        });
+        vcx.update(|window, cx| window.dispatch_event(moved(to, true), cx));
+        assert!(
+            !chrome_hover(&app, &vcx),
+            "the top edge is a drop target while a pane is in hand, not a title bar"
+        );
+        assert!(!bar_open(&mut vcx));
+        assert!(!trigger_painted(&mut vcx));
+        assert_eq!(
+            app.read_with(&vcx, |app, _| pane_drag::offered(&app.pane_drag)),
+            Some(DropZone::Edge(Dir::Up))
+        );
+        vcx.update(|window, cx| window.dispatch_event(up(to), cx));
+        vcx.run_until_parked();
+        assert_eq!(
+            leaf_ids(&app, &vcx),
+            vec![before[1], before[0]],
+            "the lower pane landed along the top edge"
+        );
+    }
+
+    fn hovered_pane(app: &Entity<super::Tty7App>, vcx: &VisualTestContext) -> Option<u64> {
+        app.read_with(vcx, |app, _| app.pane_hover.get().map(|id| id.as_u64()))
+    }
+
+    #[gpui::test]
+    fn a_single_pane_and_a_zoomed_pane_grow_no_top_grip(cx: &mut TestAppContext) {
+        let (app, mut vcx, _streams) = layout(cx, false, |window, cx| {
+            let (pane, stream) = quiet_test_pane(1, window, cx);
+            (Pane::leaf(PaneSlot::Ready(pane)), vec![stream])
+        });
+        let id = leaf_ids(&app, &vcx)[0];
+        let selector = format!("pane-drag-handle-{id}");
+        assert!(
+            painted(&mut vcx, &selector).is_none(),
+            "a single pane has no grip to draw over its first line"
+        );
+        let (area, _) = area_and_panes(&app, &vcx);
+        hover(
+            &mut vcx,
+            point(area.origin.x + area.size.width / 2., area.origin.y + px(3.)),
+        );
+        assert!(
+            bar_open(&mut vcx),
+            "y = 3 beside no grip still summons the bar"
+        );
+        assert!(
+            hovered_pane(&app, &vcx).is_none(),
+            "and it leaves no dots behind"
+        );
+        assert!(painted(&mut vcx, &selector).is_none());
+
+        let (app, mut vcx, _streams) = split(cx, gpui::Axis::Horizontal, false);
+        let ids = leaf_ids(&app, &vcx);
+        app.update_in(&mut vcx, |app, _, _| {
+            let leaf = app.tabs[0].pane.leaves()[0]
+                .terminal()
+                .cloned()
+                .expect("the zoomed pane");
+            app.maximized = Some(leaf);
+        });
+        vcx.update(|window, _| window.refresh());
+        vcx.run_until_parked();
+        for id in &ids {
+            assert!(
+                painted(&mut vcx, &format!("pane-drag-handle-{id}")).is_none(),
+                "zoom hides every grip, including the panes it covers"
+            );
+        }
+        let (area, _) = area_and_panes(&app, &vcx);
+        hover(
+            &mut vcx,
+            point(area.origin.x + area.size.width / 2., area.origin.y + px(3.)),
+        );
+        assert!(
+            bar_open(&mut vcx),
+            "a zoomed pane still summons the bar from y = 3"
+        );
+        assert!(
+            hovered_pane(&app, &vcx).is_none(),
+            "zoom does not light dots on the pane in front or the one behind it"
+        );
+    }
+
+    #[gpui::test]
+    fn leaving_the_window_upwards_puts_the_dots_away(cx: &mut TestAppContext) {
+        let (app, mut vcx, _streams) = split(cx, gpui::Axis::Horizontal, false);
+        let id = leaf_ids(&app, &vcx)[0];
+        let (_, panes) = area_and_panes(&app, &vcx);
+        // Inside the reveal band (its floor is 24px) and below the 12px grip,
+        // so the band — not the overlay — is what lights the dots.
+        let band = point(
+            panes[0].origin.x + panes[0].size.width / 2.,
+            panes[0].origin.y + px(20.),
+        );
+        hover(&mut vcx, band);
+        assert_eq!(hovered_pane(&app, &vcx), Some(id));
+        let grip = grip(&mut vcx, id);
+        hover(&mut vcx, dot(grip));
+        assert_eq!(
+            hovered_pane(&app, &vcx),
+            Some(id),
+            "moving from the band into the grip keeps the dots"
+        );
+        assert!(!bar_open(&mut vcx), "the grip does not summon the bar");
+        hover(
+            &mut vcx,
+            point(grip.origin.x + grip.size.width / 2., px(-4.)),
+        );
+        assert_eq!(
+            hovered_pane(&app, &vcx),
+            None,
+            "leaving through the top of the window clears the dots"
+        );
+    }
+
+    #[gpui::test]
+    fn an_open_bar_keeps_its_middle_grip_clear_of_search(cx: &mut TestAppContext) {
+        let (app, mut vcx, _streams) = layout(cx, true, |window, cx| {
+            let (left, left_stream) = quiet_test_pane(1, window, cx);
+            let (mid, mid_stream) = quiet_test_pane(2, window, cx);
+            let (right, right_stream) = quiet_test_pane(3, window, cx);
+            let pane = Pane::split_node(
+                gpui::Axis::Horizontal,
+                1. / 3.,
+                Pane::leaf(PaneSlot::Ready(left)),
+                Pane::split_node(
+                    gpui::Axis::Horizontal,
+                    0.5,
+                    Pane::leaf(PaneSlot::Ready(mid)),
+                    Pane::leaf(PaneSlot::Ready(right)),
+                ),
+            );
+            (pane, vec![left_stream, mid_stream, right_stream])
+        });
+        let ids = leaf_ids(&app, &vcx);
+        summon(&app, &mut vcx);
+        let middle = grip(&mut vcx, ids[1]);
+        let search = must_paint(&mut vcx, "titlebar-search");
+        assert_eq!(middle.size.height, px(HANDLE_STRIP));
+        let shares_x = middle.origin.x < search.origin.x + search.size.width
+            && search.origin.x < middle.origin.x + middle.size.width;
+        assert!(
+            shares_x,
+            "the middle column's grip has to sit on the search's x range, got grip {middle:?} search {search:?}"
+        );
+        assert!(
+            !overlaps(middle, search),
+            "an open bar's grip ({middle:?}) shares no pixel with search ({search:?})"
+        );
+        assert!(search.origin.y >= middle.origin.y + middle.size.height);
+
+        let y = middle.origin.y + px(3.);
+        for x in [
+            middle.origin.x - px(12.),
+            middle.origin.x + middle.size.width / 2.,
+            middle.origin.x + middle.size.width + px(12.),
+        ] {
+            hover(&mut vcx, point(x, y));
+            assert!(
+                bar_open(&mut vcx) && chrome_hover(&app, &vcx),
+                "sliding across the middle grip at y = 3 must not close the bar"
+            );
+        }
+        hover(
+            &mut vcx,
+            point(
+                middle.origin.x + middle.size.width / 2.,
+                middle.origin.y + px(60.),
+            ),
+        );
+        assert!(
+            !bar_open(&mut vcx) && !chrome_hover(&app, &vcx) && trigger_painted(&mut vcx),
+            "leaving the bar downward, past y = 48, closes it"
+        );
+
+        summon(&app, &mut vcx);
+        let middle = grip(&mut vcx, ids[1]);
+        let at = point(
+            middle.origin.x + middle.size.width / 2.,
+            middle.origin.y + px(3.),
+        );
+        let nudge = point(at.x + px(4.), at.y);
+        vcx.update(|window, cx| {
+            window.dispatch_event(moved(at, false), cx);
+            window.dispatch_event(down(at), cx);
+            window.dispatch_event(moved(nudge, true), cx);
+            assert!(
+                cx.has_active_drag(),
+                "dragging the middle grip at y = 3 starts a pane drag and not a window drag"
+            );
+            window.dispatch_event(up(nudge), cx);
+        });
+        vcx.run_until_parked();
+
+        summon(&app, &mut vcx);
+        let search = center(must_paint(&mut vcx, "titlebar-search"));
+        click(&mut vcx, search);
+        assert!(
+            app.read_with(&vcx, |app, _| app.search.is_some()),
+            "search everywhere still clicks when it shares the middle grip's x"
+        );
     }
 }
 

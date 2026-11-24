@@ -57,6 +57,10 @@ const GRIP_DOTS: usize = 3;
 const GRIP_DOT: f32 = 3.;
 const GRIP_DOT_GAP: f32 = 3.;
 
+/// The grip's hit box, for the overlay drawn above the floating title bar.
+pub(crate) const GRIP_W: f32 = GRIP_TARGET.0;
+pub(crate) const GRIP_H: f32 = GRIP_TARGET.1;
+
 /// Where the dots sit in the target: up against its top edge, not centred in
 /// it. The rest of the target is reach, not mark.
 const GRIP_DOT_TOP: f32 = 2.;
@@ -164,8 +168,6 @@ pub(crate) fn handle(
     state: &PaneDragState,
     cx: &App,
 ) -> gpui::AnyElement {
-    let state = state.clone();
-    let ink = cx.theme().foreground;
     div()
         .absolute()
         .top_0()
@@ -173,32 +175,106 @@ pub(crate) fn handle(
         .right_0()
         .flex()
         .justify_center()
-        .child(
-            div()
-                .id(("pane-drag-handle", pane.as_u64() as usize))
-                .group(GRIP_GROUP)
-                .w(px(GRIP_TARGET.0))
-                .h(px(GRIP_TARGET.1))
-                .flex()
-                .items_start()
-                .justify_center()
-                .pt(px(GRIP_DOT_TOP))
-                .map(crate::ui::reorder::cursor_grab)
-                .tooltip(|window, cx| {
-                    Tooltip::new(t(L10nKey::PaneDragHandleTooltip)).build(window, cx)
-                })
-                // The grip owns the strip the pane keeps clear for it, but the
-                // press still has to be kept: without it the pane underneath
-                // reads a grab as the start of a text selection.
-                .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                .on_drag(DragPane, move |_, _, _, cx| {
-                    cx.stop_propagation();
-                    begin(&state, pane);
-                    cx.new(|_| DragPane)
-                })
-                .when(revealed, |d| d.child(dots(pane, ink))),
-        )
+        .child(grip_box(
+            pane, revealed, state, GRIP_W, GRIP_H, false, None, cx,
+        ))
         .into_any_element()
+}
+
+/// The same grip, drawn above the floating title bar.
+///
+/// The bar is painted over the terminal, so a press on the dots reaches the
+/// bar before the grip inside the pane and arms the window drag first. This
+/// grip is painted after the bar and occludes: the bar's hit box misses, and
+/// the press stays on the pane. `claim` keeps the reveal band — occluded for
+/// this one move — from taking the dots back down before they paint.
+pub(crate) fn overlay_grip(
+    pane: EntityId,
+    revealed: bool,
+    state: &PaneDragState,
+    hovered: &Rc<Cell<Option<EntityId>>>,
+    claim: &Rc<Cell<Option<EntityId>>>,
+    width: f32,
+    height: f32,
+    cx: &App,
+) -> gpui::Stateful<gpui::Div> {
+    grip_box(
+        pane,
+        revealed,
+        state,
+        width,
+        height,
+        true,
+        Some((hovered.clone(), claim.clone())),
+        cx,
+    )
+}
+
+fn grip_box(
+    pane: EntityId,
+    revealed: bool,
+    state: &PaneDragState,
+    width: f32,
+    height: f32,
+    occlude: bool,
+    front: Option<(Rc<Cell<Option<EntityId>>>, Rc<Cell<Option<EntityId>>>)>,
+    cx: &App,
+) -> gpui::Stateful<gpui::Div> {
+    let state = state.clone();
+    let ink = cx.theme().foreground;
+    div()
+        .id(("pane-drag-handle", pane.as_u64() as usize))
+        .debug_selector(|| format!("pane-drag-handle-{}", pane.as_u64()))
+        .group(GRIP_GROUP)
+        .w(px(width))
+        .h(px(height))
+        .flex()
+        .items_start()
+        .justify_center()
+        .pt(px(GRIP_DOT_TOP))
+        .map(crate::ui::reorder::cursor_grab)
+        .when(occlude, |d| d.occlude())
+        .tooltip(|window, cx| Tooltip::new(t(L10nKey::PaneDragHandleTooltip)).build(window, cx))
+        // The grip owns the strip the pane keeps clear for it, but the
+        // press still has to be kept: without it the pane underneath
+        // reads a grab as the start of a text selection.
+        .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .on_drag(DragPane, move |_, _, _, cx| {
+            cx.stop_propagation();
+            begin(&state, pane);
+            cx.new(|_| DragPane)
+        })
+        .when_some(front, |d, (hovered, claim)| {
+            d.on_hover(move |over, window, _cx| {
+                if !*over {
+                    // The reveal band under this grip was already told it is
+                    // not hovered — the grip occludes it — so it will not
+                    // fire again when the pointer leaves upward, onto a
+                    // divider, or out of the window. Clearing here is the
+                    // only leave those paths get. A move back down into the
+                    // same band runs that band's hover later in this same
+                    // event and puts the pane back; a move onto the other
+                    // top grip has already set *its* pane, and this one must
+                    // not wipe that.
+                    if hovered.get() == Some(pane) {
+                        hovered.set(None);
+                        window.refresh();
+                    }
+                    return;
+                }
+                // Claimed before the band's own hover, which runs after this
+                // one and would otherwise take the dots down on the move that
+                // reached them. The claim is dropped at the start of the next
+                // frame, so it cannot keep a pane hovered once this grip has
+                // reported the pointer gone.
+                claim.set(Some(pane));
+                if hovered.get() != Some(pane) {
+                    hovered.set(Some(pane));
+                    window.refresh();
+                }
+            })
+        })
+        .when(revealed, |d| d.child(dots(pane, ink)))
 }
 
 /// The mark itself, fading up as it arrives.
@@ -233,8 +309,10 @@ fn dots(pane: EntityId, ink: gpui::Hsla) -> impl IntoElement {
 pub(crate) fn reveal_band(
     pane: EntityId,
     hovered: &Rc<Cell<Option<EntityId>>>,
+    claim: &Rc<Cell<Option<EntityId>>>,
 ) -> gpui::AnyElement {
     let hovered = hovered.clone();
+    let claim = claim.clone();
     div()
         .id(("pane-grip-band", pane.as_u64() as usize))
         .absolute()
@@ -244,17 +322,89 @@ pub(crate) fn reveal_band(
         .h(gpui::relative(REVEAL_SHARE))
         .min_h(px(REVEAL_MIN))
         .on_hover(move |over, window, _cx| {
-            let next = match (*over, hovered.get() == Some(pane)) {
-                (true, _) => Some(pane),
-                (false, true) => None,
-                // Left a band the pointer had already left: the enter of a
-                // neighbour's got here first.
-                (false, false) => return,
+            // The overlay grip is painted later, so its hover runs first and
+            // claims the pane. This band is occluded by that grip and would
+            // otherwise clear the claim in the same move — the dots would
+            // vanish on the frame the pointer reached them.
+            let next = if *over {
+                Some(pane)
+            } else if hovered.get() == Some(pane) && claim.get() != Some(pane) {
+                None
+            } else {
+                return;
             };
+            if hovered.get() == next {
+                return;
+            }
             hovered.set(next);
             window.refresh();
         })
         .into_any_element()
+}
+
+/// Grips of panes flush with the top of `area`, in window coordinates.
+///
+/// Clipped to the pane the leaf is actually painted in — divider subtracted,
+/// the way the leaf's `overflow_hidden` clips the handle drawn inside it.
+/// `height` is the hit box: the full target, or [`HANDLE_STRIP`] while the
+/// floating title bar is open, which ends above that bar's tiles and search.
+pub(crate) fn top_grips<L: Clone>(
+    pane: &Pane<L>,
+    area: Bounds<Pixels>,
+    height: f32,
+) -> Vec<(L, Bounds<Pixels>)> {
+    let height = height.min(GRIP_H).max(0.);
+    pane.leaves()
+        .into_iter()
+        .zip(pane.fitted_leaf_bounds(area))
+        .filter_map(|(leaf, b)| {
+            if b.origin.y > area.origin.y + px(1.) || b.size.width.as_f32() < 1. {
+                return None;
+            }
+            let width = GRIP_W.min(b.size.width.as_f32());
+            let left = b.origin.x + px((b.size.width.as_f32() - width) / 2.);
+            Some((
+                leaf,
+                Bounds {
+                    origin: point(left, b.origin.y),
+                    size: size(px(width), px(height.min(b.size.height.as_f32()))),
+                },
+            ))
+        })
+        .collect()
+}
+
+/// Shrink or drop grips that run into `clear` pixels at the right of `area`.
+///
+/// That strip is the window's own minimize / maximize / close, which occupy
+/// the full height of an open title bar. A top grip there covers the top of
+/// those buttons. `clear == 0` (macOS, fullscreen, or the bar is closed) leaves
+/// every grip alone. A remainder under a pixel is not a target.
+pub(crate) fn clip_past_trailing<L>(
+    grips: Vec<(L, Bounds<Pixels>)>,
+    area: Bounds<Pixels>,
+    clear: f32,
+) -> Vec<(L, Bounds<Pixels>)> {
+    if clear <= 0. {
+        return grips;
+    }
+    let limit = area.origin.x + area.size.width - px(clear);
+    grips
+        .into_iter()
+        .filter_map(|(leaf, mut bounds)| {
+            if bounds.origin.x >= limit {
+                return None;
+            }
+            let right = bounds.origin.x + bounds.size.width;
+            if right > limit {
+                bounds.size.width = limit - bounds.origin.x;
+            }
+            if bounds.size.width < px(1.) {
+                return None;
+            }
+            Some((leaf, bounds))
+        })
+        .collect()
 }
 
 /// A pane drag in flight, and the landing the last painted frame offered.
@@ -291,6 +441,13 @@ pub(crate) fn set_landing(state: &PaneDragState, zone: DropZone<EntityId>) {
     if let Some(drag) = state.borrow().as_ref() {
         drag.landing.set(Some(zone));
     }
+}
+
+/// The landing the current drag would take, if a drag is in flight and the
+/// last painted frame offered one.
+#[cfg(test)]
+pub(crate) fn offered(state: &PaneDragState) -> Option<DropZone<EntityId>> {
+    state.borrow().as_ref().and_then(|drag| drag.landing.get())
 }
 
 /// Ends the drag, answering the landing it was over when it ended.
@@ -862,6 +1019,82 @@ mod tests {
             live.leaf_rects(),
             before,
             "trying a drop out must not resize the panes on screen"
+        );
+    }
+
+    #[test]
+    fn top_grips_are_the_centred_target_of_panes_flush_with_the_window() {
+        let side_by_side =
+            Pane::split_node(gpui::Axis::Horizontal, 0.5, Pane::leaf(0u32), Pane::leaf(1));
+        let area = rect(10., 20., 1000., 600.);
+        let grips = top_grips(&side_by_side, area, GRIP_H);
+        assert_eq!(grips.len(), 2, "both columns meet the top edge");
+        assert_eq!(grips[0].0, 0);
+        assert_eq!(grips[0].1.size, size(px(GRIP_W), px(GRIP_H)));
+        assert_eq!(grips[0].1.origin.y, area.origin.y);
+        // 50/50 of 1000px leaves a 5px divider, so each pane is 497.5 wide.
+        // Centring on the ratio rect instead would sit the grip 1.25px off
+        // the pane, toward the rule.
+        let left_w = (1000. - 5.) * 0.5;
+        assert_eq!(
+            grips[0].1.origin.x + grips[0].1.size.width / 2.,
+            px(10. + left_w / 2.),
+            "the grip is centred on the pane the split actually paints"
+        );
+        let right_x = 10. + left_w + 5.;
+        assert_eq!(
+            grips[1].1.origin.x + grips[1].1.size.width / 2.,
+            px(right_x + left_w / 2.)
+        );
+        assert!(grips[0].1.origin.x + grips[0].1.size.width <= px(10. + left_w));
+        assert!(grips[1].1.origin.x >= px(right_x));
+
+        let stacked = Pane::split_node(gpui::Axis::Vertical, 0.5, Pane::leaf(0u32), Pane::leaf(1));
+        let grips = top_grips(&stacked, area, HANDLE_STRIP);
+        assert_eq!(
+            grips.len(),
+            1,
+            "the lower pane's grip is not on the window edge"
+        );
+        assert_eq!(grips[0].0, 0);
+        assert_eq!(grips[0].1.size.height, px(HANDLE_STRIP));
+        assert_eq!(grips[0].1.origin.y, area.origin.y);
+
+        let narrow_area = rect(0., 0., 400., 400.);
+        let narrow = Pane::split_node(gpui::Axis::Horizontal, 0.1, Pane::leaf(0u32), Pane::leaf(1));
+        let grips = top_grips(&narrow, narrow_area, GRIP_H);
+        let slim = narrow.fitted_leaf_bounds(narrow_area)[0];
+        assert!(slim.size.width < px(GRIP_W));
+        assert_eq!(
+            grips[0].1.size.width, slim.size.width,
+            "a pane narrower than the target clips the grip, as overflow_hidden would"
+        );
+    }
+
+    #[test]
+    fn open_bar_grips_stop_before_the_window_controls() {
+        let area = rect(0., 0., 1000., 100.);
+        let grips = vec![
+            (0u32, rect(100., 0., 80., 7.)),
+            (1, rect(850., 0., 80., 7.)),
+            (2, rect(900., 0., 80., 7.)),
+            (3, rect(897.5, 0., 80., 7.)),
+        ];
+        assert_eq!(
+            clip_past_trailing(grips.clone(), area, 0.),
+            grips,
+            "no controls, nothing to keep clear of"
+        );
+        let clipped = clip_past_trailing(grips, area, 102.);
+        assert_eq!(
+            clipped.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        assert_eq!(clipped[0].1.size.width, px(80.));
+        assert_eq!(
+            clipped[1].1.origin.x + clipped[1].1.size.width,
+            px(1000. - 102.),
+            "the grip shrinks back to the controls' left edge"
         );
     }
 

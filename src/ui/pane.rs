@@ -1,7 +1,10 @@
 use std::cell::Cell;
 use std::rc::Rc;
 
-use gpui::{App, Bounds, MouseButton, MouseMoveEvent, MouseUpEvent, Pixels, Window, canvas, div};
+use gpui::{
+    App, Bounds, MouseButton, MouseMoveEvent, MouseUpEvent, Pixels, Window, canvas, div, point,
+    size,
+};
 use gpui::{Axis, Entity, InteractiveElement as _, prelude::*, px};
 use gpui_component::ActiveTheme as _;
 
@@ -130,6 +133,14 @@ pub(crate) struct PaneChrome {
     /// pointer crosses their reveal bands and the same frame's siblings read
     /// it, so at most one grip is ever drawn.
     pub hovered: Rc<Cell<Option<gpui::EntityId>>>,
+    /// Set by a grip drawn in front of its reveal band, for the one move that
+    /// enters it. The band is occluded there and would otherwise take the
+    /// hover back in the same event. Cleared every frame; only that event
+    /// needs it.
+    pub grip_claim: Rc<Cell<Option<gpui::EntityId>>>,
+    /// Panes whose grip is drawn above the floating title bar rather than
+    /// inside the leaf, so the leaf does not draw a second one.
+    pub external_grips: Vec<gpui::EntityId>,
     /// The pane being dragged, drawn faded where it came from.
     pub lifted: Option<gpui::EntityId>,
     pub drag: crate::ui::pane_drag::PaneDragState,
@@ -816,6 +827,64 @@ impl<L: Clone> Pane<L> {
         }
     }
 
+    /// Pixel rects of the leaves, in [`leaves`](Self::leaves) order, with each
+    /// split's divider taken out of the space the children grow into.
+    ///
+    /// The ratio rects name a region of the pane, divider included, and that
+    /// is what a drop zone wants. A grip centred on one of those sits a few
+    /// pixels onto the 5px rule. This walks the same flex the split paints:
+    /// the children grow into whatever is left after the divider, `a` then `b`.
+    pub(crate) fn fitted_leaf_bounds(&self, area: Bounds<Pixels>) -> Vec<Bounds<Pixels>> {
+        let mut out = Vec::new();
+        self.collect_fitted(area, &mut out);
+        out
+    }
+
+    fn collect_fitted(&self, area: Bounds<Pixels>, out: &mut Vec<Bounds<Pixels>>) {
+        match self {
+            Pane::Leaf(_) => out.push(area),
+            Pane::Empty => {}
+            Pane::Split {
+                axis, ratio, a, b, ..
+            } => {
+                let r = ratio.get().clamp(MIN_RATIO, MAX_RATIO);
+                let divider = px(DIVIDER_THICKNESS);
+                let (a_bounds, b_bounds) = match axis {
+                    Axis::Horizontal => {
+                        let free = (area.size.width - divider).max(px(0.));
+                        let aw = free * r;
+                        (
+                            Bounds {
+                                origin: area.origin,
+                                size: size(aw, area.size.height),
+                            },
+                            Bounds {
+                                origin: point(area.origin.x + aw + divider, area.origin.y),
+                                size: size((free - aw).max(px(0.)), area.size.height),
+                            },
+                        )
+                    }
+                    Axis::Vertical => {
+                        let free = (area.size.height - divider).max(px(0.));
+                        let ah = free * r;
+                        (
+                            Bounds {
+                                origin: area.origin,
+                                size: size(area.size.width, ah),
+                            },
+                            Bounds {
+                                origin: point(area.origin.x, area.origin.y + ah + divider),
+                                size: size(area.size.width, (free - ah).max(px(0.))),
+                            },
+                        )
+                    }
+                };
+                a.collect_fitted(a_bounds, out);
+                b.collect_fitted(b_bounds, out);
+            }
+        }
+    }
+
     pub fn neighbor_in_direction(&self, from: usize, dir: Dir) -> Option<usize> {
         let rects = self.leaf_rects();
         Self::ranked_neighbor(&rects, from, dir).map(|(i, _)| i)
@@ -1060,13 +1129,24 @@ impl Pane<PaneSlot> {
                         }
                     })
                     .when(grip, |d| {
-                        d.child(crate::ui::pane_drag::reveal_band(id, &chrome.hovered))
-                            .child(crate::ui::pane_drag::handle(
+                        // A top-row grip in the floating-title-bar layout is
+                        // drawn later, above the bar. Drawing it here as well
+                        // would put a second hit box under the bar, which is
+                        // the one the bar's drag wins against.
+                        let external = chrome.external_grips.contains(&id);
+                        d.child(crate::ui::pane_drag::reveal_band(
+                            id,
+                            &chrome.hovered,
+                            &chrome.grip_claim,
+                        ))
+                        .when(!external, |d| {
+                            d.child(crate::ui::pane_drag::handle(
                                 id,
                                 chrome.hovered.get() == Some(id),
                                 &chrome.drag,
                                 cx,
                             ))
+                        })
                     })
                     .into_any_element()
             }

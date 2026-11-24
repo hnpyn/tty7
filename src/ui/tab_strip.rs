@@ -1439,45 +1439,50 @@ impl Tty7App {
             .items_center()
             .pr(px(trailing))
             .child(
-                div().occlude().flex_shrink_0().child(
-                    chrome_tile(
-                        Button::new("titlebar-right-panel")
-                            // Keep the outline fixed; only the panel region's
-                            // fill changes to show whether the panel is visible.
-                            .icon(Icon::empty().path(match panel_open {
-                                true => "icons/panel-right.svg",
-                                false => "icons/panel-right-collapsed.svg",
-                            })),
-                        false,
-                        cx,
-                    )
-                    .rounded_lg()
-                    .accessible_label(match panel_open {
-                        true => t(L10nKey::TabTooltipHideDetailPanel),
-                        false => t(L10nKey::TabTooltipShowDetailPanel),
-                    })
-                    .tooltip_element(chord_tooltip(
-                        match panel_open {
+                div()
+                    .id("titlebar-panel-toggle-hit")
+                    .debug_selector(|| "titlebar-panel-toggle".into())
+                    .occlude()
+                    .flex_shrink_0()
+                    .child(
+                        chrome_tile(
+                            Button::new("titlebar-right-panel")
+                                // Keep the outline fixed; only the panel region's
+                                // fill changes to show whether the panel is visible.
+                                .icon(Icon::empty().path(match panel_open {
+                                    true => "icons/panel-right.svg",
+                                    false => "icons/panel-right-collapsed.svg",
+                                })),
+                            false,
+                            cx,
+                        )
+                        .rounded_lg()
+                        .accessible_label(match panel_open {
                             true => t(L10nKey::TabTooltipHideDetailPanel),
                             false => t(L10nKey::TabTooltipShowDetailPanel),
-                        },
-                        "ToggleRightPanel",
-                        cx,
-                    ))
-                    // On macOS this tile is drawn inside the panel's own
-                    // titlebar while the panel is open, so closing from it
-                    // destroys the element holding the focus — and a keymap
-                    // scoped to a focused thing goes quiet with it, leaving the
-                    // ⌘J that would undo this doing nothing. Hand the terminal
-                    // back what it lost.
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        let closing = this.right_panel_open(cx);
-                        this.toggle_right_panel(cx);
-                        if closing {
-                            this.focus_active(window, cx);
-                        }
-                    })),
-                ),
+                        })
+                        .tooltip_element(chord_tooltip(
+                            match panel_open {
+                                true => t(L10nKey::TabTooltipHideDetailPanel),
+                                false => t(L10nKey::TabTooltipShowDetailPanel),
+                            },
+                            "ToggleRightPanel",
+                            cx,
+                        ))
+                        // On macOS this tile is drawn inside the panel's own
+                        // titlebar while the panel is open, so closing from it
+                        // destroys the element holding the focus — and a keymap
+                        // scoped to a focused thing goes quiet with it, leaving the
+                        // ⌘J that would undo this doing nothing. Hand the terminal
+                        // back what it lost.
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            let closing = this.right_panel_open(cx);
+                            this.toggle_right_panel(cx);
+                            if closing {
+                                this.focus_active(window, cx);
+                            }
+                        })),
+                    ),
             )
     }
 
@@ -2297,6 +2302,7 @@ impl Tty7App {
     pub(crate) fn tab_strip(
         &self,
         show_chips: bool,
+        external_hover_sheet: bool,
         window: &Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
@@ -2681,27 +2687,34 @@ impl Tty7App {
             })
             .child(
                 div()
+                    .id("titlebar-add-collapsed-hit")
+                    .debug_selector(|| "titlebar-add-collapsed".into())
                     .occlude()
                     .flex_shrink_0()
                     .child(self.new_tab_button("titlebar-add-collapsed", cx)),
             )
             .child(
-                div().occlude().flex_shrink_0().child(
-                    chrome_tile(
-                        Button::new("titlebar-expand-sidebar")
-                            .icon(Icon::empty().path("icons/panel-left-collapsed.svg")),
-                        false,
-                        cx,
-                    )
-                    .rounded_lg()
-                    .accessible_label(t(L10nKey::TabTooltipShowSidebar))
-                    .tooltip_element(chord_tooltip(
-                        t(L10nKey::TabTooltipShowSidebar),
-                        "ToggleLeftPanel",
-                        cx,
-                    ))
-                    .on_click(cx.listener(|this, _, _window, cx| this.toggle_left_panel(cx))),
-                ),
+                div()
+                    .id("titlebar-expand-sidebar-hit")
+                    .debug_selector(|| "titlebar-expand-sidebar".into())
+                    .occlude()
+                    .flex_shrink_0()
+                    .child(
+                        chrome_tile(
+                            Button::new("titlebar-expand-sidebar")
+                                .icon(Icon::empty().path("icons/panel-left-collapsed.svg")),
+                            false,
+                            cx,
+                        )
+                        .rounded_lg()
+                        .accessible_label(t(L10nKey::TabTooltipShowSidebar))
+                        .tooltip_element(chord_tooltip(
+                            t(L10nKey::TabTooltipShowSidebar),
+                            "ToggleLeftPanel",
+                            cx,
+                        ))
+                        .on_click(cx.listener(|this, _, _window, cx| this.toggle_left_panel(cx))),
+                    ),
             )
         });
 
@@ -2764,6 +2777,7 @@ impl Tty7App {
             .child(
                 h_flex()
                     .id("titlebar-search")
+                    .debug_selector(|| "titlebar-search".into())
                     .occlude()
                     .w(px(TITLEBAR_SEARCH_W))
                     .min_w_0()
@@ -2836,7 +2850,10 @@ impl Tty7App {
                 ),
                 None => this.child(chrome),
             })
-            .when(auto_hide_chrome, |this| {
+            // The floating bar paints this sheet itself, after the grips
+            // that occlude the strip. A second one here would clear the
+            // flag the moment the pointer crossed a grip.
+            .when(auto_hide_chrome && !external_hover_sheet, |this| {
                 this.child(crate::ui::app::hover_sheet(
                     "strip-chrome-hover",
                     &self.strip_chrome_hover,
