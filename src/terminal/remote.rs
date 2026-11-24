@@ -5846,6 +5846,7 @@ mod tests {
 
     #[test]
     fn decrqm_probe_reports_sync_update_supported() {
+        crate::core::config::pin_test_config_dir();
         let (client_side, mut daemon_side) = UnixStream::pair().unwrap();
         let term = RemoteTerminal::from_stream(client_side, TermSize::new(80, 24)).unwrap();
 
