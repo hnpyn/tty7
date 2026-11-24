@@ -62,6 +62,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **macOS no longer inserts a stray CR on a 1024-byte newline** — The first
+  read of a pane's output asked for the whole 256 KiB buffer. Darwin's PTY
+  then adds an extra `\r` when `ONLCR` expands a newline that lands on a
+  1024-byte boundary, and that first read happens again on every later round.
+  Every read now asks for at most one block, which is what the drain after it
+  already did.
+
 - **A resumed session keeps its id when flags precede `resume`** — `codex
   --yolo resume <id>` (and the same shape for the other agents) is seeded
   from the command line before the agent reports, so a second restore still
