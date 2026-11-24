@@ -43,6 +43,12 @@ pub struct EventProxy {
 
 impl EventListener for EventProxy {
     fn send_event(&self, event: AlacEvent) {
+        // alacritty answers an unknown private mode with `CSI ? 2031 ; 0 $ y`.
+        // The reader has already queued the answer for the mode at that byte,
+        // so this copy must not reach the view or a test draining the channel.
+        if matches!(&event, AlacEvent::PtyWrite(text) if text == "\x1b[?2031;0$y") {
+            return;
+        }
         if self.replaying.load(Ordering::Relaxed)
             && matches!(
                 event,
@@ -1405,22 +1411,22 @@ impl RemoteTerminal {
                             if !out_batch.is_empty() {
                                 // One scan. An idle machine waits on `0x1b`; one left mid-sequence still has to see the next chunk.
                                 let has_esc = crate::core::osc::contains_esc(&out_batch);
+                                // End offsets of the queries in this batch. The
+                                // replies go out from `feed_grid` at those
+                                // offsets, after the emulator has parsed the
+                                // query, so they stay in stream order with DA1,
+                                // DA2 and every other `PtyWrite`.
+                                let mut query_cuts: Vec<(usize, Query)> = Vec::new();
                                 if has_esc || !modes.is_ground() {
-                                    super::color_scheme::fold(
+                                    super::color_scheme::fold_reporting(
                                         &mut modes,
                                         &out_batch,
                                         &color_scheme_updates,
+                                        |off, query| query_cuts.push((off, query)),
                                     );
-                                }
-                                if std::mem::take(&mut scheme_with_batch)
-                                    && modes.is_on(COLOR_SCHEME_UPDATES)
-                                {
-                                    proxy.send_event(super::color_scheme::query_reply());
-                                }
-                                for query in modes.take_queries() {
-                                    if query == Query::ColorScheme {
-                                        proxy.send_event(super::color_scheme::query_reply());
-                                    }
+                                    // Recorded for the offline daemon path. The
+                                    // cuts above are the online answers.
+                                    modes.take_queries();
                                 }
                                 // The scanner reports an offset one past each
                                 // sequence it matched, in ascending order, so
@@ -1440,6 +1446,17 @@ impl RemoteTerminal {
                                 if has_esc || !command_tok.is_ground() {
                                     command_cuts(&mut command_tok, &out_batch, &mut cuts);
                                 }
+                                for (off, query) in query_cuts {
+                                    if matches!(
+                                        query,
+                                        Query::ColorScheme | Query::ColorSchemeMode { .. }
+                                    ) {
+                                        cuts.push((off, ReaderCut::Reply(query)));
+                                    }
+                                }
+                                if cuts.len() > 1 {
+                                    cuts.sort_by_key(|(off, _)| *off);
+                                }
                                 {
                                     let t0 = trace.then(std::time::Instant::now);
                                     let Some(waited) = feed_grid(
@@ -1458,6 +1475,9 @@ impl RemoteTerminal {
                                             ReaderCut::Prompt(mark) => {
                                                 prompt_break.apply(term, mark)
                                             }
+                                            ReaderCut::Reply(query) => {
+                                                answer_stream_query(&proxy, query)
+                                            }
                                         },
                                     ) else {
                                         return;
@@ -1466,6 +1486,16 @@ impl RemoteTerminal {
                                         tr_lock_t += waited;
                                         tr_adv_t += t0.elapsed() - waited;
                                     }
+                                }
+                                // After the in-stream replies. A `?2031h` later
+                                // in this burst still counts — the fold above
+                                // has already seen the whole batch — and the
+                                // report does not jump ahead of a query that
+                                // was asked earlier in it.
+                                if std::mem::take(&mut scheme_with_batch)
+                                    && modes.is_on(COLOR_SCHEME_UPDATES)
+                                {
+                                    proxy.send_event(super::color_scheme::query_reply());
                                 }
                                 if has_esc || !osc.is_ground() {
                                     if let Ok(mut notes) = osc_notes.lock() {
@@ -1629,7 +1659,7 @@ impl RemoteTerminal {
                                                 term.reset_keyboard_modes();
                                                 prompt_break.apply(term, mark)
                                             }
-                                            ReaderCut::Parked(_) => {}
+                                            ReaderCut::Parked(_) | ReaderCut::Reply(_) => {}
                                         }
                                     });
                                 if fed.is_none() {
@@ -3430,6 +3460,10 @@ enum ReaderCut {
     Parked(CursorCut),
     Command(CommandMark),
     Prompt(PromptMark),
+    /// A tracked query ended here. Answered after the emulator has parsed that
+    /// byte, so the reply follows any `PtyWrite` the byte produced and precedes
+    /// whatever the rest of the batch asks.
+    Reply(Query),
 }
 
 /// Adds the batch's command marks to `cuts`, keeping them in stream order
@@ -3452,6 +3486,22 @@ fn command_cuts(tok: &mut OscTokenizer, bytes: &[u8], cuts: &mut Vec<(usize, Rea
 
 /// Bytes parsed per hold of the grid lock, so a UI handler queued on it can run between slices.
 const MAX_LOCKED_FEED: usize = 256 * 1024;
+
+/// Reply to a query the mode tracker saw, in the form the view writes to the
+/// pty. Device attributes are left to the emulator, which has already emitted
+/// its own `PtyWrite` for the same byte.
+fn answer_stream_query(proxy: &EventProxy, query: Query) {
+    match query {
+        Query::ColorSchemeMode { set: true } => {
+            proxy.send_event(AlacEvent::PtyWrite("\x1b[?2031;1$y".into()));
+        }
+        Query::ColorSchemeMode { set: false } => {
+            proxy.send_event(AlacEvent::PtyWrite("\x1b[?2031;2$y".into()));
+        }
+        Query::ColorScheme => proxy.send_event(super::color_scheme::query_reply()),
+        Query::DeviceAttributes => {}
+    }
+}
 
 /// Parses `bytes`, running `on_cut` at each cut, and dropping the grid lock every [`MAX_LOCKED_FEED`] bytes.
 /// The lock is fair, and vte keeps its state across slices. Returns `None` if `quit` fired while waiting:
@@ -5820,6 +5870,41 @@ mod tests {
             reply.as_deref(),
             Some("\x1b[?2026;2$y"),
             "DECRQM ?2026 must be answered as supported (2 = reset)"
+        );
+    }
+
+    #[test]
+    fn an_unrecognized_2031_reply_is_not_queued() {
+        crate::core::config::pin_test_config_dir();
+        let (client_side, mut daemon_side) = UnixStream::pair().unwrap();
+        let term = RemoteTerminal::from_stream(client_side, TermSize::new(80, 24)).unwrap();
+
+        DaemonMsg::Output(b"\x1b[?2031$p".to_vec())
+            .encode(&mut daemon_side)
+            .unwrap();
+        daemon_side.flush().unwrap();
+
+        let mut writes = Vec::new();
+        for _ in 0..200 {
+            while let Ok(ev) = term.events.try_recv() {
+                if let AlacEvent::PtyWrite(text) = ev {
+                    writes.push(text);
+                }
+            }
+            if !writes.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        while let Ok(ev) = term.events.try_recv() {
+            if let AlacEvent::PtyWrite(text) = ev {
+                writes.push(text);
+            }
+        }
+        assert_eq!(
+            writes,
+            vec!["\x1b[?2031;2$y".to_string()],
+            "the emulator's ?2031;0$y must be dropped before the channel, leaving the mode at the query"
         );
     }
 

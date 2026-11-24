@@ -61,6 +61,17 @@ pub const ALT_SCREEN: u16 = 1049;
 /// A CSI longer than this is not a mode set; keep the buffer bounded.
 const MAX_PARAMS: usize = 64;
 
+/// `mode` with optional leading zeros (`02031` is `2031`). A run of zeros is
+/// not that mode, and any digit left after the zeros makes a different number.
+/// The buffer is already refused past [`MAX_PARAMS`], so this compare stays
+/// bounded.
+fn csi_param_is(params: &[u8], mode: &[u8]) -> bool {
+    let Some(start) = params.iter().position(|&b| b != b'0') else {
+        return false;
+    };
+    params[start..] == *mode
+}
+
 /// How deep a keyboard flags stack gets before its bottom entry is dropped —
 /// the client emulator's own limit (`KEYBOARD_MODE_STACK_MAX_DEPTH` in
 /// `alacritty_terminal`), so a deep run of pushes is cut where it is cut there.
@@ -334,6 +345,14 @@ impl TerminalModes {
     /// across chunks are carried, so the caller may feed whatever sizes the pty
     /// hands it.
     pub fn feed(&mut self, bytes: &[u8]) {
+        self.feed_reporting(bytes, |_, _| {});
+    }
+
+    /// [`Self::feed`], and report each tracked query at the offset one past
+    /// its final byte — the point where every byte of the query has been
+    /// consumed. A query split across chunks is reported in the chunk that
+    /// finishes it, at an offset within that chunk.
+    pub fn feed_reporting(&mut self, bytes: &[u8], mut on_query: impl FnMut(usize, Query)) {
         let mut i = 0;
         while i < bytes.len() {
             if self.state == State::Text {
@@ -390,11 +409,17 @@ impl TerminalModes {
                             dollar: true,
                         }
                     }
+                    // ESC cancels this sequence and starts another, the same way
+                    // Esc, Osc and OscEsc already keep a bare ESC from falling
+                    // through into "end of sequence".
+                    0x1b => self.state = State::Esc,
                     b'p' if dollar => {
-                        if marker == b'?' && self.params == b"2031" {
-                            self.queries.push(Query::ColorSchemeMode {
+                        if marker == b'?' && csi_param_is(&self.params, b"2031") {
+                            let query = Query::ColorSchemeMode {
                                 set: self.is_on(COLOR_SCHEME_UPDATES),
-                            });
+                            };
+                            self.queries.push(query);
+                            on_query(i + 1, query);
                         }
                         self.state = State::Text;
                     }
@@ -411,12 +436,14 @@ impl TerminalModes {
                     b'n' if !dollar => {
                         if marker == b'?' && self.params == b"996" {
                             self.queries.push(Query::ColorScheme);
+                            on_query(i + 1, Query::ColorScheme);
                         }
                         self.state = State::Text;
                     }
                     b'c' if !dollar => {
                         if marker == 0 && matches!(self.params.as_slice(), b"" | b"0") {
                             self.queries.push(Query::DeviceAttributes);
+                            on_query(i + 1, Query::DeviceAttributes);
                         }
                         self.state = State::Text;
                     }
@@ -815,9 +842,46 @@ mod tests {
             ],
             "DECRQM for 2031 reports the mode state at the query; other modes stay with the emulator"
         );
+        let mut modes = TerminalModes::new();
+        let bytes = b"\x1b[?2031$p\x1b[?2031h\x1b[?996n";
+        let mut seen = Vec::new();
+        modes.feed_reporting(bytes, |off, query| seen.push((off, query)));
+        assert_eq!(
+            seen,
+            vec![
+                (
+                    "\u{1b}[?2031$p".len(),
+                    Query::ColorSchemeMode { set: false }
+                ),
+                (bytes.len(), Query::ColorScheme),
+            ]
+        );
+        assert_eq!(modes.take_queries().len(), 2);
         assert!(modes.take_queries().is_empty());
         modes.feed(b"\x1b[?2031l");
         assert!(!modes.is_on(COLOR_SCHEME_UPDATES));
+
+        let mut modes = TerminalModes::new();
+        modes.feed(b"\x1b[?02031$p\x1b[?0000$p\x1b[?20310$p\x1b[?\x1b[?2031$p");
+        assert_eq!(
+            modes.take_queries(),
+            [
+                Query::ColorSchemeMode { set: false },
+                Query::ColorSchemeMode { set: false },
+            ],
+            "leading zeros are the same mode, all zeros and a longer number are not, and ESC restarts the sequence"
+        );
+
+        let mut modes = TerminalModes::new();
+        let mut early = Vec::new();
+        modes.feed_reporting(b"\x1b[?2031$", |off, query| early.push((off, query)));
+        assert!(
+            early.is_empty(),
+            "a query split before its final byte is not done"
+        );
+        let mut seen = Vec::new();
+        modes.feed_reporting(b"p...", |off, query| seen.push((off, query)));
+        assert_eq!(seen, vec![(1, Query::ColorSchemeMode { set: false })]);
     }
 
     #[test]

@@ -12,7 +12,7 @@ use alacritty_terminal::event::Event as AlacEvent;
 use alacritty_terminal::vte::ansi::Rgb;
 use gpui::{App, Context};
 use gpui_component::ActiveTheme;
-use tty7_core::core::term_modes::{COLOR_SCHEME_UPDATES, TerminalModes};
+use tty7_core::core::term_modes::{COLOR_SCHEME_UPDATES, Query, TerminalModes};
 
 use super::view::TerminalView;
 use crate::ui::presets::is_dark;
@@ -30,14 +30,16 @@ pub(super) fn fold(modes: &mut TerminalModes, bytes: &[u8], on: &AtomicBool) {
     on.store(modes.is_on(COLOR_SCHEME_UPDATES), Ordering::Relaxed);
 }
 
-/// `alacritty_terminal` answers `CSI ? 2031 $ p` with `0` (not recognized);
-/// replace it with `1` (set) or `2` (reset).
-pub(super) fn decrqm_reply(text: String, on: bool) -> Vec<u8> {
-    match (text.as_str(), on) {
-        ("\x1b[?2031;0$y", true) => b"\x1b[?2031;1$y".to_vec(),
-        ("\x1b[?2031;0$y", false) => b"\x1b[?2031;2$y".to_vec(),
-        _ => text.into_bytes(),
-    }
+/// [`fold`], and report each tracked query at the offset one past its final
+/// byte so a reply can be written at that point in the batch.
+pub(super) fn fold_reporting(
+    modes: &mut TerminalModes,
+    bytes: &[u8],
+    on: &AtomicBool,
+    on_query: impl FnMut(usize, Query),
+) {
+    modes.feed_reporting(bytes, on_query);
+    on.store(modes.is_on(COLOR_SCHEME_UPDATES), Ordering::Relaxed);
 }
 
 /// The answer to a `CSI ? 996 n`. Routed as a background colour request so
