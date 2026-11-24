@@ -1932,7 +1932,26 @@ impl Drop for BurstRead {
 
 impl Read for BurstRead {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let filled = self.inner.read(buf)?;
+        // The first read is the one that blocks, and it is a fresh ask on
+        // every later round. On Darwin a larger ask makes `ONLCR` insert a
+        // CR when a newline sits on a 1024-byte boundary, so it has to be
+        // capped the same way as the drain that follows. Elsewhere
+        // `drain_read_len` is the length unchanged.
+        let filled = {
+            #[cfg(unix)]
+            {
+                if self.poll_fd.is_some() {
+                    let first_want = drain_read_len(buf.len());
+                    self.inner.read(&mut buf[..first_want])?
+                } else {
+                    self.inner.read(buf)?
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                self.inner.read(buf)?
+            }
+        };
         if filled == 0 || filled == buf.len() {
             return Ok(filled);
         }
@@ -9448,6 +9467,154 @@ mod tests {
                 );
             }
             other => panic!("ONLCR coalesced read did not return: {other:?}"),
+        }
+    }
+
+    /// Lines whose `ONLCR` expansion is one 1024-byte clist block, read across
+    /// several `BurstRead` rounds. The blocking read of each round used to ask
+    /// for the whole burst buffer, and Darwin then inserts an extra `\r` where
+    /// that block ends on a newline.
+    #[cfg(unix)]
+    #[test]
+    fn burst_read_rounds_over_1024_aligned_newlines_do_not_insert_cr() {
+        struct RecordingFd {
+            fd: i32,
+            asks: Arc<Mutex<Vec<usize>>>,
+        }
+        impl Drop for RecordingFd {
+            fn drop(&mut self) {
+                if self.fd >= 0 {
+                    unsafe { libc::close(self.fd) };
+                    self.fd = -1;
+                }
+            }
+        }
+        impl Read for RecordingFd {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.asks.lock().unwrap().push(buf.len());
+                let n = unsafe { libc::read(self.fd, buf.as_mut_ptr().cast(), buf.len()) };
+                if n < 0 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Ok(n as usize)
+                }
+            }
+        }
+
+        let mut master = -1;
+        let mut slave = -1;
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            },
+            0,
+            "openpty: {}",
+            std::io::Error::last_os_error()
+        );
+        let mut termios = unsafe { std::mem::zeroed::<libc::termios>() };
+        assert_eq!(unsafe { libc::tcgetattr(slave, &mut termios) }, 0);
+        let oflag = termios.c_oflag;
+        assert!(
+            oflag & libc::OPOST != 0 && oflag & libc::ONLCR != 0,
+            "openpty default oflag={oflag:#x}, wanted OPOST|ONLCR"
+        );
+
+        // 1022 columns + `\n` expands to 1022 + `\r\n`: one clist block that
+        // ends on the newline. Six of them are three rounds of a 2048-byte
+        // burst, so each round's blocking read and the drain after it both
+        // cross a 1024-byte boundary.
+        let lines = 6;
+        let mut input = Vec::with_capacity(lines * 1023);
+        let mut expected = Vec::with_capacity(lines * 1024);
+        for _ in 0..lines {
+            input.extend(std::iter::repeat_n(b'L', 1022));
+            input.push(b'\n');
+            expected.extend(std::iter::repeat_n(b'L', 1022));
+            expected.extend_from_slice(b"\r\n");
+        }
+
+        let slave_fd = slave;
+        let writer = std::thread::spawn(move || {
+            let mut off = 0;
+            while off < input.len() {
+                let n = unsafe {
+                    libc::write(slave_fd, input[off..].as_ptr().cast(), input.len() - off)
+                };
+                if n < 0 {
+                    let err = std::io::Error::last_os_error();
+                    if err.kind() == std::io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    return Err(err);
+                }
+                if n == 0 {
+                    break;
+                }
+                off += n as usize;
+            }
+            unsafe { libc::close(slave_fd) };
+            Ok(off)
+        });
+
+        let asks = Arc::new(Mutex::new(Vec::new()));
+        let poll = unsafe { libc::dup(master) };
+        assert!(poll >= 0);
+        let mut burst = BurstRead {
+            inner: Box::new(RecordingFd {
+                fd: master,
+                asks: Arc::clone(&asks),
+            }),
+            poll_fd: Some(poll),
+        };
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut buf = vec![0u8; 2048];
+            let mut got = Vec::new();
+            let result = loop {
+                match burst.read(&mut buf) {
+                    Ok(0) => break Ok(got),
+                    Ok(n) => got.extend_from_slice(&buf[..n]),
+                    // The slave is closed. Linux reports that as EIO on the
+                    // master; macOS reports it as a zero-length read.
+                    Err(err) if err.raw_os_error() == Some(libc::EIO) => break Ok(got),
+                    Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(err) => break Err(err),
+                }
+            };
+            drop(burst);
+            let _ = tx.send(result);
+        });
+        let reported = rx.recv_timeout(Duration::from_secs(3));
+        let wrote = writer.join().expect("writer thread");
+        match reported {
+            Ok(Ok(got)) => {
+                assert_eq!(wrote.expect("slave write"), lines * 1023);
+                assert_eq!(
+                    got, expected,
+                    "ONLCR inserted extra bytes across 1024-aligned newlines"
+                );
+                assert!(
+                    !got.windows(2).any(|w| w == b"\r\r"),
+                    "a doubled CR survived the aligned rounds"
+                );
+                let asks = asks.lock().unwrap();
+                assert!(
+                    asks.len() > 2,
+                    "expected several reads across rounds, got {asks:?}"
+                );
+                #[cfg(target_vendor = "apple")]
+                assert!(
+                    asks.iter().all(|n| *n <= 1024),
+                    "a Darwin read asked for more than one clist block: {asks:?}"
+                );
+            }
+            other => panic!("aligned ONLCR rounds did not return: {other:?}"),
         }
     }
 
