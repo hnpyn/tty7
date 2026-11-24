@@ -2724,10 +2724,12 @@ impl TerminalView {
             }
             AlacEvent::Title(title) => self.set_title_when_settled(title, cx),
             AlacEvent::ResetTitle => self.set_title_when_settled(self.default_title.clone(), cx),
-            AlacEvent::PtyWrite(text) => self.terminal.write(super::color_scheme::decrqm_reply(
-                text,
-                self.terminal.color_scheme_updates(),
-            )),
+            AlacEvent::PtyWrite(text) => {
+                let bytes = super::color_scheme::decrqm_reply(text);
+                if !bytes.is_empty() {
+                    self.terminal.write(bytes);
+                }
+            }
             AlacEvent::ChildExit(_) | AlacEvent::Exit => {
                 self.terminal.exited = true;
                 // Nothing is left to settle, and a title still waiting its turn
@@ -12964,13 +12966,13 @@ mod gpui_tests {
             .unwrap();
         assert_eq!(
             pumped_input(cx, &mut asked, 20).as_deref(),
-            Some("\x1b[?997;2n"),
-            "996 answers the current scheme"
+            Some("\x1b[?2031;1$y"),
+            "DECRQM reports 2031 as set after ?2031h, ahead of the scheme reply"
         );
         assert_eq!(
             pumped_input(cx, &mut asked, 20).as_deref(),
-            Some("\x1b[?2031;1$y"),
-            "DECRQM reports 2031 as set after ?2031h"
+            Some("\x1b[?997;2n"),
+            "996 answers the current scheme after the DECRQM"
         );
 
         set_background(cx, gpui::black());
@@ -13004,6 +13006,86 @@ mod gpui_tests {
         assert_eq!(pumped_input(cx, &mut asked, 1), None);
         set_background(cx, gpui::black());
         assert_eq!(pumped_input(cx, &mut asked, 2), None, "2031 switched off");
+    }
+
+    /// The reply names the mode at the query, not at the end of the batch, and
+    /// a scheme report does not overtake a DECRQM that was asked first. Mixed
+    /// with the emulator's own DA1 and DA2, the bytes leave in stream order,
+    /// once each.
+    #[gpui::test]
+    fn decrqm_2031_answers_the_mode_at_the_query_in_stream_order(cx: &mut TestAppContext) {
+        let set_background = |cx: &mut TestAppContext, bg: gpui::Hsla| {
+            cx.update(|cx| gpui_component::Theme::global_mut(cx).background = bg)
+        };
+
+        let (_window, mut daemon) = harness(cx);
+        set_background(cx, gpui::white());
+        DaemonMsg::Output(b"\x1b[?2031$p\x1b[?2031h".to_vec())
+            .encode(&mut daemon)
+            .unwrap();
+        assert_eq!(
+            pumped_input(cx, &mut daemon, 20).as_deref(),
+            Some("\x1b[?2031;2$y"),
+            "the query landed before ?2031h, so the mode was reset"
+        );
+        assert_eq!(
+            pumped_input(cx, &mut daemon, 2),
+            None,
+            "alacritty's ;0$y is not forwarded as a second reply"
+        );
+        set_background(cx, gpui::black());
+        assert_eq!(
+            pumped_input(cx, &mut daemon, 20).as_deref(),
+            Some("\x1b[?997;1n"),
+            "the batch still ends with the mode on"
+        );
+
+        let (_window, mut daemon) = harness(cx);
+        set_background(cx, gpui::white());
+        DaemonMsg::Output(b"\x1b[?2031h\x1b[?2031$p\x1b[?2031l".to_vec())
+            .encode(&mut daemon)
+            .unwrap();
+        assert_eq!(
+            pumped_input(cx, &mut daemon, 20).as_deref(),
+            Some("\x1b[?2031;1$y"),
+            "the query landed while the mode was on"
+        );
+        set_background(cx, gpui::black());
+        assert_eq!(
+            pumped_input(cx, &mut daemon, 2),
+            None,
+            "the batch ends with the mode off"
+        );
+
+        let (_window, mut daemon) = harness(cx);
+        set_background(cx, gpui::white());
+        DaemonMsg::Output(b"\x1b[c\x1b[?2031h\x1b[?2031$p\x1b[?996n\x1b[>c".to_vec())
+            .encode(&mut daemon)
+            .unwrap();
+        assert_eq!(
+            pumped_input(cx, &mut daemon, 20).as_deref(),
+            Some("\x1b[?6c"),
+            "DA1 is answered before the later queries"
+        );
+        assert_eq!(
+            pumped_input(cx, &mut daemon, 20).as_deref(),
+            Some("\x1b[?2031;1$y")
+        );
+        assert_eq!(
+            pumped_input(cx, &mut daemon, 20).as_deref(),
+            Some("\x1b[?997;2n"),
+            "the scheme reply follows the DECRQM that preceded ?996n"
+        );
+        let da2 = pumped_input(cx, &mut daemon, 20).expect("DA2 reply");
+        assert!(
+            da2.starts_with("\x1b[>0;") && da2.ends_with('c'),
+            "DA2 follows the scheme reply, got {da2}"
+        );
+        assert_eq!(
+            pumped_input(cx, &mut daemon, 2),
+            None,
+            "each query is answered once"
+        );
     }
 
     #[gpui::test]

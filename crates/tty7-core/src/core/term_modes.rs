@@ -334,6 +334,14 @@ impl TerminalModes {
     /// across chunks are carried, so the caller may feed whatever sizes the pty
     /// hands it.
     pub fn feed(&mut self, bytes: &[u8]) {
+        self.feed_reporting(bytes, |_, _| {});
+    }
+
+    /// [`Self::feed`], and report each tracked query at the offset one past
+    /// its final byte — the point where every byte of the query has been
+    /// consumed. A query split across chunks is reported in the chunk that
+    /// finishes it, at an offset within that chunk.
+    pub fn feed_reporting(&mut self, bytes: &[u8], mut on_query: impl FnMut(usize, Query)) {
         let mut i = 0;
         while i < bytes.len() {
             if self.state == State::Text {
@@ -392,9 +400,11 @@ impl TerminalModes {
                     }
                     b'p' if dollar => {
                         if marker == b'?' && self.params == b"2031" {
-                            self.queries.push(Query::ColorSchemeMode {
+                            let query = Query::ColorSchemeMode {
                                 set: self.is_on(COLOR_SCHEME_UPDATES),
-                            });
+                            };
+                            self.queries.push(query);
+                            on_query(i + 1, query);
                         }
                         self.state = State::Text;
                     }
@@ -411,12 +421,14 @@ impl TerminalModes {
                     b'n' if !dollar => {
                         if marker == b'?' && self.params == b"996" {
                             self.queries.push(Query::ColorScheme);
+                            on_query(i + 1, Query::ColorScheme);
                         }
                         self.state = State::Text;
                     }
                     b'c' if !dollar => {
                         if marker == 0 && matches!(self.params.as_slice(), b"" | b"0") {
                             self.queries.push(Query::DeviceAttributes);
+                            on_query(i + 1, Query::DeviceAttributes);
                         }
                         self.state = State::Text;
                     }
@@ -815,6 +827,21 @@ mod tests {
             ],
             "DECRQM for 2031 reports the mode state at the query; other modes stay with the emulator"
         );
+        let mut modes = TerminalModes::new();
+        let bytes = b"\x1b[?2031$p\x1b[?2031h\x1b[?996n";
+        let mut seen = Vec::new();
+        modes.feed_reporting(bytes, |off, query| seen.push((off, query)));
+        assert_eq!(
+            seen,
+            vec![
+                (
+                    "\u{1b}[?2031$p".len(),
+                    Query::ColorSchemeMode { set: false }
+                ),
+                (bytes.len(), Query::ColorScheme),
+            ]
+        );
+        assert_eq!(modes.take_queries().len(), 2);
         assert!(modes.take_queries().is_empty());
         modes.feed(b"\x1b[?2031l");
         assert!(!modes.is_on(COLOR_SCHEME_UPDATES));

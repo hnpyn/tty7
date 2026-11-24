@@ -62,6 +62,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A colour-scheme query reports the mode at the moment it was asked** —
+  `CSI ? 2031 $ p` in the same burst as turning the mode on or off used to be
+  answered from the mode at the end of the burst, and a `?996n` in that burst
+  could be answered before an earlier `?2031$p`. The reply now follows the
+  query in the byte stream, names the mode as it stood there, and is sent
+  once. Other queries in the same burst (device attributes included) keep
+  that order.
+
 - **macOS no longer inserts a stray CR on a 1024-byte newline** — The first
   read of a pane's output asked for the whole 256 KiB buffer. Darwin's PTY
   then adds an extra `\r` when `ONLCR` expands a newline that lands on a
