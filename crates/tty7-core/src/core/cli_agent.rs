@@ -586,24 +586,20 @@ impl CLIAgent {
             }
         }
 
-        // cursor-agent's launcher is `exec -a "$0" "$NODE_BIN" [--use-system-ca]
+        // cursor-agent's launcher is `exec -a "$0" "$NODE_BIN" $NODE_FLAGS
         // "$SCRIPT_DIR/index.js" "$@"`. The process table therefore shows the
-        // binary name first (from `-a`), then Node's own `--use-system-ca` and
-        // the path to `index.js`, then the real flags. Those two tokens are not
-        // cursor-agent options — replaying them builds
-        // `cursor-agent --use-system-ca …/index.js --resume <id>`, which the CLI
-        // rejects as an unknown option. Drop them whether or not the CA flag is
-        // present; an `index.js` that is not the entry script never sits here.
-        if matches!(self, CLIAgent::Cursor) {
-            if matches!(tail.first(), Some(&"--use-system-ca")) {
-                tail.remove(0);
-            }
-            if tail
-                .first()
-                .is_some_and(|t| t.split(['/', '\\']).next_back() == Some("index.js"))
-            {
-                tail.remove(0);
-            }
+        // binary name first (from `-a`), then Node's own flags and the path to
+        // `index.js`, then the real flags. Those tokens are not cursor-agent
+        // options — replaying them builds `cursor-agent --disable-sigusr1 …
+        // index.js --resume <id>`, which the CLI rejects. Drop everything up
+        // through `index.js` when only flags precede it.
+        if matches!(self, CLIAgent::Cursor)
+            && let Some(entry) = tail
+                .iter()
+                .position(|t| t.split(['/', '\\']).next_back() == Some("index.js"))
+            && tail[..entry].iter().all(|t| t.starts_with('-'))
+        {
+            tail.drain(..=entry);
         }
 
         // Agents that reach their session through subcommands leave `stale`
@@ -2912,15 +2908,16 @@ mod tests {
                     "abc-123",
                     Some(&argv(&[
                         "/Users/me/.local/bin/cursor-agent",
+                        "--disable-sigusr1",
                         "--use-system-ca",
-                        "/Users/me/.local/share/cursor-agent/versions/2026.01.01-abc/index.js",
+                        "/Users/me/.local/share/cursor-agent/versions/2026.11.22-e9042b2/index.js",
                         "--model",
                         "gpt-5",
                     ]))
                 )
                 .as_deref(),
             Some("cursor-agent --model gpt-5 --resume abc-123"),
-            "exec -a leaves Node's --use-system-ca and index.js ahead of the real flags"
+            "exec -a leaves Node's flags and index.js ahead of the real flags"
         );
         assert_eq!(
             CLIAgent::Cursor
