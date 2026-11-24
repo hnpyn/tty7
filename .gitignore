@@ -37,3 +37,6 @@ repomix-output.*
 
 # Scratch design mockups (HTML previews made while designing, not shipped)
 /design/
+
+# Qoder local IDE/agent state
+.qoder/
