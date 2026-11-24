@@ -80,8 +80,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **A resumed session keeps its id when flags precede `resume`** — `codex
   --yolo resume <id>` (and the same shape for the other agents) is seeded
   from the command line before the agent reports, so a second restore still
-  has an id. `fork <id>` is not: that id is the source session, and writing
-  it into the pane made the next restore reopen the source.
+  has an id. A fork is not. `fork <id>`, `threads fork <id>`, `--fork <id>`,
+  and a resume combined with `--fork` or `--fork-session` all name the source
+  session, and writing that id into the pane made the next restore reopen
+  the source.
 
 - **The zoom badge stays clickable under the floating title bar** — With tabs
   on the left, moving the pointer to the top edge shows the title bar over

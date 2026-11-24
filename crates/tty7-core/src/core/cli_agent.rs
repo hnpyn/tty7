@@ -368,31 +368,69 @@ impl CLIAgent {
         })
     }
 
-    /// Extracts a session id that was passed on the command line (e.g.
-    /// `--resume <id>`, `--session <id>`, `resume <id>`) so a resumed agent
-    /// that has not yet fired another hook event still preserves its session id
-    /// across subsequent server restarts.
+    /// Extracts the session id this process is running, when the command line
+    /// names it (`--resume <id>`, `--session <id>`, `resume <id>`). A resumed
+    /// agent that has not yet fired another hook event still keeps that id
+    /// across a server restart.
+    ///
+    /// Every fork form [`Self::fork_command`] emits is left out. `fork <id>`,
+    /// `threads fork <id>`, `--fork <id>`, and a resume combined with `--fork`
+    /// or `--fork-session` all name the *source* session. Callers persist the
+    /// result as the pane's current id (the daemon's pane facts, and the
+    /// restore line when no hook has reported one), so returning the source
+    /// would reopen that session instead of the one this process is running.
+    /// `None` for `resume --last`, a bare `resume` picker, or anything that
+    /// is not an id.
     pub fn session_id_from_argv(self, argv: &[String]) -> Option<&str> {
-        self.argv_session_id(argv, true)
+        if self.argv_names_a_fork_source(argv) {
+            return None;
+        }
+        self.argv_session_id(argv)
     }
 
     /// The session a running pane should adopt from its command line.
     ///
-    /// The same scan as [`Self::session_id_from_argv`], so a global flag in
-    /// front of the subcommand still counts (`codex --yolo resume <id>`). A
-    /// `fork` subcommand is left out: it names the *source* session, and
-    /// writing that into the pane would make the next restore reopen the
-    /// source instead of the session this process is actually running.
-    /// `None` for `resume --last`, a bare `resume` picker, or anything that
-    /// is not an id.
+    /// The same scan as [`Self::session_id_from_argv`]: a global flag in front
+    /// of the subcommand still counts (`codex --yolo resume <id>`), and every
+    /// fork form is left out.
     pub fn resumed_session_id(self, argv: &[String]) -> Option<String> {
-        self.argv_session_id(argv, false).map(str::to_string)
+        self.session_id_from_argv(argv).map(str::to_string)
     }
 
-    /// `include_fork_subcommand` keeps `fork <id>` / `threads fork <id>`.
-    /// The seed path passes `false` so that source id never becomes the
-    /// pane's current session.
-    fn argv_session_id(self, argv: &[String], include_fork_subcommand: bool) -> Option<&str> {
+    /// `true` when `argv` is a fork invocation. The id on that line belongs to
+    /// the source session. Subcommand forks (`fork <id>`, `threads fork <id>`)
+    /// are recognized in [`Self::argv_session_id`], which never returns them.
+    fn argv_names_a_fork_source(self, argv: &[String]) -> bool {
+        let flags: &[&str] = match self {
+            CLIAgent::Claude
+            | CLIAgent::Grok
+            | CLIAgent::Qwen
+            | CLIAgent::QoderCLI
+            | CLIAgent::QoderCLICn
+            | CLIAgent::CodeBuddy => &["--fork-session"],
+            // `--fork <id>` for droid, pi, omp and prime-agent; a boolean
+            // `--fork` for opencode and goose. Either way the id elsewhere on
+            // the line is the source.
+            CLIAgent::OpenCode
+            | CLIAgent::Goose
+            | CLIAgent::Droid
+            | CLIAgent::Pi
+            | CLIAgent::OhMyPi
+            | CLIAgent::PrimeAgent => &["--fork"],
+            _ => &[],
+        };
+        argv.iter().any(|tok| {
+            let tok = tok.as_str();
+            flags.iter().any(|flag| {
+                tok == *flag
+                    || tok
+                        .strip_prefix(flag)
+                        .is_some_and(|rest| rest.starts_with('='))
+            })
+        })
+    }
+
+    fn argv_session_id(self, argv: &[String]) -> Option<&str> {
         let valid_id = |id: &str| {
             !id.is_empty()
                 && !id.starts_with('-')
@@ -411,13 +449,13 @@ impl CLIAgent {
             | CLIAgent::QoderCLI
             | CLIAgent::QoderCLICn
             | CLIAgent::CodeBuddy => &["--resume", "-r", "--session-id"],
-            CLIAgent::Droid => &["--resume", "-r", "--fork", "--session-id", "-s"],
+            CLIAgent::Droid => &["--resume", "-r", "--session-id", "-s"],
             CLIAgent::Goose => &["--session-id", "--id"],
             CLIAgent::Vibe | CLIAgent::Jcode => &["--resume"],
             CLIAgent::Antigravity => &["--conversation"],
             CLIAgent::OpenCode | CLIAgent::Crush => &["--session", "-s"],
             CLIAgent::Pi | CLIAgent::OhMyPi | CLIAgent::PrimeAgent => {
-                &["--session", "--session-id", "--fork", "--resume", "-r"]
+                &["--session", "--session-id", "--resume", "-r"]
             }
             CLIAgent::Empryo => &["--session"],
             CLIAgent::Kimi => &["--session", "-S", "--resume", "-r"],
@@ -441,7 +479,7 @@ impl CLIAgent {
             {
                 return Some(val);
             } else if matches!(self, CLIAgent::Codex | CLIAgent::TraeCode | CLIAgent::Muse)
-                && (tok == "resume" || (include_fork_subcommand && tok == "fork"))
+                && tok == "resume"
                 && let Some(&next) = iter.peek()
                 && valid_id(next)
             {
@@ -449,8 +487,7 @@ impl CLIAgent {
             } else if matches!(self, CLIAgent::Amp)
                 && matches!(tok, "threads" | "t")
                 && let Some(&verb) = iter.peek()
-                && (matches!(verb, "continue" | "c" | "handoff" | "h")
-                    || (include_fork_subcommand && matches!(verb, "fork" | "f")))
+                && matches!(verb, "continue" | "c" | "handoff" | "h")
             {
                 iter.next();
                 if let Some(&next) = iter.peek()
@@ -2966,7 +3003,7 @@ mod tests {
     }
 
     #[test]
-    fn resumed_session_id_follows_argv_parsing_and_skips_a_fork_subcommand() {
+    fn session_ids_follow_argv_parsing_and_skip_every_fork_form() {
         let argv = |parts: &[&str]| parts.iter().map(|s| s.to_string()).collect::<Vec<_>>();
 
         assert_eq!(
@@ -2983,31 +3020,86 @@ mod tests {
             ])),
             Some("0199a1b2-c3d4".into())
         );
+        let forks: &[(CLIAgent, &[&str])] = &[
+            (
+                CLIAgent::Claude,
+                &["claude", "--resume", "src-1", "--fork-session"],
+            ),
+            (
+                CLIAgent::Grok,
+                &["grok", "--resume", "src-1", "--fork-session"],
+            ),
+            (
+                CLIAgent::Qwen,
+                &["qwen", "--resume", "src-1", "--fork-session"],
+            ),
+            (
+                CLIAgent::CodeBuddy,
+                &["codebuddy", "--resume", "src-1", "--fork-session"],
+            ),
+            (
+                CLIAgent::QoderCLI,
+                &["qodercli", "--resume", "src-1", "--fork-session"],
+            ),
+            (
+                CLIAgent::QoderCLICn,
+                &["qodercn", "--resume", "src-1", "--fork-session"],
+            ),
+            (
+                CLIAgent::OpenCode,
+                &["opencode", "--session", "src-1", "--fork"],
+            ),
+            (CLIAgent::Droid, &["droid", "--fork", "src-1"]),
+            (CLIAgent::Pi, &["pi", "--fork", "src-1"]),
+            (CLIAgent::OhMyPi, &["omp", "--fork", "src-1"]),
+            (CLIAgent::PrimeAgent, &["prime-agent", "--fork", "src-1"]),
+            (
+                CLIAgent::Goose,
+                &[
+                    "goose",
+                    "session",
+                    "--resume",
+                    "--fork",
+                    "--session-id",
+                    "src-1",
+                ],
+            ),
+            (CLIAgent::Codex, &["codex", "fork", "src-1"]),
+            (CLIAgent::Codex, &["codex", "--yolo", "fork", "src-1"]),
+            (CLIAgent::TraeCode, &["traecli", "fork", "019c-123"]),
+            (CLIAgent::Amp, &["amp", "threads", "fork", "t-1"]),
+        ];
+        for (agent, parts) in forks {
+            let line = argv(parts);
+            assert_eq!(
+                agent.session_id_from_argv(&line),
+                None,
+                "{parts:?} names the source, not the session this process is running"
+            );
+            assert_eq!(agent.resumed_session_id(&line), None, "{parts:?}");
+        }
         assert_eq!(
-            CLIAgent::Codex.session_id_from_argv(&argv(&["codex", "fork", "src-1"])),
+            CLIAgent::Claude.session_id_from_argv(&argv(&["claude", "--resume", "src-1"])),
             Some("src-1"),
-            "the general parser still sees a fork's source id"
+            "a resume without --fork-session is the session itself"
         );
         assert_eq!(
-            CLIAgent::Codex.resumed_session_id(&argv(&["codex", "fork", "src-1"])),
-            None,
-            "fork names the source, not the session this process is running"
+            CLIAgent::OpenCode.session_id_from_argv(&argv(&["opencode", "--session", "src-1"])),
+            Some("src-1")
         );
         assert_eq!(
-            CLIAgent::Codex.resumed_session_id(&argv(&["codex", "--yolo", "fork", "src-1"])),
-            None
+            CLIAgent::Droid.session_id_from_argv(&argv(&["droid", "--resume", "src-1"])),
+            Some("src-1")
         );
         assert_eq!(
-            CLIAgent::TraeCode.resumed_session_id(&argv(&["traecli", "fork", "019c-123"])),
-            None
-        );
-        assert_eq!(
-            CLIAgent::Amp.session_id_from_argv(&argv(&["amp", "threads", "fork", "t-1"])),
-            Some("t-1")
-        );
-        assert_eq!(
-            CLIAgent::Amp.resumed_session_id(&argv(&["amp", "threads", "fork", "t-1"])),
-            None
+            CLIAgent::Goose.session_id_from_argv(&argv(&[
+                "goose",
+                "session",
+                "--resume",
+                "--session-id",
+                "src-1"
+            ])),
+            Some("src-1")
         );
         assert_eq!(
             CLIAgent::Amp.resumed_session_id(&argv(&["amp", "threads", "continue", "t-77"])),

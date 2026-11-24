@@ -7361,6 +7361,54 @@ mod tests {
     }
 
     #[test]
+    fn a_fork_source_id_is_not_stored_as_the_panes_session() {
+        use crate::core::cli_agent::CLIAgent;
+        let argv = |s: &str| s.split(' ').map(String::from).collect::<Vec<_>>();
+        let lines = [
+            (CLIAgent::Claude, "claude --resume src-1 --fork-session"),
+            (CLIAgent::OpenCode, "opencode --session src-1 --fork"),
+            (CLIAgent::Droid, "droid --fork src-1"),
+            (CLIAgent::OhMyPi, "omp --fork src-1"),
+            (CLIAgent::Pi, "pi --fork src-1"),
+            (CLIAgent::PrimeAgent, "prime-agent --fork src-1"),
+            (
+                CLIAgent::Goose,
+                "goose session --resume --fork --session-id src-1",
+            ),
+            (CLIAgent::Grok, "grok --resume src-1 --fork-session"),
+            (CLIAgent::Qwen, "qwen --resume src-1 --fork-session"),
+            (
+                CLIAgent::CodeBuddy,
+                "codebuddy --resume src-1 --fork-session",
+            ),
+            (CLIAgent::QoderCLI, "qodercli --resume src-1 --fork-session"),
+            (
+                CLIAgent::QoderCLICn,
+                "qodercn --resume src-1 --fork-session",
+            ),
+        ];
+        for (agent, line) in lines {
+            let mut st = test_state(true);
+            apply_agent(&mut st, Some((agent, argv(line))));
+            assert!(
+                st.agent_session
+                    .as_ref()
+                    .and_then(|s| s.session_id.as_ref())
+                    .is_none(),
+                "{line} seeded a session id"
+            );
+            assert!(
+                observed_facts(&st)
+                    .agent
+                    .as_ref()
+                    .and_then(|facts| facts.session_id.as_ref())
+                    .is_none(),
+                "{line} published the source id"
+            );
+        }
+    }
+
+    #[test]
     fn a_kitty_notification_marks_a_hookless_agent_waiting() {
         use crate::core::cli_agent::{AgentStatus, CLIAgent};
 
