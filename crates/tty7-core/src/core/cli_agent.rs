@@ -3136,6 +3136,19 @@ mod tests {
                 ][..],
                 "cursor-agent --model=gpt-5 /Users/me/cursor-demo/index.js --resume abc-123",
             ),
+            // Real `cursor-agent` path segment, intercepted by `is_cursor_flag`.
+            (
+                &[
+                    "cursor-agent",
+                    "--model=gpt-5",
+                    "/Users/me/cursor-agent/index.js",
+                ][..],
+                "cursor-agent --model=gpt-5 /Users/me/cursor-agent/index.js --resume abc-123",
+            ),
+            (
+                &["cursor-agent", "--yolo", "/Users/me/cursor-agent/index.js"][..],
+                "cursor-agent --yolo /Users/me/cursor-agent/index.js --resume abc-123",
+            ),
         ] {
             assert_eq!(
                 CLIAgent::Cursor
@@ -3144,6 +3157,21 @@ mod tests {
                 Some(expected),
             );
         }
+
+        assert_eq!(
+            CLIAgent::Cursor.launch_argv_for_default(&argv(&[
+                "cursor-agent",
+                "--model=gpt-5",
+                "--yolo",
+                "src/index.js",
+            ])),
+            Some(argv(&[
+                "cursor-agent",
+                "--model=gpt-5",
+                "--yolo",
+                "src/index.js",
+            ])),
+        );
 
         assert_eq!(
             CLIAgent::Cursor.session_id_from_argv(&argv(&[
@@ -3155,13 +3183,14 @@ mod tests {
             Some("sess-1"),
         );
 
-        let mut dangling = vec![
+        let expected_dangling = vec![
             "cursor-agent",
             "-r",
             "/Users/me/.local/share/cursor-agent/versions/x/index.js",
         ];
+        let mut dangling = expected_dangling.clone();
         strip_cursor_node_launcher(&mut dangling);
-        assert_eq!(dangling.len(), 3);
+        assert_eq!(dangling, expected_dangling);
     }
 
     #[test]
