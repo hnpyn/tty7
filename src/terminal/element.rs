@@ -1745,10 +1745,16 @@ fn paint_glyphs(
                                 )
                             })
                         };
-                        is_fallback_for(face_ix, true)
-                            && !(face_ix != 0
-                                && faces[face_ix].family == faces[0].family
-                                && !is_fallback_for(0, false))
+                        let fallback = is_fallback_for(face_ix, true);
+                        // Bold/italic may fall back to its own family's regular cut.
+                        // Never enable the glyph witness for regular: regular owning
+                        // the char must not mark a foreign fallback (e.g. Symbols NF)
+                        // as primary.
+                        let same_family_regular = fallback
+                            && face_ix != 0
+                            && faces[face_ix].family == faces[0].family
+                            && !is_fallback_for(0, false);
+                        fallback && !same_family_regular
                     });
                 let (scale, room) = if icon {
                     let height = font_size.min(geom.line_height);
@@ -5056,7 +5062,8 @@ mod tests {
             || false,
         ));
 
-        // Foreign fallback is cached and short-circuits subsequent probes and witness checks.
+        // Foreign fallback is cached, leaves older primary generations intact,
+        // and short-circuits subsequent probes and witness checks.
         assert!(is_fallback_font_id(
             &mut cache,
             resolved,
@@ -5064,6 +5071,8 @@ mod tests {
             || reloaded,
             || false,
         ));
+        assert_eq!(cache.get(&(resolved, first)), Some(&true));
+        assert_eq!(cache.get(&(resolved, reloaded)), Some(&true));
         assert!(is_fallback_font_id(
             &mut cache,
             resolved,
@@ -5072,7 +5081,7 @@ mod tests {
             || panic!("cached fallback must not re-check glyph witness"),
         ));
 
-        // macOS glyph witness rescues an unseen drifted id without letting foreign ids through.
+        // macOS glyph witness rescues an unseen drifted id and caches it against re-probing.
         let drifted = gpui::FontId(31);
         assert!(!is_fallback_font_id(
             &mut cache,
@@ -5082,26 +5091,36 @@ mod tests {
             || true,
         ));
         assert_eq!(cache.get(&(resolved, drifted)), Some(&true));
-
-        // Bold falling back to its own family's regular cut recognizes regular without
-        // letting regular's cmap adopt a foreign fallback.
-        let (regular, regular_now) = (gpui::FontId(3), gpui::FontId(7));
-        assert!(is_fallback_font_id(
-            &mut cache,
-            regular,
-            foreign,
-            || regular_now,
-            || false,
-        ));
         assert!(!is_fallback_font_id(
             &mut cache,
-            regular,
-            regular_now,
-            || panic!("regular's reloaded id is already cached"),
-            || false,
+            resolved,
+            drifted,
+            || panic!("rescued id must not probe again"),
+            || panic!("rescued id must not re-check glyph witness"),
         ));
 
-        // Cache resets once it reaches the cap.
+        // Same-family fallback check (bold -> regular, witness disabled on regular):
+        // foreign stays a fallback for both cuts, while regular's reloaded id is recognized.
+        let (bold, bold_now) = (resolved, reloaded);
+        let (regular, regular_now) = (gpui::FontId(3), gpui::FontId(7));
+        let bold_foreign = is_fallback_font_id(&mut cache, bold, foreign, || bold_now, || false)
+            && is_fallback_font_id(&mut cache, regular, foreign, || regular_now, || false);
+        assert!(bold_foreign);
+        assert_eq!(cache.get(&(bold, foreign)), Some(&false));
+        assert_eq!(cache.get(&(regular, foreign)), Some(&false));
+
+        let bold_uses_regular =
+            is_fallback_font_id(&mut cache, bold, regular_now, || bold_now, || false)
+                && is_fallback_font_id(
+                    &mut cache,
+                    regular,
+                    regular_now,
+                    || panic!("regular's reloaded id is already cached"),
+                    || false,
+                );
+        assert!(!bold_uses_regular);
+
+        // Cache resets once it reaches the cap, evicting prior entries.
         cache.clear();
         for n in 0..SAME_PRIMARY_FONT_CAP {
             cache.insert((resolved, gpui::FontId(n + 100)), true);
@@ -5113,6 +5132,7 @@ mod tests {
             || reloaded,
             || false,
         ));
+        assert_eq!(cache.get(&(resolved, gpui::FontId(100))), None);
         assert!(cache.len() <= 2);
     }
 
