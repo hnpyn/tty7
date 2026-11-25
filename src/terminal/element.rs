@@ -933,11 +933,25 @@ fn segment_row(row: &[RenderCell]) -> Vec<RowSeg> {
 }
 
 thread_local! {
-                            static CHAR_STRINGS: RefCell<HashMap<char, SharedString>> = RefCell::new(HashMap::new());
+    static CHAR_STRINGS: RefCell<HashMap<char, SharedString>> = RefCell::new(HashMap::new());
 
-                        /// Measured ink bounds and the font size they were measured at.
-                        static INK_BOUNDS: RefCell<(Pixels, HashMap<(gpui::FontId, char), Option<Bounds<Pixels>>>)> =
-                            RefCell::new((px(0.), HashMap::new()));
+    /// Measured ink bounds and the font size they were measured at.
+    static INK_BOUNDS: RefCell<(Pixels, HashMap<(gpui::FontId, char), Option<Bounds<Pixels>>>)> =
+        RefCell::new((px(0.), HashMap::new()));
+
+    /// `(resolved_id, shaped_id) -> is_same_face`.
+    ///
+    /// `resolve_font` keeps the id it first handed a `Font`. CoreText and
+    /// DirectWrite mint another when that face is loaded again — a second
+    /// panel, or an IME preedit whose `Font` omits the terminal's ligature
+    /// features — and the window's `LineLayoutCache` then renews whichever
+    /// id it shaped first, promoting the line from `previous_frame` into
+    /// `current_frame` on every paint. Glyphs already on screen stay on the
+    /// old id while new ones take the new one. Both are the primary face.
+    /// Cleared past [`SAME_PRIMARY_FONT_CAP`], the same way [`INK_BOUNDS`]
+    /// bounds its map.
+    static SAME_PRIMARY_FONT: RefCell<HashMap<(gpui::FontId, gpui::FontId), bool>> =
+        RefCell::new(HashMap::new());
 }
 
 fn char_string(c: char) -> SharedString {
@@ -1159,6 +1173,10 @@ fn fit_scale(ink: Pixels, budget: Pixels) -> f32 {
 /// Linux build keeps the shrink-only rule for icons too.
 const INK_BOUNDS_ARE_INK: bool = cfg!(any(target_os = "macos", target_os = "windows"));
 
+/// How many `(resolved FontId, shaped FontId)` pairs [`SAME_PRIMARY_FONT`]
+/// keeps. A pane only meets a handful; the cap is a leak stop.
+const SAME_PRIMARY_FONT_CAP: usize = 4_096;
+
 /// The most an icon is ever enlarged by.
 ///
 /// The cap keeps a glyph that is small by design — a dot, a bullet — from
@@ -1299,6 +1317,15 @@ fn ink_bounds(
 ) -> Option<Bounds<Pixels>> {
     let font_id = shaped.runs.first()?.font_id;
     let c = text.chars().next()?;
+    cached_typographic_bounds(cx, font_id, font_size, c)
+}
+
+fn cached_typographic_bounds(
+    cx: &App,
+    font_id: gpui::FontId,
+    font_size: Pixels,
+    c: char,
+) -> Option<Bounds<Pixels>> {
     INK_BOUNDS.with(|cache| {
         let hit = {
             let mut cache = cache.borrow_mut();
@@ -1461,12 +1488,64 @@ fn segment_has_room_after(row: &[RenderCell], start: usize, cells: usize, icon: 
     }
 }
 
-/// The `FontId` the shaper stamps on glyphs from `face`.
+/// Whether `shaped_id` belongs to a fallback face rather than `faces[face_ix]`.
 ///
-/// On macOS a face loaded under different feature or fallback keys gets
-/// distinct `FontId`s while CoreText runs map back to the latest one, so
-/// `resolve_font` can disagree with `shaped.runs[0].font_id` for the same face.
-fn shaped_font_id(window: &Window, face: &Font, font_size: Pixels) -> gpui::FontId {
+/// The fast path is `shaped_id == resolved_id`, where `resolved_id` came from
+/// `resolve_font`. That id does not move. A miss is remembered in
+/// [`SAME_PRIMARY_FONT`]: a fresh [`gpui::WindowTextSystem`] owns an empty
+/// `LineLayoutCache`, so shaping `"M"` through it returns the face's current
+/// id instead of one the window cache is still renewing from an earlier
+/// frame. Every id that probe has returned for this `resolved_id` stays the
+/// primary face, which is what keeps an icon shaped before the reload (still
+/// on screen, still the old id) from being fitted as a fallback. An id the
+/// probe has never claimed is a real fallback.
+///
+/// On macOS, `typographic_bounds` of `resolved_id` itself is a second
+/// witness. It is never asked of another face: a regular cut that happens to
+/// contain the icon must not mark a foreign fallback (Symbols Nerd Font)
+/// as this bold face. DirectWrite's `GetGlyphIndices` answers a missing
+/// character with `S_OK` and glyph 0 (`.notdef`), so that witness is
+/// macOS-only. A bold or italic slot may still be the same family's regular
+/// cut, and that is decided by font id, not by which characters regular
+/// draws.
+fn glyph_is_fallback_icon(
+    cx: &App,
+    faces: &[Font; 4],
+    face_ix: usize,
+    resolved_id: gpui::FontId,
+    shaped_id: gpui::FontId,
+    font_size: Pixels,
+    c: char,
+) -> bool {
+    let face = &faces[face_ix];
+    SAME_PRIMARY_FONT.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let fallback = fallback_icon_from_font_ids(
+            &mut cache,
+            resolved_id,
+            shaped_id,
+            || probe_shaped_font_id(cx, face, font_size).unwrap_or(resolved_id),
+            || resolved_face_has_glyph(cx, resolved_id, font_size, c),
+        );
+        if !fallback {
+            return false;
+        }
+        let regular = &faces[0];
+        if face_ix == 0 || face.family != regular.family {
+            return true;
+        }
+        let regular_id = cx.text_system().resolve_font(regular);
+        !adopt_same_family_regular(&mut cache, resolved_id, shaped_id, regular_id, || {
+            probe_shaped_font_id(cx, regular, font_size).unwrap_or(regular_id)
+        })
+    })
+}
+
+/// The `FontId` a shaper stamps on `face` right now.
+///
+/// Built on a new [`gpui::WindowTextSystem`] so the answer cannot be a line
+/// the window's two-frame cache promoted out of `previous_frame`.
+fn probe_shaped_font_id(cx: &App, face: &Font, font_size: Pixels) -> Option<gpui::FontId> {
     let probe = [TextRun {
         len: 1,
         font: face.clone(),
@@ -1475,13 +1554,112 @@ fn shaped_font_id(window: &Window, face: &Font, font_size: Pixels) -> gpui::Font
         underline: None,
         strikethrough: None,
     }];
-    window
-        .text_system()
-        .shape_line(SharedString::new_static("M"), font_size, &probe, None)
+    gpui::WindowTextSystem::new(cx.text_system().clone())
+        .layout_line("M", font_size, &probe, None)
         .runs
         .first()
-        .map(|r| r.font_id)
-        .unwrap_or_else(|| window.text_system().resolve_font(face))
+        .map(|run| run.font_id)
+}
+
+/// `true` when `resolved_id` itself has a real glyph for `c`.
+///
+/// macOS only, and only this face. `typographic_bounds` fails there when the
+/// face has no glyph. Asking the regular cut instead would record a foreign
+/// fallback — Menlo Bold missing `\u{e0a0}`, Symbols Nerd Font drawing it,
+/// JetBrains Mono also drawing it — as Menlo Bold. On Windows the same call
+/// succeeds for `.notdef` and would mark every character as present.
+fn resolved_face_has_glyph(
+    cx: &App,
+    resolved_id: gpui::FontId,
+    font_size: Pixels,
+    c: char,
+) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        cached_typographic_bounds(cx, resolved_id, font_size, c).is_some()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (cx, resolved_id, font_size, c);
+        false
+    }
+}
+
+/// `shaped_id` is `regular_id`, or a reload of that same regular face.
+///
+/// On a match, `(resolved_id, shaped_id)` is recorded as the same face so a
+/// bold slot that fell back to its own family's regular cut is not fitted.
+/// A foreign id is left untouched: regular containing the character is not
+/// evidence, and must not poison [`SAME_PRIMARY_FONT`].
+fn adopt_same_family_regular(
+    cache: &mut HashMap<(gpui::FontId, gpui::FontId), bool>,
+    resolved_id: gpui::FontId,
+    shaped_id: gpui::FontId,
+    regular_id: gpui::FontId,
+    probe_regular: impl FnOnce() -> gpui::FontId,
+) -> bool {
+    let belongs =
+        if shaped_id == regular_id || cache.get(&(regular_id, shaped_id)).copied() == Some(true) {
+            true
+        } else if cache.get(&(regular_id, shaped_id)).copied() == Some(false) {
+            false
+        } else {
+            !fallback_icon_from_font_ids(cache, regular_id, shaped_id, probe_regular, || false)
+        };
+    if !belongs {
+        return false;
+    }
+    cache.insert((resolved_id, shaped_id), true);
+    true
+}
+
+/// Whether `shaped_id` is a fallback icon face for `resolved_id`.
+///
+/// `probe_latest` runs only the first time `(resolved_id, shaped_id)` is
+/// seen, and only when the two ids differ. It must return the face's
+/// current shaped id. That id is recorded as the same face; `shaped_id` is
+/// recorded as a fallback when it is some other id and was not already
+/// recorded as the same face (an older id from before a reload).
+///
+/// `primary_has_glyph` is the macOS `typographic_bounds` witness. Callers
+/// on Windows and Linux pass a closure that returns `false`: DirectWrite
+/// would report `.notdef` as a hit.
+fn fallback_icon_from_font_ids(
+    cache: &mut HashMap<(gpui::FontId, gpui::FontId), bool>,
+    resolved_id: gpui::FontId,
+    shaped_id: gpui::FontId,
+    probe_latest: impl FnOnce() -> gpui::FontId,
+    primary_has_glyph: impl FnOnce() -> bool,
+) -> bool {
+    if shaped_id == resolved_id {
+        return false;
+    }
+    if cache.len() > SAME_PRIMARY_FONT_CAP {
+        cache.clear();
+    }
+    if cache.get(&(resolved_id, shaped_id)).copied() == Some(true) {
+        return false;
+    }
+    if !cache.contains_key(&(resolved_id, shaped_id)) {
+        let latest_id = probe_latest();
+        // A probe result is the primary face. Inserting `true` also repairs
+        // an older `false` if this id was misread before it became current.
+        cache.insert((resolved_id, latest_id), true);
+        if shaped_id != latest_id {
+            // Do not clobber a `true` left by an earlier probe. The lookup
+            // above already returned when this key was `true`; `or_insert`
+            // is what keeps a later probe from flipping that old id.
+            cache.entry((resolved_id, shaped_id)).or_insert(false);
+        }
+        if cache.get(&(resolved_id, shaped_id)).copied() == Some(true) {
+            return false;
+        }
+    }
+    if primary_has_glyph() {
+        cache.insert((resolved_id, shaped_id), true);
+        return false;
+    }
+    true
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1502,7 +1680,10 @@ fn paint_glyphs(
         build_font(bold_font.unwrap_or(base_font), true, true),
     ];
 
-    // Resolved only once an icon asks, so a pane without one pays nothing.
+    // `resolve_font`'s id, taken only once an icon asks, so a pane without
+    // one pays nothing. Compared with the shaped run in
+    // [`glyph_is_fallback_icon`]: the two disagree when the platform reloads
+    // the face, and that disagreement is not itself a fallback.
     let mut primary_ids: [Option<gpui::FontId>; 4] = [None; 4];
 
     let run_buf = &mut [TextRun {
@@ -1669,11 +1850,21 @@ fn paint_glyphs(
                 // keep their native size and may spill into a compatible blank.
                 let icon = INK_BOUNDS_ARE_INK
                     && is_icon
-                    && shaped.runs.first().is_some_and(|r| {
-                        r.font_id
-                            != *primary_ids[face_ix].get_or_insert_with(|| {
-                                shaped_font_id(window, &faces[face_ix], font_size)
-                            })
+                    && text.chars().next().is_some_and(|c| {
+                        shaped.runs.first().is_some_and(|r| {
+                            let resolved_id = *primary_ids[face_ix].get_or_insert_with(|| {
+                                cx.text_system().resolve_font(&faces[face_ix])
+                            });
+                            glyph_is_fallback_icon(
+                                cx,
+                                &faces,
+                                face_ix,
+                                resolved_id,
+                                r.font_id,
+                                font_size,
+                                c,
+                            )
+                        })
                     });
                 let (scale, room) = if icon {
                     let height = font_size.min(geom.line_height);
@@ -4937,6 +5128,211 @@ mod tests {
         for c in ['\u{e0b0}', '\u{e0b1}', '\u{e0b3}', '\u{e0d7}'] {
             assert!(!is_icon(c), "U+{:04X}", c as u32);
         }
+    }
+
+    /// Font-id evolution for one primary face.
+    ///
+    /// `resolved` is `resolve_font`'s stable id. `first_shaped` is the id
+    /// CoreText or DirectWrite stamped before a reload, still carried by
+    /// glyphs on screen. `reloaded` is what a fresh `"M"` probe returns
+    /// after the platform mints a new id. `foreign` is a different family.
+    #[test]
+    fn primary_font_ids_stay_the_same_face_across_a_second_load() {
+        use std::collections::HashMap;
+
+        let mut cache = HashMap::new();
+        let resolved = gpui::FontId(10);
+        let first_shaped = gpui::FontId(8);
+        let reloaded = gpui::FontId(25);
+        let foreign = gpui::FontId(99);
+        let mut probes = 0;
+
+        assert!(
+            !fallback_icon_from_font_ids(
+                &mut cache,
+                resolved,
+                resolved,
+                || {
+                    probes += 1;
+                    first_shaped
+                },
+                || false,
+            ),
+            "the resolved id itself is the primary face"
+        );
+        assert_eq!(probes, 0, "equal ids never probe");
+
+        assert!(
+            !fallback_icon_from_font_ids(
+                &mut cache,
+                resolved,
+                first_shaped,
+                || {
+                    probes += 1;
+                    first_shaped
+                },
+                || false,
+            ),
+            "the first probe's id is the same face"
+        );
+        assert_eq!(probes, 1);
+        assert_eq!(cache.get(&(resolved, first_shaped)), Some(&true));
+
+        assert!(
+            !fallback_icon_from_font_ids(
+                &mut cache,
+                resolved,
+                reloaded,
+                || {
+                    probes += 1;
+                    reloaded
+                },
+                || false,
+            ),
+            "the id a second load's probe returns is the same face too"
+        );
+        assert_eq!(cache.get(&(resolved, reloaded)), Some(&true));
+
+        let mut probed_again = false;
+        assert!(
+            !fallback_icon_from_font_ids(
+                &mut cache,
+                resolved,
+                first_shaped,
+                || {
+                    probed_again = true;
+                    reloaded
+                },
+                || false,
+            ),
+            "an old id still on screen stays the same face"
+        );
+        assert!(
+            !probed_again,
+            "a recorded same-face id is not probed again or flipped"
+        );
+        assert_eq!(cache.get(&(resolved, first_shaped)), Some(&true));
+
+        assert!(
+            fallback_icon_from_font_ids(&mut cache, resolved, foreign, || reloaded, || false),
+            "a different family's id is a fallback icon"
+        );
+        assert_eq!(cache.get(&(resolved, foreign)), Some(&false));
+        assert_eq!(
+            cache.get(&(resolved, first_shaped)),
+            Some(&true),
+            "recording a fallback must not flip the old id"
+        );
+        assert_eq!(cache.get(&(resolved, reloaded)), Some(&true));
+    }
+
+    #[test]
+    fn a_primary_glyph_witness_overrides_a_drifted_font_id() {
+        use std::collections::HashMap;
+
+        let mut cache = HashMap::new();
+        let resolved = gpui::FontId(10);
+        let drifted = gpui::FontId(25);
+        // The witness is what macOS `typographic_bounds` feeds in. Windows
+        // must not: DirectWrite reports `.notdef` as a present glyph.
+        assert!(
+            !fallback_icon_from_font_ids(
+                &mut cache,
+                resolved,
+                drifted,
+                || gpui::FontId(8),
+                || true
+            ),
+            "a primary face that contains the character is not a fallback"
+        );
+        assert_eq!(cache.get(&(resolved, drifted)), Some(&true));
+
+        let mut asked = false;
+        assert!(!fallback_icon_from_font_ids(
+            &mut cache,
+            resolved,
+            drifted,
+            || panic!("cached same-face id must not probe"),
+            || {
+                asked = true;
+                false
+            },
+        ));
+        assert!(!asked, "a cached same-face id does not ask again");
+    }
+
+    /// Menlo Bold has no glyph, JetBrains Mono Regular does, and CoreText
+    /// drew the icon with Symbols Nerd Font. Regular's cmap must not mark
+    /// that foreign id as Menlo Bold.
+    #[test]
+    fn a_foreign_shaped_id_is_not_poisoned_by_the_regular_cut() {
+        use std::collections::HashMap;
+
+        let mut cache = HashMap::new();
+        let bold = gpui::FontId(10);
+        let bold_now = gpui::FontId(25);
+        let regular = gpui::FontId(3);
+        let regular_now = gpui::FontId(7);
+        let nerd = gpui::FontId(99);
+
+        assert!(
+            fallback_icon_from_font_ids(&mut cache, bold, nerd, || bold_now, || false),
+            "the bold face does not contain the icon, and 99 is not its probe id"
+        );
+        assert_eq!(cache.get(&(bold, nerd)), Some(&false));
+
+        assert!(
+            !adopt_same_family_regular(&mut cache, bold, nerd, regular, || regular_now),
+            "Symbols Nerd Font is not the regular cut, whatever that cut can draw"
+        );
+        assert_eq!(
+            cache.get(&(bold, nerd)),
+            Some(&false),
+            "the foreign id stays a fallback"
+        );
+        assert_eq!(cache.get(&(regular, nerd)), Some(&false));
+        assert_eq!(cache.get(&(regular, regular_now)), Some(&true));
+
+        assert!(
+            adopt_same_family_regular(&mut cache, bold, regular_now, regular, || {
+                panic!("regular's reloaded id is already recorded")
+            }),
+            "the regular cut's own reloaded id is the same family"
+        );
+        assert_eq!(cache.get(&(bold, regular_now)), Some(&true));
+        assert_eq!(
+            cache.get(&(bold, nerd)),
+            Some(&false),
+            "accepting regular must not adopt the foreign id"
+        );
+    }
+
+    #[test]
+    fn same_face_cache_drops_entries_past_the_cap() {
+        use std::collections::HashMap;
+
+        let mut cache = HashMap::new();
+        let resolved = gpui::FontId(0);
+        for n in 0..=SAME_PRIMARY_FONT_CAP {
+            cache.insert((resolved, gpui::FontId(n + 1)), true);
+        }
+        assert!(cache.len() > SAME_PRIMARY_FONT_CAP);
+        let shaped = gpui::FontId(9_000);
+        assert!(fallback_icon_from_font_ids(
+            &mut cache,
+            resolved,
+            shaped,
+            || gpui::FontId(25),
+            || false,
+        ));
+        assert!(
+            cache.len() <= 2,
+            "the map is cleared before the new pair is stored, got {}",
+            cache.len()
+        );
+        assert_eq!(cache.get(&(resolved, gpui::FontId(1))), None);
+        assert_eq!(cache.get(&(resolved, gpui::FontId(25))), Some(&true));
+        assert_eq!(cache.get(&(resolved, shaped)), Some(&false));
     }
 
     #[test]
