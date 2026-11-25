@@ -463,7 +463,15 @@ impl CLIAgent {
             CLIAgent::TraeCode => &["--resume", "--session-id"],
             _ => &[],
         };
-        let mut iter = argv.iter().map(String::as_str).peekable();
+        // Cursor's process image is `node <node flags> <absolute .../index.js>
+        // <real argv>`. `-r` in those node flags is Node's `--require`, and
+        // this scan would otherwise read it as `--resume`. Drop that prefix
+        // before looking for a session id.
+        let mut tokens: Vec<&str> = argv.iter().map(String::as_str).collect();
+        if matches!(self, CLIAgent::Cursor) {
+            strip_cursor_node_launcher(&mut tokens);
+        }
+        let mut iter = tokens.iter().copied().peekable();
         while let Some(tok) = iter.next() {
             if flags.contains(&tok) {
                 if let Some(&next) = iter.peek()
@@ -591,15 +599,13 @@ impl CLIAgent {
         // binary name first (from `-a`), then Node's own flags and the path to
         // `index.js`, then the real flags. Those tokens are not cursor-agent
         // options — replaying them builds `cursor-agent --disable-sigusr1 …
-        // index.js --resume <id>`, which the CLI rejects. Drop everything up
-        // through `index.js` when only flags precede it.
-        if matches!(self, CLIAgent::Cursor)
-            && let Some(entry) = tail
-                .iter()
-                .position(|t| t.split(['/', '\\']).next_back() == Some("index.js"))
-            && tail[..entry].iter().all(|t| t.starts_with('-'))
-        {
-            tail.drain(..=entry);
+        // index.js --resume <id>`, which the CLI rejects. Node flags that take
+        // a separate value (`-r ./preload.js`, `--max-old-space-size 4096`)
+        // have to come off too: `-r` is this agent's resume switch, so a
+        // preload path left in place is read as a session id. A project file
+        // named `index.js` is not the launcher and must stay, flags and all.
+        if matches!(self, CLIAgent::Cursor) {
+            strip_cursor_node_launcher(&mut tail);
         }
 
         // Agents that reach their session through subcommands leave `stale`
@@ -1040,6 +1046,136 @@ pub fn command_argv(command: &str) -> Vec<String> {
         argv.remove(0);
     }
     argv
+}
+
+/// Drop cursor-agent's Node launcher prefix, in place.
+///
+/// The script has to be an absolute `index.js` with a directory segment that
+/// is exactly `cursor-agent` or `@cursor` (ASCII case folded). A directory
+/// that merely contains those letters (`cursor-demo`) is a user path. Only
+/// Node's own flags may sit in front of the script, and a flag that takes a
+/// value must have that value before the script — `cursor-agent -r
+/// …/index.js` is Node reading the script as `-r`'s argument, not a launcher
+/// prefix. A cursor-agent flag there (`--model`, `--yolo`, `--resume`, …)
+/// means this `index.js` is a user argument. The program token itself
+/// (`cursor-agent`, `node`, `env`) is kept, and so is an env assignment
+/// interleaved with it (`env FOO=1 node`).
+fn strip_cursor_node_launcher(tokens: &mut Vec<&str>) {
+    let Some(span) = cursor_node_launcher_span(tokens) else {
+        return;
+    };
+    tokens.drain(span);
+}
+
+fn cursor_node_launcher_span(tokens: &[&str]) -> Option<std::ops::Range<usize>> {
+    let entry = tokens
+        .iter()
+        .position(|token| is_cursor_node_launcher_script(token))?;
+    // `env FOO=1 node -r preload.js <script>` mixes the interpreter and the
+    // assignments. Both stay; the node flags are what follows that run.
+    let flags_at = tokens[..entry]
+        .iter()
+        .take_while(|token| is_env_assignment(token) || is_launcher_program(token))
+        .count();
+    if !is_node_launcher_prefix(&tokens[flags_at..entry]) {
+        return None;
+    }
+    Some(flags_at..entry + 1)
+}
+
+fn is_launcher_program(token: &str) -> bool {
+    if token.starts_with('-') {
+        return false;
+    }
+    names_cursor(token) || is_interpreter(base_stem(token))
+}
+
+fn names_cursor(token: &str) -> bool {
+    token.split(['/', '\\']).any(|seg| {
+        CLIAgent::match_token(&base_stem(seg).to_ascii_lowercase()) == Some(CLIAgent::Cursor)
+    })
+}
+
+fn is_cursor_node_launcher_script(token: &str) -> bool {
+    if !is_absolute_path_token(token) {
+        return false;
+    }
+    let mut segments = token.split(['/', '\\']).filter(|seg| !seg.is_empty());
+    let Some(file) = segments.next_back() else {
+        return false;
+    };
+    file == "index.js"
+        && segments.any(|seg| {
+            let seg = seg.to_ascii_lowercase();
+            seg == "cursor-agent" || seg == "@cursor"
+        })
+}
+
+fn is_absolute_path_token(token: &str) -> bool {
+    if token.starts_with('/') || token.starts_with(r"\\") {
+        return true;
+    }
+    let bytes = token.as_bytes();
+    bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'\\' || bytes[2] == b'/')
+}
+
+fn is_node_launcher_prefix(tokens: &[&str]) -> bool {
+    let mut i = 0;
+    while i < tokens.len() {
+        let token = tokens[i];
+        if !is_node_flag_token(token) {
+            return false;
+        }
+        if node_flag_takes_separate_value(token) {
+            // The value has to be a real argument in front of the script.
+            // `cursor-agent -r <index.js>` is Node taking the script as
+            // `-r`'s module, and a cursor-agent flag there is a user
+            // argument. Neither one is a launcher prefix.
+            if i + 1 >= tokens.len() || is_cursor_agent_flag(tokens[i + 1]) {
+                return false;
+            }
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    true
+}
+
+fn is_node_flag_token(token: &str) -> bool {
+    if is_cursor_agent_flag(token) || token == "-" || token == "--" {
+        return false;
+    }
+    token.starts_with('-') && token.len() > 1
+}
+
+fn is_cursor_agent_flag(token: &str) -> bool {
+    let name = token.split_once('=').map(|(name, _)| name).unwrap_or(token);
+    matches!(
+        name,
+        "--model" | "--resume" | "--yolo" | "--print" | "-p" | "--output-format" | "--workspace"
+    )
+}
+
+fn node_flag_takes_separate_value(token: &str) -> bool {
+    matches!(
+        token,
+        "-r" | "--require"
+            | "--import"
+            | "--loader"
+            | "--experimental-loader"
+            | "-C"
+            | "--conditions"
+            | "--max-old-space-size"
+            | "--dns-result-order"
+            | "--redirect-warnings"
+            | "--openssl-config"
+            | "--diagnostic-dir"
+            | "--title"
+    )
 }
 
 fn is_env_assignment(token: &str) -> bool {
@@ -2958,6 +3094,189 @@ mod tests {
             Some("cursor-agent --model gpt-5 --resume abc-123"),
             "a direct launch with no Node wrapper is unchanged"
         );
+    }
+
+    #[test]
+    fn cursor_launcher_strips_node_flags_that_take_a_value() {
+        let argv = |parts: &[&str]| parts.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let line = argv(&[
+            "cursor-agent",
+            "--disable-sigusr1",
+            "--max-old-space-size",
+            "4096",
+            "-r",
+            "./preload.js",
+            "/Users/me/.local/share/cursor-agent/versions/2026.11.22-e9042b2/index.js",
+            "--model",
+            "gpt-5",
+            "--resume",
+            "sess-9",
+        ]);
+
+        assert_eq!(
+            CLIAgent::Cursor
+                .resume_command("abc-123", Some(&line))
+                .as_deref(),
+            Some("cursor-agent --model gpt-5 --resume abc-123"),
+            "node's valued flags and index.js come off; --model stays"
+        );
+        assert_eq!(
+            CLIAgent::Cursor.launch_argv_for_default(&line),
+            Some(argv(&["cursor-agent", "--model", "gpt-5"])),
+            "the saved launch command does not keep node flags"
+        );
+        assert_eq!(
+            CLIAgent::Cursor.session_id_from_argv(&line),
+            Some("sess-9"),
+            "the session id is --resume's, not the preload path"
+        );
+
+        let without_resume = argv(&[
+            "node",
+            "--disable-sigusr1",
+            "--max-old-space-size",
+            "4096",
+            "-r",
+            "./preload.js",
+            "/Users/me/.local/share/cursor-agent/versions/x/index.js",
+        ]);
+        assert_eq!(
+            CLIAgent::Cursor.session_id_from_argv(&without_resume),
+            None,
+            "node's -r ./preload.js is not a session id"
+        );
+    }
+
+    #[test]
+    fn cursor_launcher_does_not_strip_user_flags_or_a_project_index_js() {
+        let argv = |parts: &[&str]| parts.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+        assert_eq!(
+            CLIAgent::Cursor
+                .resume_command(
+                    "abc-123",
+                    Some(&argv(&[
+                        "cursor-agent",
+                        "--model=gpt-5",
+                        "--yolo",
+                        "src/index.js",
+                    ]))
+                )
+                .as_deref(),
+            Some("cursor-agent --model=gpt-5 --yolo src/index.js --resume abc-123"),
+            "a relative project file is not the launcher"
+        );
+        assert_eq!(
+            CLIAgent::Cursor
+                .resume_command(
+                    "abc-123",
+                    Some(&argv(&["cursor-agent", "--yolo", "index.js"]))
+                )
+                .as_deref(),
+            Some("cursor-agent --yolo index.js --resume abc-123"),
+            "a bare index.js is not the launcher"
+        );
+        assert_eq!(
+            CLIAgent::Cursor
+                .resume_command(
+                    "abc-123",
+                    Some(&argv(&[
+                        "cursor-agent",
+                        "--model=gpt-5",
+                        "/Users/me/cursor-demo/index.js",
+                    ]))
+                )
+                .as_deref(),
+            Some("cursor-agent --model=gpt-5 /Users/me/cursor-demo/index.js --resume abc-123"),
+            "a cursor-agent flag in front of a path keeps the path from being the launcher"
+        );
+        assert_eq!(
+            CLIAgent::Cursor.launch_argv_for_default(&argv(&[
+                "cursor-agent",
+                "--model=gpt-5",
+                "--yolo",
+                "src/index.js",
+            ])),
+            Some(argv(&[
+                "cursor-agent",
+                "--model=gpt-5",
+                "--yolo",
+                "src/index.js",
+            ])),
+            "--model and --yolo survive into the saved command"
+        );
+    }
+
+    #[test]
+    fn cursor_launcher_keeps_a_dangling_value_and_a_lookalike_path() {
+        let argv = |parts: &[&str]| parts.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+        let mut dangling = vec![
+            "cursor-agent",
+            "-r",
+            "/Users/me/.local/share/cursor-agent/versions/x/index.js",
+        ];
+        strip_cursor_node_launcher(&mut dangling);
+        assert_eq!(
+            dangling,
+            vec![
+                "cursor-agent",
+                "-r",
+                "/Users/me/.local/share/cursor-agent/versions/x/index.js",
+            ],
+            "-r with the script as its missing value is not a launcher prefix"
+        );
+
+        assert_eq!(
+            CLIAgent::Cursor.session_id_from_argv(&argv(&[
+                "cursor-agent",
+                "-r",
+                "sess-1",
+                "/Users/me/cursor-demo/index.js",
+            ])),
+            Some("sess-1"),
+            "cursor-demo is not the install directory, so -r sess-1 stays a resume"
+        );
+
+        let wrapped = argv(&[
+            "/usr/bin/env",
+            "FOO=1",
+            "node",
+            "-r",
+            "preload.js",
+            "/Users/me/.local/share/cursor-agent/versions/x/index.js",
+            "--model",
+            "gpt-5",
+        ]);
+        assert_eq!(
+            CLIAgent::Cursor.session_id_from_argv(&wrapped),
+            None,
+            "node -r preload.js in front of the launcher is not a session id"
+        );
+        assert_eq!(
+            CLIAgent::Cursor
+                .resume_command("abc-123", Some(&wrapped))
+                .as_deref(),
+            Some("cursor-agent --model gpt-5 --resume abc-123"),
+            "env, node, and the valued node flag come off; --model stays"
+        );
+
+        for script in [
+            "C:/Users/me/cursor-agent/versions/x/index.js",
+            r"\\server\share\cursor-agent\versions\x\index.js",
+            "/Users/me/node_modules/@cursor/cursor-agent/index.js",
+        ] {
+            assert_eq!(
+                CLIAgent::Cursor
+                    .resume_command(
+                        "abc-123",
+                        Some(&argv(&["cursor-agent", "--use-system-ca", script]))
+                    )
+                    .as_deref(),
+                Some("cursor-agent --resume abc-123"),
+                "launcher path {script}"
+            );
+        }
     }
 
     #[test]
