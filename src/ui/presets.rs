@@ -98,8 +98,6 @@ pub struct Interactions {
     pub input_border: u32,
 }
 
-impl Global for Interactions {}
-
 pub mod state {
     pub const HOVER: f32 = 1.18;
     pub const SELECTED: f32 = 1.30;
@@ -696,28 +694,6 @@ const RAIL_TINT: f32 = 0.03;
 /// the fills a sidebar is actually painted on.
 const TITLE_FLOOR: f32 = 7.0;
 
-/// A semantic ink stepped down to sit beside body text instead of over it.
-///
-/// `success` and `danger` are cleared to `TEXT_FLOOR` at full chroma, which is
-/// right for the one line that says a push failed and wrong for a `+94 −26`
-/// repeated on every row of a list: twelve saturated numerals become the
-/// loudest thing in the column while carrying the least. Blending toward the
-/// caption ink they sit next to keeps the hue (green still means added) and
-/// takes the shout out, then the blend is walked back toward the full ink
-/// only when the surface it lands on cannot carry it at `TEXT_FLOOR`.
-#[cfg(test)]
-pub(crate) fn resting_ink(ink: Hsla, beside: Hsla, surface: Hsla) -> Hsla {
-    let (ink, beside, surface) = (pack(ink), pack(beside), pack(surface));
-    let blend = mix(ink, beside, 0.45);
-    gpui::rgb(at_least(blend, ink, surface, TEXT_FLOOR)).into()
-}
-
-#[cfg(test)]
-fn pack(c: Hsla) -> u32 {
-    let rgb = crate::terminal::palette::hsla_to_rgb(c);
-    (rgb.r as u32) << 16 | (rgb.g as u32) << 8 | rgb.b as u32
-}
-
 /// Hairlines are separators, not control outlines — the surfaces they divide
 /// carry their own fills, so WCAG 1.4.11's 3:1 does not apply and painting them
 /// that hard would read as a wireframe. This floor only rescues the palettes
@@ -813,62 +789,6 @@ pub fn by_id(cx: &App, id: &str) -> Theme {
         .or_else(|| themes.iter().find(|t| t.id == DEFAULT_ID))
         .cloned()
         .unwrap_or_else(|| themes.into_iter().next().expect("at least the built-ins"))
-}
-
-#[cfg(test)]
-pub fn to_yaml(t: &Theme) -> String {
-    fn hex(c: u32) -> String {
-        format!("\"#{:06x}\"", c & 0xff_ffff)
-    }
-    fn rgb_hex((r, g, b): (u8, u8, u8)) -> String {
-        format!("\"#{r:02x}{g:02x}{b:02x}\"")
-    }
-    let mut s = String::new();
-    s.push_str(&format!("name: {:?}\n", t.name));
-    match &t.background {
-        Fill::Solid(c) => s.push_str(&format!("background: {}\n", hex(*c))),
-        Fill::Vertical { top, bottom } => s.push_str(&format!(
-            "background: {{ top: {}, bottom: {} }}\n",
-            hex(*top),
-            hex(*bottom)
-        )),
-        Fill::Horizontal { left, right } => s.push_str(&format!(
-            "background: {{ left: {}, right: {} }}\n",
-            hex(*left),
-            hex(*right)
-        )),
-    }
-    s.push_str(&format!("foreground: {}\n", hex(t.foreground)));
-    s.push_str(&format!("accent: {}\n", hex(t.accent)));
-    if let Some(c) = t.caret {
-        s.push_str(&format!("cursor: {}\n", hex(c)));
-    }
-    if let Some(c) = t.selection {
-        s.push_str(&format!("selection: {}\n", hex(c)));
-    }
-    if let Some(o) = t.opacity {
-        s.push_str(&format!("opacity: {o}\n"));
-    }
-    if t.blur {
-        s.push_str("blur: true\n");
-    }
-    if let Some(img) = &t.image {
-        s.push_str(&format!(
-            "background_image:\n  path: {:?}\n  opacity: {}\n",
-            img.path.display().to_string(),
-            img.opacity
-        ));
-    }
-    let row = |range: std::ops::Range<usize>| {
-        range
-            .map(|i| rgb_hex(t.ansi16[i]))
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
-    s.push_str("ansi:\n");
-    s.push_str(&format!("  normal: [{}]\n", row(0..8)));
-    s.push_str(&format!("  bright: [{}]\n", row(8..16)));
-    s
 }
 
 fn load_all() -> (Vec<Theme>, Vec<(String, String)>) {
@@ -2018,34 +1938,6 @@ mod tests {
     }
 
     #[test]
-    fn resting_semantic_ink_keeps_the_text_floor() {
-        for t in builtins() {
-            let m = t.neutrals();
-            let sem = t.semantics();
-            let beside: Hsla = gpui::rgb(m.muted_foreground).into();
-            for (name, ink) in [("success", sem.success.ink), ("danger", sem.danger.ink)] {
-                for (surface_name, surface) in [
-                    ("window", m.background),
-                    ("sidebar", m.sidebar),
-                    ("popover", m.popover),
-                ] {
-                    let resting = pack(resting_ink(
-                        gpui::rgb(ink).into(),
-                        beside,
-                        gpui::rgb(surface).into(),
-                    ));
-                    let ratio = contrast(resting, surface);
-                    assert!(
-                        ratio >= TEXT_FLOOR - 0.02,
-                        "{}/{surface_name}: resting {name} {resting:#08x} is only {ratio:.2}:1",
-                        t.id
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
     fn sidebar_text_reads_on_the_fill_it_is_painted_on() {
         for t in builtins() {
             let m = t.neutrals();
@@ -2341,32 +2233,6 @@ ansi:
             }
         );
         assert_eq!(fill.color(), 0x001122);
-    }
-
-    #[test]
-    fn to_yaml_round_trips_window_and_image_fields() {
-        let mut theme = builtins().into_iter().next().unwrap();
-        theme.background = Fill::Vertical {
-            top: 0x001122,
-            bottom: 0x334455,
-        };
-        theme.opacity = Some(0.85);
-        theme.blur = true;
-        theme.image = Some(Image {
-            path: PathBuf::from("/pictures/koi.jpg"),
-            opacity: 0.4,
-        });
-        let file: ThemeFile = serde_yaml::from_str(&to_yaml(&theme)).unwrap();
-        assert_eq!(
-            file.background.into_fill().unwrap(),
-            theme.background,
-            "gradient background lost"
-        );
-        assert_eq!(file.opacity, Some(0.85));
-        assert!(file.blur);
-        let img = file.background_image.expect("image field lost");
-        assert_eq!(img.path, "/pictures/koi.jpg");
-        assert_eq!(img.opacity, 0.4);
     }
 
     #[test]

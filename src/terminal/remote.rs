@@ -118,9 +118,7 @@ struct ReaderSignals {
     /// anchored to the grid for the paint path to blit. Shared with the reader,
     /// which places/deletes them as `DaemonMsg::Image`/`DeleteImage` frames land.
     images: crate::terminal::images::ImageStore,
-    clipboard_writes: Arc<Mutex<VecDeque<tty7_core::core::clipboard::ClipboardWrite>>>,
     osc_notes: OscNotes,
-    clipboard_write_busy: Arc<AtomicBool>,
     /// Whether this pane's pty is one a conhost renders into, and so whether
     /// the reader puts back the cursor a repaint parked. Decided per pane from
     /// its [`PtySource`], and shared rather than copied because the reader can
@@ -134,11 +132,9 @@ struct ReaderSignals {
 /// whether a conhost stands between the application and us.
 ///
 /// The distinction is not the platform this client was built for. A Windows
-/// client's panes are a mix: a local shell — or `wsl.exe`, or an `ssh` client,
-/// which are ordinary programs inside the same ConPTY — is rendered by conhost,
-/// while a pane on a remote `tty7-server` (Linux or macOS only, see
-/// [`tty7_core::daemon::install::asset::asset_for_uname`]) or on a native-SSH
-/// channel is a raw unix pty whose bytes reach us untouched.
+/// client's local shell — or `wsl.exe`, or an `ssh` client, which are ordinary
+/// programs inside the same ConPTY — is rendered by conhost. Every other pty
+/// is raw, and its bytes reach us untouched.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PtySource {
     /// A pty this machine's Windows daemon opened: a ConPTY, with conhost
@@ -348,12 +344,10 @@ pub struct RemoteTerminal {
     /// frames, read by the paint path — only the client holds the grid the
     /// anchors are relative to, so the store lives here rather than in the daemon.
     images: crate::terminal::images::ImageStore,
-    clipboard_writes: Arc<Mutex<VecDeque<tty7_core::core::clipboard::ClipboardWrite>>>,
     osc_notes: OscNotes,
-    /// On the pane rather than its view so it survives a relink; only the
+    /// On the pane rather than its view so it survives a reader restart; only the
     /// view's poll touches it.
     note_budget: Mutex<NoteBudget>,
-    clipboard_write_busy: Arc<AtomicBool>,
     route: PaneRoute,
     /// Kept so the event channel stays open for the life of the pane.
     #[allow(dead_code)]
@@ -485,7 +479,7 @@ impl RemoteTerminal {
     }
 
     /// Remember the directory the daemon was asked to spawn in, so everything
-    /// that keys off a pane's cwd — the sidebar's repo grouping above all —
+    /// that keys off a pane's cwd — completion and link resolution above all —
     /// has an answer before the shell gets far enough to report its own via
     /// OSC 7. The reader thread is already running, so a report that beat us
     /// here wins: it describes where the shell actually landed, which is not
@@ -540,9 +534,7 @@ impl RemoteTerminal {
         let shell_vi_mode = Arc::new(AtomicBool::new(false));
         let running_command: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
         let images = crate::terminal::images::ImageStore::new();
-        let clipboard_writes = Arc::new(Mutex::new(VecDeque::new()));
         let osc_notes = OscNotes::default();
-        let clipboard_write_busy = Arc::new(AtomicBool::new(false));
 
         let reader_quit = Arc::new(AtomicBool::new(false));
         let local_conpty = Arc::new(AtomicBool::new(pty == PtySource::LocalConpty));
@@ -565,9 +557,7 @@ impl RemoteTerminal {
                 shell_vi_mode: shell_vi_mode.clone(),
                 running_command: running_command.clone(),
                 images: images.clone(),
-                clipboard_writes: clipboard_writes.clone(),
                 osc_notes: osc_notes.clone(),
-                clipboard_write_busy: clipboard_write_busy.clone(),
                 local_conpty: local_conpty.clone(),
                 color_scheme_updates: color_scheme_updates.clone(),
             },
@@ -594,10 +584,8 @@ impl RemoteTerminal {
             agent,
             agent_session,
             images,
-            clipboard_writes,
             osc_notes,
             note_budget: Mutex::default(),
-            clipboard_write_busy,
             route: PaneRoute::Local,
             proxy,
             reader_thread: Some(reader_thread),
@@ -651,9 +639,7 @@ impl RemoteTerminal {
                     shell_vi_mode,
                     running_command,
                     images,
-                    clipboard_writes,
                     osc_notes,
-                    clipboard_write_busy,
                     local_conpty,
                     color_scheme_updates,
                 } = signals;
@@ -1003,40 +989,12 @@ impl RemoteTerminal {
                                     proxy.send_event(AlacEvent::Wakeup);
                                 }
                             }
-                            DaemonMsg::ClipboardWrite(frame) => {
-                                flush_batch!();
-                                if let Some(write) =
-                                    tty7_core::core::clipboard::ClipboardWrite::decode_frame(frame)
-                                {
-                                    if clipboard_write_busy
-                                        .compare_exchange(
-                                            false,
-                                            true,
-                                            Ordering::AcqRel,
-                                            Ordering::Acquire,
-                                        )
-                                        .is_ok()
-                                    {
-                                        if let Ok(mut pending) = clipboard_writes.lock() {
-                                            pending.push_back(write);
-                                            proxy.send_event(AlacEvent::Wakeup);
-                                        } else {
-                                            clipboard_write_busy.store(false, Ordering::Release);
-                                        }
-                                    } else {
-                                        let reply = tty7_core::core::clipboard::response(
-                                            write.id.as_deref(),
-                                            "EBUSY",
-                                        );
-                                        proxy.send_event(AlacEvent::PtyWrite(
-                                            String::from_utf8(reply)
-                                                .expect("OSC 5522 replies are ASCII"),
-                                        ));
-                                    }
-                                } else {
-                                    clipboard_write_busy.store(false, Ordering::Release);
-                                }
-                            }
+                            // Clipboard writes are never forwarded: the pane is spawned
+                            // with remote clipboard writes disabled, and the sniffer
+                            // answers `EPERM` itself. The frame is still accounted
+                            // for by `queued_gate_len` so a stray one cannot stall
+                            // the output gate.
+                            DaemonMsg::ClipboardWrite(_) => {}
                             DaemonMsg::Cwd(path) => {
                                 flush_batch!();
                                 if let Ok(mut guard) = cwd.lock() {
@@ -1364,17 +1322,6 @@ impl RemoteTerminal {
         let (show, dropped) = budget.admit(now, notes.len());
         notes.truncate(show);
         (notes, dropped)
-    }
-
-    pub fn pop_clipboard_write(&self) -> Option<tty7_core::core::clipboard::ClipboardWrite> {
-        self.clipboard_writes
-            .lock()
-            .ok()
-            .and_then(|mut pending| pending.pop_front())
-    }
-
-    pub fn finish_clipboard_write(&self) {
-        self.clipboard_write_busy.store(false, Ordering::Release);
     }
 
     pub fn agent_session(&self) -> Option<AgentSessionState> {
@@ -3439,7 +3386,7 @@ mod tests {
         assert_eq!(
             term.foreground_cwd(),
             Some(PathBuf::from("/repo/tty7")),
-            "the sidebar can group this pane without waiting for the shell"
+            "completion and link resolution can use this cwd before the shell reports"
         );
 
         daemon_side.send(DaemonMsg::Cwd(PathBuf::from("/repo/tty7/crates")));

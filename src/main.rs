@@ -997,6 +997,51 @@ mod font_thicken_tests {
     }
 }
 
+#[cfg(test)]
+mod content_change_tests {
+    use super::is_content_change;
+    use notify::event::{AccessKind, AccessMode, CreateKind, ModifyKind, RemoveKind};
+
+    #[test]
+    fn open_read_and_close_read_are_not_content_changes() {
+        assert!(!is_content_change(&notify::EventKind::Access(
+            AccessKind::Open(AccessMode::Any)
+        )));
+        assert!(!is_content_change(&notify::EventKind::Access(
+            AccessKind::Open(AccessMode::Read)
+        )));
+        assert!(!is_content_change(&notify::EventKind::Access(
+            AccessKind::Open(AccessMode::Write)
+        )));
+        assert!(!is_content_change(&notify::EventKind::Access(
+            AccessKind::Read
+        )));
+        assert!(!is_content_change(&notify::EventKind::Access(
+            AccessKind::Close(AccessMode::Read)
+        )));
+    }
+
+    #[test]
+    fn close_write_modify_create_and_remove_are_content_changes() {
+        assert!(is_content_change(&notify::EventKind::Access(
+            AccessKind::Close(AccessMode::Write)
+        )));
+        assert!(is_content_change(&notify::EventKind::Access(
+            AccessKind::Close(AccessMode::Any)
+        )));
+        assert!(is_content_change(&notify::EventKind::Any));
+        assert!(is_content_change(&notify::EventKind::Modify(
+            ModifyKind::Any
+        )));
+        assert!(is_content_change(&notify::EventKind::Create(
+            CreateKind::File
+        )));
+        assert!(is_content_change(&notify::EventKind::Remove(
+            RemoveKind::File
+        )));
+    }
+}
+
 /// The watcher tick, from a reloaded file to the keys the app dispatches on.
 ///
 /// The one thing #548 is for — hand-editing config.json and having the new
@@ -1075,7 +1120,8 @@ mod config_reload_tests {
         cx.update(|cx| {
             running_on(cx, Config::default());
 
-            // The app's own `save()` fires this watcher on every sidebar drag.
+            // The app's own `save()` fires this watcher for a preference edit
+            // that does not move a binding.
             let mut unrelated = Config::default();
             unrelated.copy_on_select = !unrelated.copy_on_select;
             let mut announced = false;

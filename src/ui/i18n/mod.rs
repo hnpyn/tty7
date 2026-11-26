@@ -138,7 +138,6 @@ l10n_keys! {
     IntegrationNoticeBlocked,
     IntegrationNoticeNotEngaged,
     PaneTitleProcessExited,
-    CompletionListingRemote,
     ShellFellBack,
     ShellCouldNotStart,
     ShellCouldNotStartTitle,

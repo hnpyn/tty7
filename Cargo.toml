@@ -38,8 +38,8 @@ memchr = "2"
 # Column widths for the input bar (`terminal::view`). The bar has to lay text
 # out the way the terminal grid will, and the grid gets its widths from this
 # same crate by way of `alacritty_terminal` — a hand-rolled code-point table
-# drifts from it the moment Unicode adds a block. Already in the tree via
-# `tty7-cli`, so this pins no new code.
+# drifts from it the moment Unicode adds a block. The grid already measures
+# with this crate, so the pin does not add a second width table.
 unicode-width = "0.2"
 smol.workspace = true
 smallvec.workspace = true
@@ -188,12 +188,11 @@ default-members = ["."]
 
 [workspace.package]
 edition = "2024"
-# The single version for all three crates — `tty7`, `tty7-core`, `tty7-server`
-# all inherit it with `version.workspace = true`. They ship together and a
-# client talking to a server of a different build has to be able to say so, so
-# they must never drift apart. This is the line a release bump edits (and the
-# one nightly's `awk '/^version = /'` stamps: it is the first such line in the
-# file, since the package entries above are all `version.workspace = true`).
+# The single version for both crates — `tty7` and `tty7-core` inherit it with
+# `version.workspace = true`. They ship together, so they must never drift
+# apart. This is the line a release bump edits (and the one nightly's
+# `awk '/^version = /'` stamps: it is the first such line in the file, since
+# the package entries above are all `version.workspace = true`).
 version = "26.10.0"
 
 [workspace.dependencies]
@@ -218,8 +217,7 @@ gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "1d217ee3
 # Our fork of Zed's alacritty_terminal fork: the VT parser + grid
 # (`Term`/`ansi::Processor`). Two packages read it and they must agree, hence
 # this being a workspace pin rather than one each — the GUI (`terminal::remote`)
-# to render the live mirror, and tty7-cli to turn a captured pane back into text
-# (`tty7 capture --plain`). The daemon parses nothing; it is a byte pipe, and its
+# renders the live mirror. The daemon parses nothing; it is a byte pipe, and its
 # PTY is driven by `portable-pty`.
 #
 # The `tty7` branch is Zed's `fcf32fe` (the rev Zed pins) plus four commits.
@@ -315,10 +313,10 @@ codegen-units = 1
 # 4. `ListState::with_size_hint`. A list counts an item it has not laid out yet
 #    as zero tall, so a long document reports itself as about one viewport and
 #    a scrollbar reading that height drags one viewport and stops — the diff
-#    overlay scrolls a whole working tree through one of these. The hint counts
+#    overlay scrolls a whole document through one of these. The hint counts
 #    the unmeasured items at an estimate instead, which `measure_all` would
 #    settle exactly at the price of laying out the whole document on the first
-#    frame (see `ui::diff_overlay::DIFF_LINE_H`).
+#    frame.
 #
 # 5. A text layout remembers the width it was truncated to, and a size measured
 #    under truncation no longer answers a later measure that asks for the whole

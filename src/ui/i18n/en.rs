@@ -86,7 +86,6 @@ pub fn translate_en(key: L10nKey) -> &'static str {
             "tty7 shell integration hasn't engaged in this pane, so inline completion and the Ctrl+R menu are unavailable. Usual causes: a shell you started with your own arguments, a PTY wrapper, or an unsupported shell."
         }
         L10nKey::PaneTitleProcessExited => "{title} — process exited",
-        L10nKey::CompletionListingRemote => "listing remote…",
         L10nKey::ShellFellBack => {
             "Configured shell {shell} failed to start. Using the login shell."
         }

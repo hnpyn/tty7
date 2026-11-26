@@ -620,7 +620,6 @@ pub(crate) fn apply_theme(mut window: Option<&mut Window>, cx: &mut App) {
         image: theme.image.clone(),
     });
     cx.set_global(surfaces.clone());
-    cx.set_global(interaction);
     cx.set_global(presets::ActiveAccent(m.accent));
 
     if !cx.has_global::<StockUiFont>() {
@@ -832,9 +831,7 @@ pub(crate) fn apply_theme(mut window: Option<&mut Window>, cx: &mut App) {
     let sidebar_sel = rgb(surfaces.sidebar.selected);
     // `t.sidebar` stays the opaque theme token: the settings theme picker
     // paints with it on top of the (opaque) settings overlay, so diluting
-    // it would wash out that panel. The workspace sidebar/right-panel
-    // surfaces get their translucent variant at render time instead —
-    // see `workspace_surface_color`.
+    // it would wash out that panel.
     t.sidebar = sidebar_bg;
     t.tokens.sidebar = sidebar_bg.into();
     // The lighter tier: every `sidebar_border` site is a pane meeting another
@@ -1224,7 +1221,7 @@ mod tests {
         use crate::core::config::WindowBackdrop;
         // Every config written before this setting existed carries `Auto`,
         // and many of them carry `window_blur: true` from the old switch.
-        // Those windows were opaque, with opaque sidebars — an update must
+        // Those windows were opaque — an update must
         // not silently turn them see-through, so `Auto` gets the plain 1.0
         // default no matter which way the legacy toggle points.
         for blur in [false, true] {

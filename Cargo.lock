@@ -7640,7 +7640,6 @@ version = "26.10.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
- "core-foundation 0.10.0",
  "ignore",
  "libc",
  "log",
@@ -7650,7 +7649,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

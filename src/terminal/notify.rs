@@ -7,11 +7,9 @@ use gpui::EntityId;
 
 /// Show a desktop notification.
 ///
-/// Naming a `pane` makes the notification clickable where the platform supports
-/// it, so activating it reveals that pane. It is an `EntityId` on purpose: the
-/// tray dispatch identifies leaves by their gpui entity id, and taking a bare
-/// `u64` here is what lets a caller hand over a `pane_id` — a different number,
-/// assigned by the daemon — and get a notification that reveals nothing.
+/// Naming a `pane` keeps the notification tied to that pane. It is an
+/// `EntityId` on purpose: a bare `u64` would let a caller hand over a
+/// `pane_id` — a different number, assigned by the daemon.
 ///
 /// macOS always goes through `macos_notify`, clickable or not. Elsewhere, every
 /// other case (no pane, unsupported platform, Windows toast queue full) falls
@@ -396,13 +394,8 @@ fn show_windows_toast(
     Some(toast)
 }
 
-/// What a click on a Windows toast asks for. A pane this process notified
-/// about is revealed; anything else — a toast from an earlier tty7, one
-/// without a pane, a launch string we do not recognize — still brings tty7
-/// forward, which is what the user clicked a tty7 toast for.
-/// What a toast click used to ask the tray to do. The tray is gone, so a
-/// click is recorded and otherwise ignored; the variants stay so the launch
-/// string is still parsed.
+/// What a Windows toast click used to ask for. The click is recorded and
+/// otherwise ignored; the variants stay so the launch string is still parsed.
 #[cfg(any(target_os = "windows", test))]
 #[derive(Debug, PartialEq, Eq)]
 enum ToastClick {
@@ -446,9 +439,8 @@ impl RecentActivations {
 }
 
 /// A click on a tty7 toast, from whichever path delivered it. Runs on a COM or
-/// WinRT callback thread, so it only touches the tray channel — queued there
-/// when this process has no dispatch loop yet (a launch COM made to deliver
-/// the click).
+/// WinRT callback thread. A repeat of the same launch string is ignored; the
+/// click is not dispatched further.
 #[cfg(target_os = "windows")]
 #[cfg_attr(test, allow(dead_code))]
 pub(crate) fn toast_activated(launch: &str) {
@@ -463,8 +455,8 @@ pub(crate) fn toast_activated(launch: &str) {
     }
 }
 
-/// Ask the tray dispatch loop to bring `leaf_id` to the front. Runs on whatever
-/// thread the platform hands the activation to, so it only touches the channel.
+/// macOS used to reveal `leaf_id` from a notification click. The banner still
+/// dismisses; the id is unused.
 #[cfg(target_os = "macos")]
 fn reveal_pane(leaf_id: u64) {
     // Click-to-reveal went with the tray. The banner still dismisses.

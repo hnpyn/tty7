@@ -4,9 +4,9 @@ use alacritty_terminal::index::{Column, Direction, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::TermMode;
 use gpui::{
-    App, ClipboardEntry, ClipboardItem, Context, EntityId, ExternalPaths, FocusHandle, Focusable,
-    Font, KeyDownEvent, Modifiers, MouseButton, MouseDownEvent, Pixels, ScrollDelta,
-    ScrollWheelEvent, Task, WeakEntity, Window, actions, div, prelude::*, px,
+    App, ClipboardEntry, ClipboardItem, Context, ExternalPaths, FocusHandle, Focusable, Font,
+    KeyDownEvent, Modifiers, MouseButton, MouseDownEvent, Pixels, ScrollDelta, ScrollWheelEvent,
+    Task, WeakEntity, Window, actions, div, prelude::*, px,
 };
 use gpui_component::kbd::Kbd;
 use gpui_component::menu::ContextMenuExt;
@@ -63,27 +63,6 @@ fn input_caret_paint(
     })
 }
 
-/// Which panes are on screen right now, readable without touching the entity
-/// map. The chrome (tab strip, sidebar, switcher) reads every pane entity
-/// while the window draws, so gpui tracks them all and `notify()` from a
-/// hidden pane still dirties the window — this flag is the out-of-band answer
-/// the output pump consults instead. `Tty7App::render` declares it each frame
-/// for its own tabs; a pane nobody has declared yet counts as displayed, so a
-/// missed path can only cost extra repaints, never a frozen grid.
-///
-/// A gpui `Global` rather than a `static`: entity ids are only unique within
-/// one `App`, and parallel `#[gpui::test]` apps mint colliding ids — a
-/// process-wide map would let one test's declarations flip another's flags.
-/// In the shipped binary there is exactly one `App`, so the two are the same.
-#[derive(Default)]
-struct DisplayedRegistry(
-    std::sync::Mutex<
-        std::collections::HashMap<EntityId, std::sync::Arc<std::sync::atomic::AtomicBool>>,
-    >,
-);
-
-impl gpui::Global for DisplayedRegistry {}
-
 actions!(
     terminal,
     [
@@ -108,16 +87,6 @@ actions!(
 pub struct ChildExited;
 
 impl gpui::EventEmitter<ChildExited> for TerminalView {}
-
-pub struct AgentSessionChanged;
-
-impl gpui::EventEmitter<AgentSessionChanged> for TerminalView {}
-
-/// A coding agent started running in this pane: its foreground went from no
-/// agent to this one. What quick launch counts as the agent being used.
-pub struct AgentDetected(#[allow(dead_code)] pub crate::core::cli_agent::CLIAgent);
-
-impl gpui::EventEmitter<AgentDetected> for TerminalView {}
 
 /// What a pane is called when nothing running in it has said otherwise.
 pub(crate) const DEFAULT_TITLE: &str = "ntty7";
@@ -147,30 +116,6 @@ pub struct ShellParts {
     shell_spec: Option<ShellSpec>,
     /// Set when a configured shell failed and the login shell was used instead.
     pub(crate) shell_notice: Option<String>,
-}
-
-/// What the reader was last shown of each pane's finished agent turn, kept for
-/// the life of the app rather than of a view.
-///
-/// A view is thrown away and built again over the same daemon pane whenever a
-/// workspace is switched out and back or a window is reopened from the tray,
-/// and a fresh view sees a `Done` agent arrive from nothing — exactly what a
-/// turn finishing live looks like. This is how the new view tells the two apart
-/// (#870).
-#[derive(Default)]
-struct AgentReadMarks(std::collections::HashMap<(crate::ui::host_ops::HostId, u64), AgentReadMark>);
-
-impl gpui::Global for AgentReadMarks {}
-
-#[derive(Clone)]
-struct AgentReadMark {
-    session: (Option<String>, Option<Vec<String>>),
-    /// The status the pane's last view saw. Kept for every status, not only
-    /// `Done`, so a later view can tell a turn the reader already saw from one
-    /// that finished after they left (#870).
-    status: Option<crate::core::cli_agent::AgentStatus>,
-    turns: u64,
-    unread: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -249,12 +194,7 @@ pub struct TerminalView {
     host_id: crate::ui::host_ops::HostId,
     pub pane_id: u64,
     shell_spec: Option<ShellSpec>,
-    remote_clipboard_write_in_flight: Option<u64>,
-    remote_clipboard_write_generation: u64,
     pub focus_handle: FocusHandle,
-    /// See [`displayed_registry`]. Shared with the registry so the app can
-    /// flip it during a draw without an entity access.
-    displayed: std::sync::Arc<std::sync::atomic::AtomicBool>,
     pub font: Font,
     pub font_bold: Option<Font>,
     pub font_italic: Option<Font>,
@@ -305,8 +245,8 @@ pub struct TerminalView {
     last_mouse_cell: Option<(usize, usize)>,
     /// The button whose press this pane reported to the application, until
     /// its release. The drag and release handlers listen on the whole window,
-    /// so this is what keeps a drag over the title bar, the sidebar or the
-    /// pane next door from reaching a program that never saw it begin (#1182).
+    /// so this is what keeps a drag over the title bar or the pane next door
+    /// from reaching a program that never saw it begin (#1182).
     mouse_grab: Option<MouseButton>,
     /// Where the grid sat in the window on the last frame, so an event that
     /// arrives with nothing but a window position — the wheel — can be told
@@ -369,30 +309,14 @@ pub struct TerminalView {
     running_since: Option<std::time::Instant>,
     running_title: String,
     running_agent: Option<crate::core::cli_agent::CLIAgent>,
-    /// The foreground agent as of the last poll, so a new one is reported
-    /// once ([`AgentDetected`]) rather than on every frame it keeps running.
-    seen_agent: Option<crate::core::cli_agent::CLIAgent>,
-    /// Whether an agent appearing here is news. A pane this view spawned is
-    /// armed from the start; one it reattached to — an app restart, a
-    /// workspace switched back to — may already be running an agent that was
-    /// counted when it started, so it arms only once its shell is seen back
-    /// at the prompt with no agent in front.
-    agent_detection_armed: bool,
     last_agent_status: Option<crate::core::cli_agent::AgentStatus>,
-    last_agent_session: (Option<String>, Option<Vec<String>>),
     agent_turn_started: Option<std::time::Instant>,
     /// The "finished" notification for a turn that just reached `Done`,
     /// waiting out [`AGENT_DONE_SETTLE`]. Dropped — and so never sent — when
     /// the status moves on first.
     pending_finish_notice: Option<Task<()>>,
     agent_was_rich: bool,
-    agent_result_unread: bool,
-    keep_unread_on_focus: bool,
-    /// Whether this view has seen its pane's agent status move at all. The
-    /// first move is where a rebuilt view consults [`AgentReadMarks`].
-    agent_status_seen: bool,
     git_status_cwd: Option<std::path::PathBuf>,
-    last_agent_activity: u64,
     cmd: CmdEditor,
     /// Mirrors `Config::prompt_editor`. Cached rather than read from the global
     /// because the ownership question ("does this keystroke belong to the local
@@ -425,12 +349,6 @@ pub struct TerminalView {
     last_word_nav: Option<LastWordWalk>,
     pending_history: Option<PendingHistory>,
     completion: Option<CompletionSession>,
-    remote_completion_inflight: bool,
-    /// Why the last remote listing produced nothing, when it failed: "no
-    /// candidates" and "the listing itself failed" used to end in the same
-    /// silence, and only one of them is normal (#585). Dismissed by the next
-    /// keystroke, like the integration notice.
-    remote_completion_notice: Option<String>,
     completion_generation: u64,
     editor_handoff: Option<u64>,
     editor_handoff_interrupt_seq: Option<u64>,
@@ -443,17 +361,6 @@ pub struct TerminalView {
     editor_drag_word: Option<(usize, usize)>,
     editor_goal_col: Option<usize>,
     pub(super) hovered_link: Option<HoveredLink>,
-    /// How opaque the pane wants this terminal painted this frame: 1.0 at
-    /// rest. The pane computes it and stores it here, because the
-    /// dim is applied by blending the terminal's own colours toward the
-    /// window background instead of the pane's element opacity — an opacity
-    /// style would alpha-multiply every quad and path separately, so a
-    /// powerline triangle stacked over a segment quad would show the
-    /// already-dimmed segment through its own (1-dim) alpha and land with a
-    /// visible seam where it meets the segment. The terminal element resets
-    /// the field to 1.0 at the end of every paint, so the value never
-    /// outlives the frame it was written for.
-    pub(super) dim: f32,
     _focus_subs: Vec<gpui::Subscription>,
 }
 
@@ -488,12 +395,9 @@ enum GridLink {
 enum LinkAt {
     /// A link, and the cells it covers as one run per row.
     Found(LinkTarget, Vec<(Point, Point)>),
-    /// A token that parses as a path, that nothing has answered for.
-    /// `pending` separates the two reasons: the path is not there, or the host
-    /// that would know has not replied yet.
+    /// A token that parses as a path, and the local filesystem said it is not there.
     Unresolved {
         candidate: super::search::FileCandidate,
-        pending: bool,
     },
     None,
 }
@@ -571,15 +475,6 @@ fn settle_title(showing: &str, waiting: bool, incoming: &str) -> TitleSettle {
         true => TitleSettle::Queue,
         false => TitleSettle::QueueAndWait,
     }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum GitRefresh {
-    Edge,
-    Opportunistic,
-    /// Nothing happened; the cache just has no answer for this pane's cwd
-    /// yet, or the last probe found no repository.
-    Retry,
 }
 
 fn known_pty_shim(fg: &str) -> Option<&'static str> {
@@ -986,42 +881,6 @@ fn files_cwd(
     }
 }
 
-/// The staging directory to reuse on the next paste. A failed preparation is
-/// not cached, so the next paste tries again.
-#[cfg(test)]
-fn staging_cache(prepared: &Result<String, String>) -> Option<String> {
-    prepared.as_ref().ok().cloned()
-}
-
-/// How long a paste stays staged on the remote. Long enough to outlive any
-/// conversation that still refers to it; a week of pasted spreadsheets is
-/// what would otherwise pile up in the user's home forever.
-#[cfg(test)]
-const REMOTE_CLIPBOARD_TTL_SECS: u64 = 7 * 24 * 60 * 60;
-
-/// A fresh name for one paste's own directory under the staging directory.
-///
-/// Each paste gets a directory so every file keeps its real name — which is
-/// what the agent reads, and `report.xlsx` says far more than a hash — without
-/// two pastes of the same name overwriting each other.
-#[cfg(test)]
-fn paste_dir_name() -> String {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos() as u64);
-    format!("paste-{nanos:x}{n:x}")
-}
-
-/// Whether a staging entry has outlived [`REMOTE_CLIPBOARD_TTL_SECS`]. An
-/// entry with no mtime (`0`) is left alone: its age is unknown, not great.
-#[cfg(test)]
-fn staged_entry_expired(mtime: u64, now: u64) -> bool {
-    mtime != 0 && now.saturating_sub(mtime) > REMOTE_CLIPBOARD_TTL_SECS
-}
-
 fn transcode_to_png(bytes: &[u8], format: gpui::ImageFormat) -> Option<Vec<u8>> {
     use gpui::ImageFormat as G;
     let src = match format {
@@ -1041,34 +900,6 @@ fn transcode_to_png(bytes: &[u8], format: gpui::ImageFormat) -> Option<Vec<u8>> 
         .write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
         .ok()?;
     Some(out)
-}
-
-fn validate_remote_clipboard_image(
-    write: tty7_core::core::clipboard::ClipboardWrite,
-) -> Result<(gpui::Image, Option<String>), String> {
-    let (gpui_format, image_format) = match write.mime.as_str() {
-        "image/png" => (gpui::ImageFormat::Png, image::ImageFormat::Png),
-        "image/jpeg" | "image/jpg" => (gpui::ImageFormat::Jpeg, image::ImageFormat::Jpeg),
-        "image/gif" => (gpui::ImageFormat::Gif, image::ImageFormat::Gif),
-        "image/webp" => (gpui::ImageFormat::Webp, image::ImageFormat::WebP),
-        _ => return Err("unsupported image MIME type".into()),
-    };
-    if image::guess_format(&write.data).ok() != Some(image_format) {
-        return Err("image signature does not match its MIME type".into());
-    }
-
-    let mut reader =
-        image::ImageReader::with_format(std::io::Cursor::new(&write.data), image_format);
-    let mut limits = image::Limits::default();
-    limits.max_image_width = Some(16_384);
-    limits.max_image_height = Some(16_384);
-    limits.max_alloc = Some(256 << 20);
-    reader.limits(limits);
-    reader
-        .decode()
-        .map_err(|e| format!("invalid or oversized image: {e}"))?;
-
-    Ok((gpui::Image::from_bytes(gpui_format, write.data), write.id))
 }
 
 fn fallback_chain(family: &str, configured: &[String]) -> Vec<String> {
@@ -1189,7 +1020,6 @@ impl TerminalView {
             .map(crate::core::config::gpui_font_features);
         let report_mouse = config.mouse_reporting;
         let prompt_editor = config.prompt_editor;
-        let agent_detection_armed = true;
         let mut font = gpui::font(font_family);
         font.fallbacks = Some(gpui::FontFallbacks::from_fonts(fallbacks.clone()));
         if let Some(features) = &font_features {
@@ -1243,12 +1073,6 @@ impl TerminalView {
         let focus_subs = vec![
             cx.on_focus_in(&focus_handle, window, |view, _window, cx| {
                 view.cursor_visible = true;
-                if view.keep_unread_on_focus {
-                    view.keep_unread_on_focus = false;
-                } else {
-                    view.agent_result_unread = false;
-                    view.note_agent_result_unread(cx);
-                }
                 view.report_focus_change(true);
                 cx.notify();
             }),
@@ -1306,18 +1130,7 @@ impl TerminalView {
 
         super::color_scheme::watch(cx);
 
-        let displayed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let entity_id = cx.entity().entity_id();
-        cx.default_global::<DisplayedRegistry>()
-            .0
-            .lock()
-            .unwrap()
-            .insert(entity_id, displayed.clone());
-
         cx.on_release_in(window, move |view, window, cx| {
-            if let Some(registry) = cx.try_global::<DisplayedRegistry>() {
-                registry.0.lock().unwrap().remove(&entity_id);
-            }
             view.terminal.detach_link();
             for image in view.terminal.images().take_for_release() {
                 cx.drop_image(image, Some(window));
@@ -1336,10 +1149,7 @@ impl TerminalView {
             host_id: crate::ui::host_ops::HostId::LOCAL,
             pane_id,
             shell_spec: None,
-            remote_clipboard_write_in_flight: None,
-            remote_clipboard_write_generation: 0,
             focus_handle,
-            displayed,
             font,
             font_bold,
             font_italic,
@@ -1381,7 +1191,6 @@ impl TerminalView {
             scroll_handle: TerminalScrollHandle::default(),
             search: None,
             cursor_visible: true,
-            dim: 1.,
             search_focused: false,
             composer: None,
             composer_focused: false,
@@ -1398,18 +1207,11 @@ impl TerminalView {
             running_since: None,
             running_title: String::new(),
             running_agent: None,
-            seen_agent: None,
-            agent_detection_armed,
             last_agent_status: None,
-            last_agent_session: (None, None),
             agent_turn_started: None,
             pending_finish_notice: None,
             agent_was_rich: false,
-            agent_result_unread: false,
-            keep_unread_on_focus: false,
-            agent_status_seen: false,
             git_status_cwd: None,
-            last_agent_activity: 0,
             cmd: CmdEditor::new(),
             prompt_editor,
             typeahead: Typeahead::new(),
@@ -1433,8 +1235,6 @@ impl TerminalView {
             completion_generation: 0,
             editor_handoff: None,
             editor_handoff_interrupt_seq: None,
-            remote_completion_inflight: false,
-            remote_completion_notice: None,
             reverse_search: None,
             integration_notice: None,
             integration_notice_shown: false,
@@ -1516,17 +1316,6 @@ impl TerminalView {
         t_fmt(key, &[("title", name)])
     }
 
-    /// Sets how opaque the pane wants this terminal painted; the pane leaf
-    /// calls this every frame while rendering, and the terminal element
-    /// blends its colours toward the window background during paint (see
-    /// [`Self::dim`] for why that beats an element-opacity style). The
-    /// element resets the value to 1.0 at the end of every paint, so a
-    /// render site that forgets to set it gets full brightness next frame —
-    /// never a stale dim.
-    pub(crate) fn set_dim(&mut self, dim: f32) {
-        self.dim = dim;
-    }
-
     pub fn remote_context(&self) -> Option<RemoteContext> {
         self.terminal.remote_context()
     }
@@ -1602,43 +1391,6 @@ impl TerminalView {
                 false => self.running_title.clone(),
             },
         }))
-    }
-
-    #[cfg(test)]
-    pub fn agent_result_unread(&self) -> bool {
-        self.agent_result_unread
-    }
-
-    /// Leave what the reader has seen of this pane's agent where the pane's
-    /// next view will look for it — see [`AgentReadMarks`]. A mark left at any
-    /// status other than `Done` never vouches for a finished turn, but it still
-    /// records that this app was watching: a turn that was running when the
-    /// view went and finished before the next one came must badge.
-    fn record_agent_read_mark(&self, turns: u64, cx: &mut App) {
-        cx.default_global::<AgentReadMarks>().0.insert(
-            (self.host_id, self.pane_id),
-            AgentReadMark {
-                session: self.last_agent_session.clone(),
-                status: self.last_agent_status,
-                turns,
-                unread: self.agent_result_unread,
-            },
-        );
-    }
-
-    /// Carry a change to the badge alone into the mark the last status left.
-    fn note_agent_result_unread(&self, cx: &mut App) {
-        if !cx.has_global::<AgentReadMarks>() {
-            return;
-        }
-        let key = (self.host_id, self.pane_id);
-        if let Some(mark) = cx.global_mut::<AgentReadMarks>().0.get_mut(&key) {
-            mark.unread = self.agent_result_unread;
-        }
-    }
-
-    fn git_retry_due(&self, _cx: &App) -> bool {
-        false
     }
 
     /// The directory this pane's *work* is happening in — what every panel
@@ -1732,63 +1484,14 @@ impl TerminalView {
         }
     }
 
-    fn poll_remote_clipboard_write(&mut self, cx: &mut Context<Self>) {
-        if self.remote_clipboard_write_in_flight.is_some() {
-            return;
-        }
-        let Some(write) = self.terminal.pop_clipboard_write() else {
-            return;
-        };
-
-        let generation = self.remote_clipboard_write_generation;
-        self.remote_clipboard_write_in_flight = Some(generation);
-        let request_id = write.id.clone();
-        cx.spawn(async move |view, cx| {
-            let validated = cx
-                .background_spawn(async move { validate_remote_clipboard_image(write) })
-                .await;
-            view.update(cx, |view, cx| {
-                if view.remote_clipboard_write_in_flight != Some(generation) {
-                    return;
-                }
-                view.remote_clipboard_write_in_flight = None;
-                view.terminal.finish_clipboard_write();
-                match validated {
-                    Ok((image, id)) => {
-                        cx.write_to_clipboard(ClipboardItem::new_image(&image));
-                        view.terminal
-                            .write(tty7_core::core::clipboard::response(id.as_deref(), "DONE"));
-                    }
-                    Err(reason) => {
-                        log::warn!("refusing remote clipboard image: {reason}");
-                        view.terminal.write(tty7_core::core::clipboard::response(
-                            request_id.as_deref(),
-                            "EINVAL",
-                        ));
-                    }
-                }
-                view.poll_remote_clipboard_write(cx);
-            })
-            .ok();
-        })
-        .detach();
-    }
-
     fn handle_event(&mut self, ev: AlacEvent, cx: &mut Context<Self>) {
         self.terminal.poll_exited();
         self.sync_typeahead_owner();
-        self.poll_remote_clipboard_write(cx);
         match ev {
             AlacEvent::Wakeup => {
                 // The grid moved under whatever the search bar last measured.
                 self.note_output_under_search(cx);
-                // Only a pane that is on screen repaints on output. The
-                // chrome's per-frame entity reads keep every pane in the
-                // window's tracked set, so an ungated notify from a
-                // background tab would dirty the window at output rate.
-                if self.displayed.load(std::sync::atomic::Ordering::Relaxed) {
-                    cx.notify();
-                }
+                cx.notify();
             }
             AlacEvent::Title(title) => self.set_title_when_settled(title, cx),
             AlacEvent::ResetTitle => self.set_title_when_settled(self.default_title.clone(), cx),
@@ -1863,11 +1566,6 @@ impl TerminalView {
             return;
         }
         if self.integration_notice.take().is_some() {
-            cx.notify();
-        }
-        // The remote-listing failure pill goes away on the next keystroke
-        // too — by then the user has seen it (#585).
-        if self.remote_completion_notice.take().is_some() {
             cx.notify();
         }
         let reshaped = if cfg!(target_os = "macos") {
@@ -3035,10 +2733,9 @@ impl TerminalView {
         true
     }
 
-    /// Same shape as `warn_paste_upload_failed`: one toast per failed open, so
-    /// a broken `link_file_command` surfaces as a config problem instead of a
-    /// "dead link" (#542). Spawn is all that is reported — a spawned opener
-    /// that exits non-zero is nobody's to see.
+    /// One toast per failed open, so a broken `link_file_command` surfaces as a
+    /// config problem instead of a "dead link" (#542). Spawn is all that is
+    /// reported — a spawned opener that exits non-zero is nobody's to see.
     fn warn_file_open_failed(
         &self,
         path: &std::path::Path,
@@ -3190,7 +2887,6 @@ impl TerminalView {
         if running && self.running_agent.is_none() {
             self.running_agent = self.terminal.foreground_agent();
         }
-        let cmd_finished = self.running_since.is_some() && !running;
         match (self.running_since, running) {
             (None, true) => {
                 self.running_since = Some(std::time::Instant::now());
@@ -3220,18 +2916,9 @@ impl TerminalView {
             _ => {}
         }
 
-        self.poll_agent_detection(at_prompt, cx);
-
-        let turn_finished = self.poll_agent_status(notify_allowed, window, cx);
+        self.poll_agent_status(notify_allowed, cx);
 
         let session = self.terminal.agent_session();
-        let tool_activity = match session.as_ref().map(|s| s.activity) {
-            Some(n) => std::mem::replace(&mut self.last_agent_activity, n) != n,
-            None => {
-                self.last_agent_activity = 0;
-                false
-            }
-        };
         let cwd_now = self
             .cwd_is_on_host()
             .then(|| {
@@ -3241,12 +2928,9 @@ impl TerminalView {
                     .or_else(|| self.cwd())
             })
             .flatten();
-        if cwd_now.as_ref() != self.git_status_cwd.as_ref() || cmd_finished || turn_finished {
-            self.refresh_git_status(cwd_now, GitRefresh::Edge, cx);
-        } else if tool_activity {
-            self.refresh_git_status(cwd_now, GitRefresh::Opportunistic, cx);
-        } else if self.git_retry_due(cx) {
-            self.refresh_git_status(cwd_now, GitRefresh::Retry, cx);
+        if cwd_now.as_ref() != self.git_status_cwd.as_ref() {
+            self.git_status_cwd = cwd_now;
+            cx.notify();
         }
 
         self.follow_history_scope(cx);
@@ -3381,43 +3065,7 @@ impl TerminalView {
         self.history_ready = true;
     }
 
-    fn refresh_git_status(
-        &mut self,
-        cwd: Option<std::path::PathBuf>,
-        _trigger: GitRefresh,
-        cx: &mut Context<Self>,
-    ) {
-        let changed = self.git_status_cwd != cwd;
-        self.git_status_cwd = cwd;
-        if changed {
-            cx.notify();
-        }
-    }
-
-    /// Report an agent that has just started in this pane ([`AgentDetected`]),
-    /// once per start, and never one that was already running when this view
-    /// reattached to the pane.
-    fn poll_agent_detection(&mut self, at_prompt: bool, cx: &mut Context<Self>) {
-        let agent = self.terminal.foreground_agent();
-        if agent != self.seen_agent {
-            self.seen_agent = agent;
-            if let Some(agent) = agent
-                && self.agent_detection_armed
-            {
-                cx.emit(AgentDetected(agent));
-            }
-        }
-        if agent.is_none() && at_prompt {
-            self.agent_detection_armed = true;
-        }
-    }
-
-    fn poll_agent_status(
-        &mut self,
-        notify_allowed: bool,
-        window: &Window,
-        cx: &mut Context<Self>,
-    ) -> bool {
+    fn poll_agent_status(&mut self, notify_allowed: bool, cx: &mut Context<Self>) {
         use crate::core::cli_agent::AgentStatus;
 
         let session = self.terminal.agent_session();
@@ -3428,73 +3076,13 @@ impl TerminalView {
             self.agent_was_rich = false;
         }
 
-        let identity = (
-            session.as_ref().and_then(|s| s.session_id.clone()),
-            session.as_ref().and_then(|s| s.launch_argv.clone()),
-        );
-        if identity != self.last_agent_session {
-            self.last_agent_session = identity;
-            cx.emit(AgentSessionChanged);
-        }
-
         let status = session.as_ref().map(|s| s.status);
-        let turns = session.as_ref().map_or(0, |s| s.turns);
         if status == self.last_agent_status {
-            return false;
+            return;
         }
         let prev = std::mem::replace(&mut self.last_agent_status, status);
-        let first_sight = !std::mem::replace(&mut self.agent_status_seen, true);
         self.pending_finish_notice = None;
-        // tty7's own conclusion, not the agent's: the user interrupted the
-        // turn, or it went silent. Neither is a result to announce.
         let inferred = session.as_ref().is_some_and(|s| s.inferred);
-
-        // A view built over a pane that already holds a finished turn sees
-        // `Done` arrive from nothing, the same as a turn finishing now. If the
-        // pane's previous view left a mark for this session at this turn count,
-        // it is the turn the reader was already shown: take their badge back as
-        // they left it instead of raising a new one (#870). A turn that
-        // finished after the old view went has no such mark, or a lower count.
-        if first_sight
-            && status == Some(AgentStatus::Done)
-            && let Some(mark) = cx
-                .try_global::<AgentReadMarks>()
-                .and_then(|marks| marks.0.get(&(self.host_id, self.pane_id)))
-                .filter(|mark| {
-                    mark.status == Some(AgentStatus::Done)
-                        && mark.session == self.last_agent_session
-                        && mark.turns == turns
-                })
-                .cloned()
-        {
-            self.agent_result_unread = mark.unread && !self.focus_handle.is_focused(window);
-            self.keep_unread_on_focus = false;
-            self.record_agent_read_mark(turns, cx);
-            cx.notify();
-            return false;
-        }
-
-        let turn_finished = status == Some(AgentStatus::Done) && prev != Some(AgentStatus::Done);
-
-        match status {
-            Some(AgentStatus::Done) if prev != Some(AgentStatus::Done) => {
-                // Whether the reader saw the result is a question about the
-                // window's live focus, not about the last focus callback this
-                // pane happened to receive. A pane focused while it was being
-                // built, before its leaf was attached, never gets the blur that
-                // would clear `self.focused` — trusting the cached flag there
-                // drops the badge on the one pane the reader is not looking at.
-                self.agent_result_unread = !inferred && !self.focus_handle.is_focused(window);
-                self.keep_unread_on_focus = false;
-            }
-            Some(AgentStatus::Done) => {}
-            _ => {
-                self.agent_result_unread = false;
-                self.keep_unread_on_focus = false;
-            }
-        }
-        self.record_agent_read_mark(turns, cx);
-
         let rich = session.as_ref().is_some_and(|s| s.rich);
         let agent_name = self
             .terminal
@@ -3545,7 +3133,6 @@ impl TerminalView {
             _ => {}
         }
         cx.notify();
-        turn_finished
     }
 
     fn at_shell_prompt(&self) -> bool {
@@ -4392,9 +3979,6 @@ impl TerminalView {
             ),
         };
         let Some(comp) = comp else {
-            if self.spawn_remote_path_completion(&line, cursor, forward, cx) {
-                return;
-            }
             log::debug!(
                 target: "tty7::completion",
                 "handing the line to the shell: no candidates for {line:?} at {cursor} \
@@ -4491,16 +4075,6 @@ impl TerminalView {
     fn remote_ssh_cwd(&self) -> Option<String> {
         let _ = self.terminal.remote_context();
         None
-    }
-
-    fn spawn_remote_path_completion(
-        &mut self,
-        _line: &str,
-        _cursor: usize,
-        _forward: bool,
-        _cx: &mut Context<Self>,
-    ) -> bool {
-        false
     }
 
     fn open_completion(&mut self, session: CompletionSession) -> u64 {
@@ -5148,7 +4722,7 @@ impl TerminalView {
             .h(self.line_height * self.terminal.size().rows as f32)
             // No `scrollbar_show` override: the bar takes `cx.theme()`'s, which
             // `apply_theme` pins to `Scrolling` for every list in the app. A
-            // pane disagreeing with the sidebar about when a scrollbar is worth
+            // pane disagreeing with every other list about when a scrollbar is worth
             // showing would be the odd one out.
             .child(Scrollbar::vertical(&self.scroll_handle).id("terminal-scrollbar"))
     }
@@ -5182,8 +4756,8 @@ impl TerminalView {
                 },
                 ..,
             ) => self.open_file_link(path, line, column, is_dir, window, cx),
-            LinkAt::Unresolved { candidate, pending } => {
-                return self.report_unresolved_link(&candidate, pending, window, cx);
+            LinkAt::Unresolved { candidate } => {
+                return self.report_unresolved_link(&candidate, window, cx);
             }
             LinkAt::None => return false,
         }
@@ -5318,7 +4892,6 @@ impl TerminalView {
     fn report_unresolved_link(
         &mut self,
         candidate: &super::search::FileCandidate,
-        pending: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
@@ -5326,11 +4899,6 @@ impl TerminalView {
         // A word that is not written like a path was never a link, and saying
         // so on every modifier-click over ordinary output would be noise.
         if !candidate.looks_like_a_path(roots.style) {
-            return false;
-        }
-        // The host has not answered yet. The underline is the promise that it
-        // has; before then, accusing it of losing the file would be a guess.
-        if pending {
             return false;
         }
         // An absolute or `~`-rooted path was never measured from anywhere, so
@@ -5516,10 +5084,7 @@ impl TerminalView {
                 .then(|| super::search::unresolved_candidate(&text, click_idx, roots.style))
                 .flatten()
             {
-                Some(candidate) => LinkAt::Unresolved {
-                    candidate,
-                    pending: false,
-                },
+                Some(candidate) => LinkAt::Unresolved { candidate },
                 None => LinkAt::None,
             },
         }
@@ -6156,25 +5721,6 @@ impl TerminalView {
             .child(text)
     }
 
-    /// What the remote-completion pill should say right now, if anything:
-    /// the listing's failure once it has one, "listing…" while it runs, and
-    /// nothing at all the rest of the time (#585).
-    fn remote_completion_notice_text(&self) -> Option<String> {
-        if let Some(notice) = &self.remote_completion_notice {
-            return Some(notice.clone());
-        }
-        self.remote_completion_inflight
-            .then(|| t(L10nKey::CompletionListingRemote).to_string())
-    }
-
-    fn render_remote_completion_notice(
-        &self,
-        cx: &mut Context<Self>,
-    ) -> Option<impl IntoElement + use<>> {
-        let text = self.remote_completion_notice_text()?;
-        Some(Self::notice_pill(text, cx))
-    }
-
     fn kind_color(&self, kind: TokenKind, cx: &App) -> gpui::Hsla {
         let theme = cx.theme();
         match kind {
@@ -6286,7 +5832,6 @@ impl Render for TerminalView {
             None => (None, None),
         };
         let integration_notice = self.render_integration_notice(cx);
-        let remote_completion_notice = self.render_remote_completion_notice(cx);
 
         let menu_focus = self.focus_handle.clone();
         let has_selection = self.any_selection();
@@ -6417,7 +5962,6 @@ impl Render for TerminalView {
             .children(completion_menu)
             .children(reverse_search_menu)
             .children(integration_notice)
-            .children(remote_completion_notice)
             .children(composer_over)
             .context_menu(move |menu, _window, cx| {
                 // Suppressing the popup means handing back an item-less menu:
@@ -7382,8 +6926,8 @@ mod tests {
     };
     use super::{SCROLL_ANIM_FRAME, scroll_anim_step};
     use super::{
-        TitleSettle, files_cwd, settle_title, stages_clipboard_image, staging_cache,
-        wsl_share_distro, wsl_share_path,
+        TitleSettle, files_cwd, settle_title, stages_clipboard_image, wsl_share_distro,
+        wsl_share_path,
     };
     use super::{
         before_input, description_budget, drag_scroll_step, elide, encode_mouse,
@@ -7656,29 +7200,6 @@ mod tests {
     }
 
     #[test]
-    fn remote_clipboard_images_must_match_their_declared_mime() {
-        let pixel = image::RgbaImage::from_pixel(1, 1, image::Rgba([4, 5, 6, 255]));
-        let mut png = Vec::new();
-        image::DynamicImage::ImageRgba8(pixel)
-            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
-            .unwrap();
-
-        let valid = tty7_core::core::clipboard::ClipboardWrite {
-            mime: "image/png".into(),
-            data: png.clone(),
-            id: None,
-        };
-        assert!(super::validate_remote_clipboard_image(valid).is_ok());
-
-        let mismatched = tty7_core::core::clipboard::ClipboardWrite {
-            mime: "image/jpeg".into(),
-            data: png,
-            id: None,
-        };
-        assert!(super::validate_remote_clipboard_image(mismatched).is_err());
-    }
-
-    #[test]
     fn a_wsl_cwd_gets_a_windows_spelling_the_completion_engine_can_list() {
         let share = |posix: &str| wsl_share_path("Ubuntu-24.04", posix);
 
@@ -7757,17 +7278,6 @@ mod tests {
             None
         );
         assert_eq!(files_cwd(None, Some("Ubuntu"), None), None);
-    }
-
-    #[test]
-    fn a_failed_staging_preparation_is_retried_rather_than_latched() {
-        assert_eq!(
-            staging_cache(&Ok("/home/me/.cache/tty7/clipboard".to_string())),
-            Some("/home/me/.cache/tty7/clipboard".to_string())
-        );
-        // Nothing was created, so the next paste must try again instead of
-        // handing out a path under a directory that does not exist.
-        assert_eq!(staging_cache(&Err("link is down".to_string())), None);
     }
 
     #[test]
@@ -8474,29 +7984,6 @@ mod tests {
         assert!(clipboard_paths(&text).is_empty());
     }
 
-    /// Two pastes of `report.xlsx` in the same instant must not land in the
-    /// same directory, or the second overwrites the file the first pasted.
-    #[test]
-    fn every_paste_stages_into_a_directory_of_its_own() {
-        let a = super::paste_dir_name();
-        let b = super::paste_dir_name();
-        assert_ne!(a, b);
-        assert!(!a.is_empty() && !a.contains('/') && !a.contains('\\') && a != "." && a != "..");
-    }
-
-    #[test]
-    fn staged_pastes_expire_after_a_week_and_never_on_an_unknown_age() {
-        let now = 1_800_000_000;
-        let week = super::REMOTE_CLIPBOARD_TTL_SECS;
-        assert!(!super::staged_entry_expired(now - 60, now));
-        assert!(!super::staged_entry_expired(now - week, now));
-        assert!(super::staged_entry_expired(now - week - 1, now));
-        // No mtime from the server says nothing about age.
-        assert!(!super::staged_entry_expired(0, now));
-        // A remote clock ahead of ours is young, not negative.
-        assert!(!super::staged_entry_expired(now + 3600, now));
-    }
-
     #[test]
     fn display_width_ascii_and_control_are_narrow() {
         assert_eq!(display_width('a'), 1);
@@ -9037,43 +8524,6 @@ mod tests {
 }
 
 #[cfg(test)]
-pub(crate) fn quiet_test_pane(
-    pane_id: u64,
-    window: &mut Window,
-    cx: &mut gpui::App,
-) -> (
-    gpui::Entity<TerminalView>,
-    crate::terminal::remote::TestLink,
-) {
-    let (terminal, daemon_side) = RemoteTerminal::from_pipe(
-        TermSize::new(80, 24),
-        crate::terminal::remote::PtySource::for_route(&crate::terminal::PaneRoute::Local),
-    );
-    let view = cx.new(|cx| TerminalView::with_terminal(terminal, pane_id, window, cx));
-    (view, daemon_side)
-}
-
-/// The same pane, but reattached rather than spawned — what restoring last
-/// session's tabs builds, and the only shape in which the daemon replays state
-/// the pane already had.
-#[cfg(test)]
-pub(crate) fn quiet_reattached_test_pane(
-    pane_id: u64,
-    window: &mut Window,
-    cx: &mut gpui::App,
-) -> (
-    gpui::Entity<TerminalView>,
-    crate::terminal::remote::TestLink,
-) {
-    let (terminal, daemon_side) = RemoteTerminal::from_pipe(
-        TermSize::new(80, 24),
-        crate::terminal::remote::PtySource::for_route(&crate::terminal::PaneRoute::Local),
-    );
-    let view = cx.new(|cx| TerminalView::with_terminal(terminal, pane_id, window, cx));
-    (view, daemon_side)
-}
-
-#[cfg(test)]
 mod gpui_tests {
     use super::*;
     use crate::daemon::protocol::{ClientMsg, DaemonMsg};
@@ -9238,411 +8688,6 @@ mod gpui_tests {
         );
     }
 
-    #[gpui::test]
-    fn a_reported_session_id_asks_the_window_to_save(cx: &mut TestAppContext) {
-        use crate::core::cli_agent::{AgentSessionState, AgentStatus};
-
-        crate::core::config::pin_test_config_dir();
-        let (window, daemon) = harness(cx);
-        let saves = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let view = window.update(cx, |_, _, cx| cx.entity()).unwrap();
-        {
-            let saves = saves.clone();
-            cx.update(|cx| {
-                cx.subscribe(&view, move |_, _: &AgentSessionChanged, _| {
-                    saves.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                })
-                .detach();
-            });
-        }
-
-        daemon.send(DaemonMsg::AgentStatus(Some(AgentSessionState {
-            status: AgentStatus::Idle,
-            message: None,
-            session_id: Some("sid-abc".into()),
-            launch_argv: Some(vec!["claude".into()]),
-            rich: true,
-            cwd: None,
-            activity: 0,
-            turns: 0,
-            inferred: false,
-            readout: Default::default(),
-            since_ms: None,
-        })));
-        for _ in 0..200 {
-            if window
-                .update(cx, |view, _, _| view.terminal.agent_session().is_some())
-                .unwrap()
-            {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-
-        window
-            .update(cx, |view, window, cx| {
-                view.poll_agent_status(false, window, cx)
-            })
-            .unwrap();
-        cx.run_until_parked();
-        assert_eq!(
-            saves.load(std::sync::atomic::Ordering::SeqCst),
-            1,
-            "the id has to reach the layout on file"
-        );
-
-        window
-            .update(cx, |view, window, cx| {
-                view.poll_agent_status(false, window, cx)
-            })
-            .unwrap();
-        cx.run_until_parked();
-        assert_eq!(
-            saves.load(std::sync::atomic::Ordering::SeqCst),
-            1,
-            "an unchanged session must not re-save on every poll"
-        );
-    }
-
-    /// Report a session in `status` on `daemon` and wait for `pane` to see it.
-    fn report_agent_status(
-        status: crate::core::cli_agent::AgentStatus,
-        pane: &gpui::Entity<TerminalView>,
-        cx: &mut TestAppContext,
-        daemon: &TestLink,
-    ) {
-        report_agent_turn(status, 0, pane, cx, daemon);
-    }
-
-    /// The same, for a session that has finished `turns` turns so far.
-    fn report_agent_turn(
-        status: crate::core::cli_agent::AgentStatus,
-        turns: u64,
-        pane: &gpui::Entity<TerminalView>,
-        cx: &mut TestAppContext,
-        daemon: &TestLink,
-    ) {
-        use crate::core::cli_agent::AgentSessionState;
-
-        let state = AgentSessionState {
-            status,
-            message: None,
-            session_id: Some("sid-abc".into()),
-            launch_argv: Some(vec!["claude".into()]),
-            rich: true,
-            cwd: None,
-            activity: 0,
-            turns,
-            inferred: false,
-            readout: Default::default(),
-            since_ms: None,
-        };
-        daemon.send(DaemonMsg::AgentStatus(Some(state.clone())));
-        for _ in 0..200 {
-            if cx.update(|cx| pane.read(cx).terminal.agent_session()) == Some(state.clone()) {
-                return;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        panic!("the agent status never reached the pane");
-    }
-
-    /// Poll `pane`'s agent status inside `window` and read its badge back.
-    fn poll_unread(
-        window: gpui::WindowHandle<TerminalView>,
-        pane: &gpui::Entity<TerminalView>,
-        cx: &mut TestAppContext,
-    ) -> bool {
-        // Through the untyped handle: the typed one leases the root view, and
-        // `pane` may be that view.
-        cx.update_window(window.into(), |_, window, cx| {
-            pane.update(cx, |pane, cx| {
-                pane.poll_agent_status(false, window, cx);
-                pane.agent_result_unread()
-            })
-        })
-        .unwrap()
-    }
-
-    /// Switching workspaces, or reopening a window from the tray, throws the
-    /// pane's view away and builds a new one on the same daemon pane (#870).
-    /// The new view's first look at a `Done` agent is not a turn finishing —
-    /// the reader watched that one finish before the old view went.
-    #[gpui::test]
-    fn a_rebuilt_pane_does_not_re_badge_a_turn_the_reader_already_saw(cx: &mut TestAppContext) {
-        use crate::core::cli_agent::AgentStatus;
-
-        let (window, before_daemon) = harness(cx);
-        let before = window.update(cx, |_, _, cx| cx.entity()).unwrap();
-        window
-            .update(cx, |view, window, cx| {
-                view.focus_handle.clone().focus(window, cx)
-            })
-            .unwrap();
-        cx.run_until_parked();
-        report_agent_turn(AgentStatus::Done, 1, &before, cx, &before_daemon);
-        assert!(
-            !poll_unread(window, &before, cx),
-            "the reader watched it finish"
-        );
-
-        // The same daemon pane, rebuilt the way `tabs_from_session` rebuilds it,
-        // with the reader's focus somewhere else.
-        let (after, daemon) = window
-            .update(cx, |_, window, cx| super::quiet_test_pane(1, window, cx))
-            .unwrap();
-        window
-            .update(cx, |view, window, cx| {
-                view.focus_handle.clone().focus(window, cx)
-            })
-            .unwrap();
-        cx.run_until_parked();
-        report_agent_turn(AgentStatus::Done, 1, &after, cx, &daemon);
-        assert!(
-            !poll_unread(window, &after, cx),
-            "rebuilding the pane is not a turn finishing"
-        );
-    }
-
-    /// What the rebuild must not swallow: a turn that was still running when
-    /// the view went away and finished before the new one arrived.
-    #[gpui::test]
-    fn a_turn_that_finished_while_the_pane_was_away_still_badges(cx: &mut TestAppContext) {
-        use crate::core::cli_agent::AgentStatus;
-
-        let (window, before_daemon) = harness(cx);
-        let before = window.update(cx, |_, _, cx| cx.entity()).unwrap();
-        window
-            .update(cx, |view, window, cx| {
-                view.focus_handle.clone().focus(window, cx)
-            })
-            .unwrap();
-        cx.run_until_parked();
-        report_agent_turn(AgentStatus::Working, 0, &before, cx, &before_daemon);
-        assert!(!poll_unread(window, &before, cx));
-
-        let (after, daemon) = window
-            .update(cx, |_, window, cx| super::quiet_test_pane(1, window, cx))
-            .unwrap();
-        window
-            .update(cx, |view, window, cx| {
-                view.focus_handle.clone().focus(window, cx)
-            })
-            .unwrap();
-        cx.run_until_parked();
-        report_agent_turn(AgentStatus::Done, 1, &after, cx, &daemon);
-        assert!(
-            poll_unread(window, &after, cx),
-            "nobody saw this turn finish"
-        );
-    }
-
-    /// Nor a whole later turn: the reader saw turn one, the agent was sent
-    /// another and finished it while the pane was away. The status reads
-    /// `Done` both times; only the turn count tells them apart.
-    #[gpui::test]
-    fn a_later_turn_that_finished_while_the_pane_was_away_still_badges(cx: &mut TestAppContext) {
-        use crate::core::cli_agent::AgentStatus;
-
-        let (window, before_daemon) = harness(cx);
-        let before = window.update(cx, |_, _, cx| cx.entity()).unwrap();
-        window
-            .update(cx, |view, window, cx| {
-                view.focus_handle.clone().focus(window, cx)
-            })
-            .unwrap();
-        cx.run_until_parked();
-        report_agent_turn(AgentStatus::Done, 1, &before, cx, &before_daemon);
-        assert!(!poll_unread(window, &before, cx));
-
-        let (after, daemon) = window
-            .update(cx, |_, window, cx| super::quiet_test_pane(1, window, cx))
-            .unwrap();
-        window
-            .update(cx, |view, window, cx| {
-                view.focus_handle.clone().focus(window, cx)
-            })
-            .unwrap();
-        cx.run_until_parked();
-        report_agent_turn(AgentStatus::Done, 2, &after, cx, &daemon);
-        assert!(
-            poll_unread(window, &after, cx),
-            "the second turn finished unseen"
-        );
-    }
-
-    /// And a badge the reader had not cleared yet comes back with the pane.
-    #[gpui::test]
-    fn an_unread_turn_is_still_unread_after_the_pane_is_rebuilt(cx: &mut TestAppContext) {
-        use crate::core::cli_agent::AgentStatus;
-
-        let (window, before_daemon) = harness(cx);
-        let before = window.update(cx, |_, _, cx| cx.entity()).unwrap();
-        // Building another pane takes the window's focus off `before`.
-        let (_elsewhere, _elsewhere_daemon) = window
-            .update(cx, |_, window, cx| super::quiet_test_pane(5, window, cx))
-            .unwrap();
-        cx.run_until_parked();
-        report_agent_turn(AgentStatus::Done, 1, &before, cx, &before_daemon);
-        assert!(poll_unread(window, &before, cx), "nobody was looking");
-
-        let (after, daemon) = window
-            .update(cx, |_, window, cx| super::quiet_test_pane(1, window, cx))
-            .unwrap();
-        window
-            .update(cx, |view, window, cx| {
-                view.focus_handle.clone().focus(window, cx)
-            })
-            .unwrap();
-        cx.run_until_parked();
-        report_agent_turn(AgentStatus::Done, 1, &after, cx, &daemon);
-        assert!(
-            poll_unread(window, &after, cx),
-            "rebuilding the pane is not reading it"
-        );
-    }
-
-    /// The badge answers "did the reader see this?", so it has to read the
-    /// window's live focus rather than anything a focus callback left behind.
-    ///
-    /// A second pane built into the same window is the case that goes wrong:
-    /// it holds no focus and was never told it lost any, so a flag a callback
-    /// maintains says whatever it was born saying — and the badge lands on
-    /// exactly the pane nobody is looking at.
-    #[gpui::test]
-    fn a_finished_turn_on_an_unfocused_pane_is_unread(cx: &mut TestAppContext) {
-        use crate::core::cli_agent::AgentStatus;
-
-        crate::core::config::pin_test_config_dir();
-        let (window, _root_daemon) = harness(cx);
-        let (pane, daemon) = window
-            .update(cx, |_, window, cx| super::quiet_test_pane(2, window, cx))
-            .unwrap();
-        // Building a pane takes the window's focus (`with_terminal`), and the
-        // reader's next click hands it back. The new pane is not in the element
-        // tree, so nothing delivers it the blur that goes with losing it.
-        window
-            .update(cx, |view, window, cx| {
-                view.focus_handle.clone().focus(window, cx);
-            })
-            .unwrap();
-        cx.run_until_parked();
-        window
-            .update(cx, |_, window, cx| {
-                assert!(
-                    !pane.read(cx).focus_handle.is_focused(window),
-                    "the focus went back to the pane the reader is on"
-                );
-            })
-            .unwrap();
-
-        report_agent_status(AgentStatus::Done, &pane, cx, &daemon);
-        window
-            .update(cx, |_, window, cx| {
-                pane.update(cx, |pane, cx| {
-                    pane.poll_agent_status(false, window, cx);
-                    assert!(pane.agent_result_unread(), "nobody was looking at the pane");
-                });
-            })
-            .unwrap();
-    }
-
-    /// Build `pane_id`'s first view (unfocused), let it watch `status` at
-    /// `turns`, then rebuild the pane the way restoring a workspace does — a
-    /// reattach, whose head is the daemon replaying `replayed` — and read the
-    /// rebuilt view's badge.
-    fn rebuild_by_reattach(
-        watched: (crate::core::cli_agent::AgentStatus, u64),
-        replayed: (crate::core::cli_agent::AgentStatus, u64),
-        cx: &mut TestAppContext,
-    ) -> bool {
-        let (window, _root_daemon) = harness(cx);
-        let focus_root = |cx: &mut TestAppContext| {
-            window
-                .update(cx, |view, window, cx| {
-                    view.focus_handle.clone().focus(window, cx)
-                })
-                .unwrap();
-            cx.run_until_parked();
-        };
-        let (before, before_daemon) = window
-            .update(cx, |_, window, cx| super::quiet_test_pane(2, window, cx))
-            .unwrap();
-        focus_root(cx);
-        report_agent_turn(watched.0, watched.1, &before, cx, &before_daemon);
-        poll_unread(window, &before, cx);
-        drop(before);
-
-        let (after, daemon) = window
-            .update(cx, |_, window, cx| {
-                super::quiet_reattached_test_pane(2, window, cx)
-            })
-            .unwrap();
-        focus_root(cx);
-        report_agent_turn(replayed.0, replayed.1, &after, cx, &daemon);
-        poll_unread(window, &after, cx)
-    }
-
-    /// A reattach whose pane this app already watched is a rebuild, not a
-    /// restart: the read mark, not the replay, says whether the turn is news.
-    #[gpui::test]
-    fn a_reattached_pane_takes_back_the_badge_its_reader_left(cx: &mut TestAppContext) {
-        use crate::core::cli_agent::AgentStatus;
-        assert!(
-            rebuild_by_reattach((AgentStatus::Done, 1), (AgentStatus::Done, 1), cx),
-            "the reader never cleared that badge; rebuilding the pane is not reading it"
-        );
-    }
-
-    #[gpui::test]
-    fn a_reattached_pane_badges_a_turn_that_was_running_when_its_view_went(
-        cx: &mut TestAppContext,
-    ) {
-        use crate::core::cli_agent::AgentStatus;
-        assert!(
-            rebuild_by_reattach((AgentStatus::Working, 0), (AgentStatus::Done, 1), cx),
-            "nobody saw this turn finish"
-        );
-    }
-
-    #[gpui::test]
-    fn a_reattached_pane_badges_a_later_turn_that_finished_while_away(cx: &mut TestAppContext) {
-        use crate::core::cli_agent::AgentStatus;
-        // Turn one left a mark; turn two finishing before the reattach is a
-        // different count, so the mark does not vouch for it.
-        assert!(
-            rebuild_by_reattach((AgentStatus::Done, 1), (AgentStatus::Done, 2), cx),
-            "the second turn finished unseen"
-        );
-    }
-
-    #[gpui::test]
-    fn a_finished_turn_on_the_focused_pane_is_already_read(cx: &mut TestAppContext) {
-        use crate::core::cli_agent::AgentStatus;
-
-        crate::core::config::pin_test_config_dir();
-        let (window, daemon) = harness(cx);
-        let pane = window.update(cx, |_, _, cx| cx.entity()).unwrap();
-        window
-            .update(cx, |view, window, cx| {
-                view.focus_handle.clone().focus(window, cx);
-            })
-            .unwrap();
-        cx.run_until_parked();
-
-        report_agent_status(AgentStatus::Done, &pane, cx, &daemon);
-        window
-            .update(cx, |view, window, cx| {
-                assert!(view.focus_handle.is_focused(window));
-                view.poll_agent_status(false, window, cx);
-                assert!(
-                    !view.agent_result_unread(),
-                    "the reader watched the turn finish"
-                );
-            })
-            .unwrap();
-    }
-
     /// An agent that moves into a git worktree does not `chdir` — the process
     /// stays put and only its hook stream says where the work went. Every
     /// panel that answers "where am I?" reads `effective_cwd`, so this is the
@@ -9693,7 +8738,7 @@ mod gpui_tests {
                 assert_eq!(
                     view.effective_cwd(),
                     Some(working_in.clone()),
-                    "the file tree, the cwd row and the SCM panel all root here"
+                    "completion and link resolution root here"
                 );
                 assert_eq!(view.effective_host_cwd(), Some(working_in.clone()));
             })
@@ -9934,13 +8979,12 @@ mod gpui_tests {
                     "nothing underlines for a name that is not on disk"
                 );
                 match view.resolve_link_at(gone, 0, true, cx) {
-                    LinkAt::Unresolved { candidate, pending } => {
+                    LinkAt::Unresolved { candidate } => {
                         assert_eq!(candidate.path, "scratchpad/gone.md");
                         assert!(
                             candidate.looks_like_a_path(view.link_path_style()),
                             "so the click reports it instead of staying silent"
                         );
-                        assert!(!pending, "a local pane answers on the spot");
                     }
                     _ => panic!("expected an unresolved path-shaped candidate"),
                 }
@@ -13020,29 +12064,6 @@ mod gpui_tests {
     }
 
     #[gpui::test]
-    fn a_remote_listing_says_so_while_it_runs_and_when_it_fails(cx: &mut TestAppContext) {
-        let (window, _daemon) = harness(cx);
-        window
-            .update(cx, |view, _, _| {
-                assert!(view.remote_completion_notice_text().is_none());
-                view.remote_completion_inflight = true;
-                assert_eq!(
-                    view.remote_completion_notice_text().as_deref(),
-                    Some("listing remote…"),
-                    "a slow link must not read as a broken Tab key (#585)"
-                );
-                view.remote_completion_inflight = false;
-                view.remote_completion_notice = Some("remote listing failed — boom".to_string());
-                assert_eq!(
-                    view.remote_completion_notice_text().as_deref(),
-                    Some("remote listing failed — boom"),
-                    "a failed listing is not the same silence as an empty one"
-                );
-            })
-            .unwrap();
-    }
-
-    #[gpui::test]
     fn an_exited_local_pane_still_swallows_every_key(cx: &mut TestAppContext) {
         let (window, _daemon) = harness(cx);
         window
@@ -13713,17 +12734,7 @@ mod gpui_tests {
         let build = |cx: &mut TestAppContext, buf: &mut Vec<RenderCell>, must_block: bool| {
             cx.update(|cx| {
                 let colors = PaintColors::resolve(cx.theme(), cx);
-                element.build_grid(
-                    &colors,
-                    buf,
-                    24,
-                    80,
-                    false,
-                    cx,
-                    1.,
-                    gpui::Rgba::default(),
-                    must_block,
-                )
+                element.build_grid(&colors, buf, 24, 80, false, cx, must_block)
             })
         };
 
@@ -14966,87 +13977,6 @@ mod gpui_tests {
             })
             .unwrap();
     }
-
-    /// A clipboard image the daemon forwarded is written to this machine's
-    /// clipboard, and the pane answers `DONE`.
-    #[gpui::test]
-    fn a_clipboard_image_reaches_the_system_clipboard(cx: &mut TestAppContext) {
-        use gpui::ClipboardEntry;
-
-        let (_window, daemon) = harness(cx);
-        let pixel = image::RgbaImage::from_pixel(1, 1, image::Rgba([4, 5, 6, 255]));
-        let mut png = Vec::new();
-        image::DynamicImage::ImageRgba8(pixel)
-            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
-            .unwrap();
-        let write = tty7_core::core::clipboard::ClipboardWrite {
-            mime: "image/png".into(),
-            data: png.clone(),
-            id: Some("copy-1".into()),
-        };
-        daemon.send(DaemonMsg::ClipboardWrite(write.encode_frame()));
-
-        for _ in 0..400 {
-            cx.run_until_parked();
-            let copied = cx.update(|cx| {
-                cx.read_from_clipboard().and_then(|item| {
-                    item.entries().iter().find_map(|entry| match entry {
-                        ClipboardEntry::Image(image) => Some(image.bytes.clone()),
-                        _ => None,
-                    })
-                })
-            });
-            if copied.as_deref() == Some(png.as_slice()) {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        let copied = cx.update(|cx| cx.read_from_clipboard());
-        assert!(copied.is_some_and(|item| {
-            item.entries()
-                .iter()
-                .any(|entry| matches!(entry, ClipboardEntry::Image(image) if image.bytes == png))
-        }));
-        assert_eq!(
-            next_input(&daemon),
-            tty7_core::core::clipboard::response(Some("copy-1"), "DONE")
-        );
-    }
-
-    /// A new pane reports an agent once when it starts. Polling again while
-    /// that same agent is still running is not another start.
-    #[gpui::test]
-    fn a_running_agent_is_detected_once(cx: &mut TestAppContext) {
-        use crate::core::cli_agent::CLIAgent;
-
-        let (window, _root) = harness(cx);
-        let detected = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
-        let (pane, daemon) = window
-            .update(cx, |_, window, cx| super::quiet_test_pane(3, window, cx))
-            .unwrap();
-        let seen = detected.clone();
-        cx.update(|cx| {
-            cx.subscribe(&pane, move |_, ev: &AgentDetected, _| {
-                seen.borrow_mut().push(ev.0);
-            })
-            .detach();
-        });
-
-        let report = |agent: Option<CLIAgent>, at_prompt: bool, cx: &mut TestAppContext| {
-            daemon.send(DaemonMsg::Agent(agent));
-            for _ in 0..200 {
-                if pane.read_with(cx, |p, _| p.terminal.foreground_agent()) == agent {
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            }
-            pane.update(cx, |p, cx| p.poll_agent_detection(at_prompt, cx));
-            cx.run_until_parked();
-        };
-        report(Some(CLIAgent::Claude), false, cx);
-        report(Some(CLIAgent::Claude), false, cx);
-        assert_eq!(*detected.borrow(), vec![CLIAgent::Claude]);
-    }
 }
 
 /// The window between the shell reporting a prompt and its line editor
@@ -15528,8 +14458,8 @@ mod prompt_handover_tests {
             .unwrap();
     }
 
-    /// #1182: dragging anywhere in the window — the title bar, the sidebar,
-    /// the pane next door — reached every pane whose program had asked for
+    /// #1182: dragging anywhere in the window — the title bar or the pane
+    /// next door — reached every pane whose program had asked for
     /// the mouse. The drag handler listens on the whole window and pinned the
     /// pointer to the nearest cell, so tmux (`mouse on`) saw a drag along its
     /// top row it never saw a press for, dropped into copy-mode and started
@@ -15552,8 +14482,8 @@ mod prompt_handover_tests {
                     .size_full()
                     .flex()
                     .flex_row()
-                    // Stands in for the sidebar and anything else that is not
-                    // a pane: no hitbox of either terminal covers it.
+                    // Stands in for chrome that is not a pane: no hitbox of either
+                    // terminal covers it.
                     .child(div().w(px(200.)).h_full())
                     .child(div().flex_1().h_full().child(self.a.clone()))
                     .child(div().flex_1().h_full().child(self.b.clone()))
@@ -15610,7 +14540,7 @@ mod prompt_handover_tests {
         let (ga, gb) = (geom(&a, &mut vcx), geom(&b, &mut vcx));
         assert!(
             ga.origin.x > px(200.) && gb.origin.x > ga.origin.x,
-            "sidebar, then A, then B: {:?} {:?}",
+            "gutter, then A, then B: {:?} {:?}",
             ga.origin,
             gb.origin
         );
@@ -15681,7 +14611,7 @@ mod prompt_handover_tests {
         // Whatever the panes said while settling is not what this is about.
         let _ = (text(&a_pty), text(&b_pty));
 
-        // 1. A drag across the sidebar, the way one would drag a window by
+        // 1. A drag across the gutter, the way one would drag a window by
         //    its title bar: neither pane saw the press, so neither hears it.
         let side = |y: f32| gpui::point(px(50.), px(y));
         hover(&mut vcx, side(100.));

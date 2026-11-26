@@ -342,14 +342,24 @@ fn posix_locale_stem(identifier: &str) -> Option<String> {
 
 #[cfg(target_os = "macos")]
 fn system_locale_identifier() -> Option<String> {
-    use core_foundation::base::TCFType;
-    use core_foundation::string::{CFString, CFStringRef};
     use std::os::raw::c_void;
 
     type CFLocaleRef = *const c_void;
+    type CFStringRef = *const c_void;
+
+    /// `kCFStringEncodingUTF8`.
+    const CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
+
+    #[link(name = "CoreFoundation", kind = "framework")]
     unsafe extern "C" {
         fn CFLocaleCopyCurrent() -> CFLocaleRef;
         fn CFLocaleGetIdentifier(locale: CFLocaleRef) -> CFStringRef;
+        fn CFStringGetCString(
+            the_string: CFStringRef,
+            buffer: *mut std::ffi::c_char,
+            buffer_size: isize,
+            encoding: u32,
+        ) -> u8;
         fn CFRelease(cf: *const c_void);
     }
 
@@ -359,8 +369,24 @@ fn system_locale_identifier() -> Option<String> {
             return None;
         }
         let identifier = CFLocaleGetIdentifier(locale);
-        let out =
-            (!identifier.is_null()).then(|| CFString::wrap_under_get_rule(identifier).to_string());
+        let out = if identifier.is_null() {
+            None
+        } else {
+            // Locale identifiers (`en_US`, `zh_Hans_CN`) are far shorter than this.
+            let mut buf = [0u8; 256];
+            let ok = CFStringGetCString(
+                identifier,
+                buf.as_mut_ptr().cast(),
+                buf.len() as isize,
+                CF_STRING_ENCODING_UTF8,
+            );
+            if ok == 0 {
+                None
+            } else {
+                let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+                String::from_utf8(buf[..len].to_vec()).ok()
+            }
+        };
         CFRelease(locale);
         out
     }
@@ -6340,6 +6366,12 @@ mod tests {
             Some("C.UTF-8".to_string())
         );
         assert_eq!(character_locale(Some("zh_Hans_CN"), installed(&[])), None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn system_locale_identifier_is_present() {
+        assert!(system_locale_identifier().is_some());
     }
 
     #[cfg(target_os = "macos")]

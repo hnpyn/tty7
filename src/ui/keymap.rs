@@ -1464,7 +1464,7 @@ mod gpui_tests {
             );
 
             // An unrelated edit leaves the triple alone — this is the gate the
-            // watcher compares, and a sidebar drag must not rebind.
+            // watcher compares, and a preference save must not rebind.
             cx.global_mut::<Config>().copy_on_select = true;
             assert_eq!(keybinding_config(cx), before);
 

@@ -82,7 +82,6 @@ pub fn translate_zh(key: L10nKey) -> Option<&'static str> {
             "此窗格的 tty7 shell 集成没生效，内联补全和 Ctrl+R 菜单不可用。常见原因：用自己参数启动的 shell、PTY 包装器，或不受支持的 shell。"
         }
         L10nKey::PaneTitleProcessExited => "{title} — 进程已退出",
-        L10nKey::CompletionListingRemote => "正在列出远程目录…",
         L10nKey::ShellFellBack => "配置的 shell {shell} 启动失败，已改用登录 shell。",
         L10nKey::ShellCouldNotStart => "无法启动终端：{error}",
         L10nKey::ShellCouldNotStartTitle => "ntty7 无法启动终端",

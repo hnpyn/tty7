@@ -85,14 +85,20 @@ fn file_stem(label: &str) -> String {
 }
 
 pub fn load(scope: &Scope) -> History {
-    load_with_shell_files(scope, Vec::new())
+    let raw = if scope.is_local() {
+        load_shell_history()
+    } else {
+        Vec::new()
+    };
+    finish_load(scope, raw)
 }
 
-/// `shell_files` are the far end's own history files, each paired with the file
-/// name it was read from — the name is what picks the reader, so fetching a
-/// file the bash reader cannot parse is not enough to corrupt the list.
+/// Test seam: a remote scope's shell history arrives as named file bytes.
+/// The name picks the reader, so a file the bash reader cannot parse does not
+/// corrupt the list. Production loads only tty7's own record for that scope.
+#[cfg(test)]
 pub fn load_with_shell_files(scope: &Scope, shell_files: Vec<(String, Vec<u8>)>) -> History {
-    let mut raw: Vec<Raw> = if scope.is_local() {
+    let raw = if scope.is_local() {
         load_shell_history()
     } else {
         let mut out = Vec::new();
@@ -101,6 +107,10 @@ pub fn load_with_shell_files(scope: &Scope, shell_files: Vec<(String, Vec<u8>)>)
         }
         out
     };
+    finish_load(scope, raw)
+}
+
+fn finish_load(scope: &Scope, mut raw: Vec<Raw>) -> History {
     // Bytes, not `read_to_string`: one bad byte anywhere must not make the
     // whole file vanish from the menu.
     if let Some(path) = scope.file()

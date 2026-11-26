@@ -16,9 +16,9 @@
 //! does not forgive is the third. `\\?\C:` parses as [`Prefix::VerbatimDisk`]
 //! and `C:` as [`Prefix::Disk`], those are different components, and so
 //! `\\?\C:\Users\x\repo != C:/Users/x/repo` — by equality, by hash, and by
-//! `starts_with`. Every cache in the SCM layer is keyed by exactly that
-//! comparison, so a root that came in past `canonicalize` and a root that came
-//! out of `git` name the same repository and share nothing.
+//! `starts_with`. A cache keyed by that comparison treats them as different
+//! paths, so a root that came in past `canonicalize` and a root that came
+//! out of `git` name the same directory and share nothing.
 //!
 //! [`local_spelling`] is where that is settled, once, at the boundary a path
 //! is *created* at rather than at each of the places it is later compared.
@@ -140,13 +140,10 @@ pub fn local_spelling_buf(path: impl AsRef<Path>) -> std::path::PathBuf {
 
 /// The spelling a path that lives on `host` is stored in.
 ///
-/// [`local_spelling`] answers for the machine this process runs on, and every
-/// caller that keys a repository by its root has to ask this one instead: the
-/// same caches, the same `git` probes and the same SCM panel serve a pane on
-/// another machine, and `/home/u/src` from a Linux box is already native over
-/// there. Re-spelling it here would send `\home\u\src` back over the
-/// wire — `Host::git` puts the path on the far side's command line verbatim —
-/// and name nothing on either machine.
+/// [`local_spelling`] answers for the machine this process runs on. A path on
+/// another machine is already native over there: `/home/u/src` from a Linux
+/// box must stay `/home/u/src`. Re-spelling it on a Windows client would turn
+/// it into `\home\u\src` and name nothing on either machine.
 ///
 /// A remote host is left exactly as it arrived, which is what this tree did
 /// everywhere before the local rule existed. Path syntax is a property of the
@@ -251,11 +248,9 @@ mod tests {
 
     /// The local rule is asked of the machine the path is *on*.
     ///
-    /// A pane, a git probe and the SCM panel all serve a remote workspace
-    /// with the same code, and the root they settle on goes back over the
-    /// wire as the cwd of the next `git` — `RemoteHost` sends
-    /// `to_string_lossy` of it, verbatim. A Windows client folding a Linux
-    /// box's `/home/u/src` would ask that box about `\home\u\src`.
+    /// A path that arrived from another machine is stored as it arrived.
+    /// A Windows client folding a Linux box's `/home/u/src` would ask about
+    /// `\home\u\src`.
     ///
     /// Ungated: on unix both arms are the identity anyway, and Windows is the
     /// only client where getting this wrong is visible.
@@ -286,7 +281,7 @@ mod tests {
 
     /// What `Path` already does for us, pinned so a later "improvement" here
     /// cannot quietly start folding things it must not. These are the cases
-    /// the #791 gate blamed for the SCM divergence; they were never the cause.
+    /// the #791 gate blamed for paths that compare unequal; they were never the cause.
     #[test]
     fn path_equality_already_forgives_case_slashes_and_a_trailing_separator() {
         if !cfg!(windows) {
