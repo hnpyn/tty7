@@ -75,9 +75,6 @@ pub fn translate_zh(key: L10nKey) -> Option<&'static str> {
         L10nKey::ComposerEffortTip => "推理强度  ·  点击切换",
         L10nKey::AppMenuMinimize => "最小化",
         L10nKey::AppMenuZoom => "缩放",
-        L10nKey::PaneRestoredScreenBanner => {
-            "已恢复的画面：下面是新的 shell，上面的内容都已不在运行"
-        }
         L10nKey::IntegrationNoticeBlocked => {
             "“{wrapper}”截获了此窗格的 shell 上报，内联补全和 Ctrl+R 菜单不可用。shell 自带的历史搜索仍可使用。"
         }

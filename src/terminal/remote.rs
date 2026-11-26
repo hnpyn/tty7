@@ -17,19 +17,16 @@ use crate::terminal::prompt_reflow::{PromptBreak, PromptMark};
 
 use std::collections::VecDeque;
 
-use crate::core::cli_agent::{AgentSessionState, AgentStatus, CLIAgent};
+use crate::core::cli_agent::{AgentSessionState, CLIAgent};
 use crate::core::config::CursorStyle as ConfigCursorStyle;
 use crate::core::osc::{Note, NoteBudget, OscTokenizer, TitleEffect, TitleLifetime};
-use crate::daemon::protocol::{
-    AuthPromptKind, ClientMsg, DaemonMsg, NativeSshSpec, RemoteContext, RemoteKind, RestoreFrom,
-    ShellSpec, SshPhase, WinSize,
-};
+use crate::daemon::protocol::{ClientMsg, DaemonMsg, RemoteContext, ShellSpec, WinSize};
 #[cfg(unix)]
 pub(crate) type Stream = std::os::unix::net::UnixStream;
 #[cfg(windows)]
 pub(crate) type Stream = std::net::TcpStream;
 use gpui::EntityId;
-use tty7_core::core::term_modes::{COLOR_SCHEME_UPDATES, Query, TerminalModes};
+use tty7_core::core::term_modes::{Query, TerminalModes};
 
 use super::size::TermSize;
 
@@ -107,23 +104,10 @@ struct ShellState {
     cycle: u64,
 }
 
-/// The pane's agent status as the client last heard it, plus how it heard it.
-///
-/// A reattach — the app restarting onto panes the daemon kept alive, or a
-/// dropped link coming back — has the daemon replay the pane's *stored* status
-/// as an ordinary `AgentStatus` frame ([`crate::daemon`]'s `replay_state`).
-/// Nothing on the wire distinguishes it from a live transition, and a client
-/// that reads it as one concludes that every restored agent finished its turn
-/// in the instant the window opened. `replayed` is that distinction, kept in
-/// the same lock as the value it describes so a reader can never observe the
-/// status without also learning where it came from.
+/// The pane's agent status as the client last heard it.
 #[derive(Default)]
 struct AgentSlot {
     state: Option<AgentSessionState>,
-    /// `state` arrived as an attach replay and no one has adopted it yet.
-    /// Cleared by the first taker — the view adopts it as a baseline rather
-    /// than as an edge.
-    replayed: bool,
 }
 
 struct ReaderSignals {
@@ -132,17 +116,11 @@ struct ReaderSignals {
     remote: Arc<Mutex<Option<RemoteContext>>>,
     agent: Arc<Mutex<Option<CLIAgent>>>,
     agent_session: Arc<Mutex<AgentSlot>>,
-    /// Whether this link still owes us the attach replay. The reader keeps it
-    /// as a plain local: a link's replay is a property of that link's stream
-    /// position, and nothing outside the reader thread ever needs to read it.
-    awaiting_replay: bool,
     exited: Arc<AtomicBool>,
     child_exited: Arc<AtomicBool>,
     zle_reading: Arc<AtomicBool>,
     shell_vi_mode: Arc<AtomicBool>,
     running_command: Arc<Mutex<String>>,
-    auth: Arc<Mutex<VecDeque<(u64, AuthPromptKind)>>>,
-    phase: Arc<Mutex<Option<SshPhase>>>,
     /// Kitty-graphics images the daemon lifted out of the stream (issue #213),
     /// anchored to the grid for the paint path to blit. Shared with the reader,
     /// which places/deletes them as `DaemonMsg::Image`/`DeleteImage` frames land.
@@ -150,7 +128,6 @@ struct ReaderSignals {
     clipboard_writes: Arc<Mutex<VecDeque<tty7_core::core::clipboard::ClipboardWrite>>>,
     osc_notes: OscNotes,
     clipboard_write_busy: Arc<AtomicBool>,
-    lease: Arc<Mutex<Option<String>>>,
     /// Whether this pane's pty is one a conhost renders into, and so whether
     /// the reader puts back the cursor a repaint parked. Decided per pane from
     /// its [`PtySource`], and shared rather than copied because the reader can
@@ -188,9 +165,11 @@ impl PtySource {
     /// pty at all; answering as if it were local costs nothing and keeps the
     /// match total.
     fn for_route(route: &PaneRoute) -> PtySource {
-        match route {
-            PaneRoute::Local | PaneRoute::Unroutable(_) if cfg!(windows) => PtySource::LocalConpty,
-            _ => PtySource::Raw,
+        let _ = route;
+        if cfg!(windows) {
+            PtySource::LocalConpty
+        } else {
+            PtySource::Raw
         }
     }
 }
@@ -199,23 +178,12 @@ impl PtySource {
 pub struct PaneWorkspace {
     pub workspace: crate::core::session::WorkspaceId,
     pub target: crate::core::session::RemoteTarget,
-    pub spec: Option<Box<NativeSshSpec>>,
     /// The name the workspace answers to — its own label, or its machine's
     /// when it has none. A pane keeps answering to this name when its link
     /// dies (#438 gave SSH panes their host here; without this, a workspace
     /// pane fell back to the bare app name and the tab read "tty7 —
     /// disconnected").
     pub label: Option<String>,
-    /// Whether the daemon serving this workspace's panes echoes a `Size` frame
-    /// when it applies a resize — read off the host's control hello by whoever
-    /// built this value, because this module may not ask the network itself.
-    /// `false` whenever the answer is unknown (link down, server too old to
-    /// advertise), which keeps the safe reflow-at-request behavior.
-    pub resize_echo: bool,
-    /// Whether that daemon knows size leases — a phone running the pane at
-    /// its own size — so this client can ask to hear about them. Read off the
-    /// same hello, `false` when unknown, like `resize_echo`.
-    pub size_lease: bool,
 }
 
 impl PaneWorkspace {
@@ -224,46 +192,20 @@ impl PaneWorkspace {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum PaneRoute {
     #[default]
     Local,
-    /// A workspace that used to be reached over SSH or WSL. ntty7 has no
-    /// remote pane; the flags stay so a layout test can still describe one.
-    Remote {
-        resize_echo: bool,
-        size_lease: bool,
-    },
-    Unroutable(String),
 }
 
 impl PaneRoute {
     pub fn for_workspace(workspace: Option<&PaneWorkspace>) -> PaneRoute {
-        let Some(ws) = workspace else {
-            return PaneRoute::Local;
-        };
-        use crate::core::session::RemoteTarget;
-        let routable = match &ws.target {
-            RemoteTarget::Wsl { .. } | RemoteTarget::LocalStdio { .. } => true,
-            RemoteTarget::Profile { .. }
-            | RemoteTarget::Alias { .. }
-            | RemoteTarget::Direct { .. } => ws.spec.is_some(),
-        };
-        if routable {
-            PaneRoute::Remote {
-                resize_echo: ws.resize_echo,
-                size_lease: ws.size_lease,
-            }
-        } else {
-            let name = ws.label.as_deref().unwrap_or("this workspace");
-            PaneRoute::Unroutable(format!(
-                "{name} has no SSH connection details, so its panes cannot be routed"
-            ))
-        }
+        let _ = workspace;
+        PaneRoute::Local
     }
 
     pub fn is_local(&self) -> bool {
-        matches!(self, PaneRoute::Local)
+        true
     }
 }
 
@@ -617,7 +559,6 @@ impl Downlink {
                 match msg {
                     ClientMsg::Input(bytes) => pane.write_input(&bytes),
                     ClientMsg::Resize(size) => pane.resize(size),
-                    _ => {}
                 }
             }
         }
@@ -676,10 +617,9 @@ impl Inbox {
 /// Bytes the output gate charged for this frame, including output appended into one buffer.
 fn queued_gate_len(msg: &DaemonMsg) -> usize {
     match msg {
-        DaemonMsg::Output(bytes)
-        | DaemonMsg::Snapshot(bytes)
-        | DaemonMsg::Image(bytes)
-        | DaemonMsg::ClipboardWrite(bytes) => bytes.len(),
+        DaemonMsg::Output(bytes) | DaemonMsg::Image(bytes) | DaemonMsg::ClipboardWrite(bytes) => {
+            bytes.len()
+        }
         _ => 0,
     }
 }
@@ -725,10 +665,6 @@ pub struct RemoteTerminal {
     pub exited: bool,
     size: TermSize,
     synced_size: bool,
-    /// This link reattached to a pane that was already running rather than
-    /// spawning a fresh one, so whatever it reports first — an agent in the
-    /// foreground included — predates this client.
-    reattached: bool,
     /// The `(cell_w, cell_h)` last sent to the daemon, in device pixels. Tracked
     /// alongside `size` so a display-scale change still reaches the child even
     /// when the grid dimensions are unchanged.
@@ -752,8 +688,6 @@ pub struct RemoteTerminal {
     /// client: the frame the daemon sends says a command runs, not which one.
     /// The close confirmation has to name what it is about to end.
     running_command: Arc<Mutex<String>>,
-    auth_prompts: Arc<Mutex<VecDeque<(u64, AuthPromptKind)>>>,
-    ssh_phase: Arc<Mutex<Option<SshPhase>>>,
     agent: Arc<Mutex<Option<CLIAgent>>>,
     agent_session: Arc<Mutex<AgentSlot>>,
     /// Kitty-graphics images placed on this pane's grid (issue #213).
@@ -767,13 +701,9 @@ pub struct RemoteTerminal {
     /// view's poll touches it.
     note_budget: Mutex<NoteBudget>,
     clipboard_write_busy: Arc<AtomicBool>,
-    /// Who runs this pane at their own size — a phone, by the name it paired
-    /// under — while the daemon says so.
-    #[cfg_attr(not(test), allow(dead_code))]
-    lease: Arc<Mutex<Option<String>>>,
     route: PaneRoute,
     /// Kept so the event channel stays open for the life of the pane.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[allow(dead_code)]
     proxy: EventProxy,
     reader_thread: Option<JoinHandle<()>>,
     /// Tells the *current* reader thread to bow out. Teardown must never wait
@@ -826,7 +756,6 @@ impl RemoteTerminal {
             cwd,
             shell,
             None,
-            None,
             true,
         )
     }
@@ -840,15 +769,8 @@ impl RemoteTerminal {
         cwd: Option<PathBuf>,
         shell: Option<ShellSpec>,
         owner: Option<String>,
-        restore: Option<RestoreFrom>,
         use_config_shell: bool,
     ) -> anyhow::Result<(Self, u64)> {
-        if let PaneRoute::Unroutable(reason) = route {
-            return Err(anyhow::anyhow!(reason.clone()));
-        }
-        if !route.is_local() {
-            return Err(anyhow::anyhow!("remote panes are not available"));
-        }
         Self::spawn_once(
             route,
             size,
@@ -857,7 +779,6 @@ impl RemoteTerminal {
             cwd,
             shell,
             owner,
-            restore,
             use_config_shell,
         )
     }
@@ -871,10 +792,8 @@ impl RemoteTerminal {
         cwd: Option<PathBuf>,
         shell: Option<ShellSpec>,
         owner: Option<String>,
-        restore: Option<RestoreFrom>,
         use_config_shell: bool,
     ) -> anyhow::Result<(Self, u64)> {
-        let _ = restore;
         let id = NEXT_PANE.fetch_add(1, Ordering::Relaxed);
         let win = win_size(size, cell_w, cell_h);
         let workspace = spawn_workspace(owner.as_deref(), route);
@@ -888,10 +807,9 @@ impl RemoteTerminal {
             shell,
             owner,
             workspace,
-            None,
             false,
             use_config_shell,
-            tty7_core::daemon::pane::PaneLink::Coalesced(tx),
+            tty7_core::daemon::pane::PaneLink::coalesced(tx),
             || {},
         )?;
         let drain = pane.gate();
@@ -907,7 +825,6 @@ impl RemoteTerminal {
             Some(drain),
             size,
             PtySource::for_route(route),
-            false,
             None,
             Some(hold),
         )?;
@@ -915,7 +832,6 @@ impl RemoteTerminal {
         term.pane_id = Some(id);
         term.route = route.clone();
         term.seed_cwd(cwd);
-        term.watch_leases();
         Ok((term, id))
     }
 
@@ -931,130 +847,6 @@ impl RemoteTerminal {
         if let Ok(mut guard) = self.cwd.lock() {
             guard.get_or_insert(cwd);
         }
-    }
-
-    pub fn attach_on(
-        _route: &PaneRoute,
-        _size: TermSize,
-        _cell_w: u16,
-        _cell_h: u16,
-        pane_id: u64,
-    ) -> anyhow::Result<Self> {
-        Err(anyhow::anyhow!(
-            "pane {pane_id} cannot be reattached; ntty7 keeps no daemon to resume it"
-        ))
-    }
-
-    #[cfg(test)]
-    pub fn adopt_relink(
-        &mut self,
-        stream: Stream,
-        buffered: Vec<u8>,
-        route: &PaneRoute,
-        size: TermSize,
-        cell_w: u16,
-        cell_h: u16,
-    ) -> anyhow::Result<()> {
-        self.stop_reader();
-        while self.events.try_recv().is_ok() {}
-        if let Ok(mut pending) = self.clipboard_writes.lock() {
-            pending.clear();
-        }
-        self.clipboard_write_busy.store(false, Ordering::Release);
-
-        let read_half = stream.try_clone()?;
-        let inbox = start_decoder(read_half, buffered);
-
-        // A relink keeps the view, and the view keeps the status it last saw
-        // before the link dropped. That is already a baseline, and the better
-        // one: if the agent finished its turn while the link was down, the
-        // daemon's replayed `Done` against the view's `Working` is exactly the
-        // edge the reader must be told about. So the relink's replay is read
-        // as a live report, and a cold-attach mark nobody took yet is dropped
-        // rather than left to swallow that edge.
-        if let Ok(mut guard) = self.agent_session.lock() {
-            guard.replayed = false;
-        }
-
-        self.exited_flag.store(false, Ordering::SeqCst);
-        self.exited = false;
-        {
-            use alacritty_terminal::vte::ansi::Handler as _;
-            let mut term = self.term.lock();
-            term.reset_state();
-        }
-        // The grid was just reset, so every image anchor now points nowhere.
-        // Drop them; the daemon does not replay out-of-band image frames, so a
-        // browser redraws on its next transmit (see issue #213's reattach note).
-        self.images.clear();
-
-        let quit = Arc::new(AtomicBool::new(false));
-        let reader = Self::spawn_reader(
-            self.term.clone(),
-            self.proxy.clone(),
-            Inbox::Mpsc(inbox),
-            None,
-            quit.clone(),
-            ReaderSignals {
-                cwd: self.cwd.clone(),
-                shell: self.shell_state.clone(),
-                remote: self.remote_context.clone(),
-                agent: self.agent.clone(),
-                agent_session: self.agent_session.clone(),
-                // The daemon does replay the stored status down this link, but
-                // the view already has a baseline from before the drop — see
-                // above.
-                awaiting_replay: false,
-                exited: self.exited_flag.clone(),
-                child_exited: self.child_exited.clone(),
-                zle_reading: self.zle_reading.clone(),
-                shell_vi_mode: self.shell_vi_mode.clone(),
-                running_command: self.running_command.clone(),
-                auth: self.auth_prompts.clone(),
-                phase: self.ssh_phase.clone(),
-                images: self.images.clone(),
-                clipboard_writes: self.clipboard_writes.clone(),
-                osc_notes: self.osc_notes.clone(),
-                clipboard_write_busy: self.clipboard_write_busy.clone(),
-                lease: self.lease.clone(),
-                // Deliberately the pane's existing answer rather than one
-                // rebuilt from `route`: the pty on the far side is the same pty
-                // it was before the link dropped, and only this value still
-                // remembers what a `RemoteContext` taught the old reader.
-                local_conpty: self.local_conpty.clone(),
-                color_scheme_updates: self.color_scheme_updates.clone(),
-            },
-        );
-        self.reader_thread = Some(reader);
-        self.reader_quit = quit;
-        // Installed after `reader_quit`, so the sender reports a refusal
-        // against the reader this link actually has. Assigning retires the old
-        // `LinkWriter` through its `Drop`, which is what closes the old socket.
-        self.link = Downlink::Frames(LinkWriter::new(stream, self.input_loss())?);
-        self.route = route.clone();
-        // The new link has told us nothing yet; the daemon repeats a lease
-        // that still stands when we ask again.
-        if let Ok(mut guard) = self.lease.lock() {
-            *guard = None;
-        }
-        self.watch_leases();
-        self.synced_size = false;
-        self.resize(size, cell_w, cell_h);
-        Ok(())
-    }
-
-    /// A pane the client *reattached* to rather than spawned — the shape the
-    /// app restores last session's tabs in, where the head of the stream is the
-    /// daemon replaying state the pane already had.
-    #[cfg(test)]
-    pub(super) fn from_stream_reattached(stream: Stream, size: TermSize) -> anyhow::Result<Self> {
-        Self::from_stream_parts(
-            stream,
-            size,
-            Vec::new(),
-            PtySource::for_route(&PaneRoute::Local),
-            true,
-        )
     }
 
     /// A pane on a pty of this machine's own — what the tests build, and what
@@ -1076,34 +868,19 @@ impl RemoteTerminal {
         buffered: Vec<u8>,
         pty: PtySource,
     ) -> anyhow::Result<Self> {
-        Self::from_stream_parts(stream, size, buffered, pty, false)
+        Self::from_stream_parts(stream, size, buffered, pty)
     }
 
-    /// `awaiting_replay` says this link is an attach rather than a spawn, and
-    /// so that the frames at the head of its stream describe a pane that was
-    /// already running — see [`AgentSlot`]. It has to be decided here rather
-    /// than set on the returned terminal: the reader starts inside this
-    /// function, and against a daemon that answers promptly the replay can be
-    /// parsed before the caller gets its value back.
     #[cfg(test)]
     fn from_stream_parts(
         stream: Stream,
         size: TermSize,
         buffered: Vec<u8>,
         pty: PtySource,
-        awaiting_replay: bool,
     ) -> anyhow::Result<Self> {
         let read_half = stream.try_clone()?;
         let inbox = start_decoder(read_half, buffered);
-        Self::assemble(
-            Inbox::Mpsc(inbox),
-            None,
-            size,
-            pty,
-            awaiting_replay,
-            Some(stream),
-            None,
-        )
+        Self::assemble(Inbox::Mpsc(inbox), None, size, pty, Some(stream), None)
     }
 
     fn assemble(
@@ -1111,7 +888,6 @@ impl RemoteTerminal {
         drain: Option<Arc<tty7_core::daemon::pane::OutputGate>>,
         size: TermSize,
         pty: PtySource,
-        awaiting_replay: bool,
         write_half: Option<Stream>,
         hold: Option<Arc<PaneHold>>,
     ) -> anyhow::Result<Self> {
@@ -1139,14 +915,10 @@ impl RemoteTerminal {
         let zle_reading = Arc::new(AtomicBool::new(false));
         let shell_vi_mode = Arc::new(AtomicBool::new(false));
         let running_command: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
-        let auth_prompts: Arc<Mutex<VecDeque<(u64, AuthPromptKind)>>> =
-            Arc::new(Mutex::new(VecDeque::new()));
-        let ssh_phase: Arc<Mutex<Option<SshPhase>>> = Arc::new(Mutex::new(None));
         let images = crate::terminal::images::ImageStore::new();
         let clipboard_writes = Arc::new(Mutex::new(VecDeque::new()));
         let osc_notes = OscNotes::default();
         let clipboard_write_busy = Arc::new(AtomicBool::new(false));
-        let lease = Arc::new(Mutex::new(None));
 
         let reader_quit = Arc::new(AtomicBool::new(false));
         let local_conpty = Arc::new(AtomicBool::new(pty == PtySource::LocalConpty));
@@ -1163,19 +935,15 @@ impl RemoteTerminal {
                 remote: remote_context.clone(),
                 agent: agent.clone(),
                 agent_session: agent_session.clone(),
-                awaiting_replay,
                 exited: exited_flag.clone(),
                 child_exited: child_exited.clone(),
                 zle_reading: zle_reading.clone(),
                 shell_vi_mode: shell_vi_mode.clone(),
                 running_command: running_command.clone(),
-                auth: auth_prompts.clone(),
-                phase: ssh_phase.clone(),
                 images: images.clone(),
                 clipboard_writes: clipboard_writes.clone(),
                 osc_notes: osc_notes.clone(),
                 clipboard_write_busy: clipboard_write_busy.clone(),
-                lease: lease.clone(),
                 local_conpty: local_conpty.clone(),
                 color_scheme_updates: color_scheme_updates.clone(),
             },
@@ -1199,7 +967,6 @@ impl RemoteTerminal {
             exited: false,
             size,
             synced_size: false,
-            reattached: awaiting_replay,
             synced_cell: (0, 0),
             resize_sent_at: None,
             link,
@@ -1211,8 +978,6 @@ impl RemoteTerminal {
             zle_reading,
             shell_vi_mode,
             running_command,
-            auth_prompts,
-            ssh_phase,
             agent,
             agent_session,
             images,
@@ -1220,7 +985,6 @@ impl RemoteTerminal {
             osc_notes,
             note_budget: Mutex::default(),
             clipboard_write_busy,
-            lease,
             route: PaneRoute::Local,
             proxy,
             reader_thread: Some(reader_thread),
@@ -1232,20 +996,7 @@ impl RemoteTerminal {
         })
     }
 
-    /// The signals the sender thread raises a refused frame through, bundled
-    /// for the `LinkWriter` about to be installed. Read after `reader_quit` has
-    /// been swapped, so a relink's new sender answers to the new reader.
-    #[cfg(test)]
-    fn input_loss(&self) -> InputLoss {
-        InputLoss::new(
-            self.reader_quit.clone(),
-            self.exited_flag.clone(),
-            self.proxy.clone(),
-        )
-    }
-
     pub fn detach_link(&mut self) {
-        self.link.send(ClientMsg::Detach);
         self.stop_reader();
         self.poll_exited();
     }
@@ -1289,23 +1040,18 @@ impl RemoteTerminal {
                     remote,
                     agent,
                     agent_session,
-                    awaiting_replay,
                     exited: exited_flag,
                     child_exited,
                     zle_reading,
                     shell_vi_mode,
                     running_command,
-                    auth,
-                    phase,
                     images,
                     clipboard_writes,
                     osc_notes,
                     clipboard_write_busy,
-                    lease,
                     local_conpty,
                     color_scheme_updates,
                 } = signals;
-                let mut awaiting_replay = awaiting_replay;
                 crate::core::threads::promote_to_user_interactive();
                 let mut processor: ansi::Processor = ansi::Processor::new();
                 let mut osc = OscNotifyScanner::default();
@@ -1318,10 +1064,6 @@ impl RemoteTerminal {
                 // never disagree about whether a title is still current.
                 let mut title_tok = OscTokenizer::new(&[b"0", b"2", b"133"]);
                 let mut title_life = TitleLifetime::default();
-                // No live `Output` frame yet: whatever arrives now is the
-                // daemon's replay (an attach or a relink), which it sends
-                // entirely as `Snapshot`s followed by the stored state.
-                let mut replaying_state = true;
                 let mut cursor_scan = ParkedCursorScanner::new();
                 let mut parked_cursor = ParkedCursorRepair::default();
                 // #837: the command marks, cut at exactly where they land so
@@ -1334,13 +1076,6 @@ impl RemoteTerminal {
                 // (`term_modes` restores it ahead of the ring).
                 let mut modes = TerminalModes::new();
                 color_scheme_updates.store(false, Ordering::Relaxed);
-                // Set by a replay, sent by the first frame after it: a replay
-                // is a modes Snapshot plus one per ring segment.
-                let mut report_scheme = false;
-                // Taken with the first `Output` of a batch and judged after
-                // that whole batch is folded, so a `?2031h` later in the same
-                // burst still gets the reply.
-                let mut scheme_with_batch = false;
                 let mut queued: VecDeque<DaemonMsg> = VecDeque::new();
                 // Kitty-graphics decode runs on its own thread with newest-frame
                 // coalescing (issue #213): inflating a full-window browser frame
@@ -1487,16 +1222,6 @@ impl RemoteTerminal {
                                         tr_adv_t += t0.elapsed() - waited;
                                     }
                                 }
-                                // After the in-stream replies. A `?2031h` later
-                                // in this burst still counts — the fold above
-                                // has already seen the whole batch — and the
-                                // report does not jump ahead of a query that
-                                // was asked earlier in it.
-                                if std::mem::take(&mut scheme_with_batch)
-                                    && modes.is_on(COLOR_SCHEME_UPDATES)
-                                {
-                                    proxy.send_event(super::color_scheme::query_reply());
-                                }
                                 if has_esc || !osc.is_ground() {
                                     if let Ok(mut notes) = osc_notes.lock() {
                                         osc.feed(&out_batch, &mut *notes);
@@ -1582,21 +1307,6 @@ impl RemoteTerminal {
                         let Some(msg) = queued.pop_front() else {
                             break;
                         };
-                        // Once per replay (a modes Snapshot, then one per
-                        // ring segment), at the first frame past the ring —
-                        // not when what was read runs out: an 8 MiB ring
-                        // takes many reads, and a read that ends between the
-                        // segment holding a dead program's `?2031h` and the
-                        // one holding the prompt that ended it would report
-                        // into the shell. A live Output reports once folded.
-                        if !matches!(
-                            msg,
-                            DaemonMsg::Size(_) | DaemonMsg::Snapshot(_) | DaemonMsg::Output(_)
-                        ) && std::mem::take(&mut report_scheme)
-                            && modes.is_on(COLOR_SCHEME_UPDATES)
-                        {
-                            proxy.send_event(super::color_scheme::query_reply());
-                        }
                         match msg {
                             // Geometry, applied at this exact stream position.
                             // During replay each ring segment is preceded by
@@ -1608,10 +1318,8 @@ impl RemoteTerminal {
                             DaemonMsg::Size(ws) => {
                                 flush_batch!();
                                 // A live echo lands just before the shell's
-                                // SIGWINCH redraw; a replayed Size heads old
-                                // bytes that nothing is going to repaint.
-                                let shell_redraws = !replaying_state
-                                    && !local_conpty.load(Ordering::Relaxed)
+                                // SIGWINCH redraw.
+                                let shell_redraws = !local_conpty.load(Ordering::Relaxed)
                                     && shell.lock().is_ok_and(|s| s.active && s.at_prompt);
                                 {
                                     let mut term = term.lock();
@@ -1626,91 +1334,7 @@ impl RemoteTerminal {
                                 }
                                 proxy.send_event(AlacEvent::Wakeup);
                             }
-                            DaemonMsg::Snapshot(bytes) => {
-                                flush_batch!();
-                                cursor_scan.reset();
-                                parked_cursor.reset();
-                                proxy.replaying.store(true, Ordering::Relaxed);
-                                // The replay carries the command marks too, so
-                                // a pane reattached after `nvim` exited in it
-                                // comes back with the prompt's cursor.
-                                let mut cuts: Vec<(usize, ReaderCut)> = Vec::new();
-                                command_cuts(&mut command_tok, &bytes, &mut cuts);
-                                // Each prompt mark in it also clears the kitty
-                                // keyboard stacks, at the mark itself. Live,
-                                // that happens on the `Prompt` report that
-                                // follows it; a replay carries one report for
-                                // the whole ring, so flags a dead program left
-                                // before an earlier prompt would otherwise come
-                                // back to whatever runs in the pane now (#1155).
-                                // The daemon's `TerminalModes` clears them at
-                                // the same marks, so the prelude ahead of the
-                                // ring agrees.
-                                let fed =
-                                    feed_grid(&term, &mut processor, &bytes, cuts, &quit, |term, cut| {
-                                        match cut {
-                                            ReaderCut::Command(mark) => {
-                                                if mark == CommandMark::Finished {
-                                                    term.reset_keyboard_modes();
-                                                }
-                                                command_cursor.apply(term, mark)
-                                            }
-                                            ReaderCut::Prompt(mark) => {
-                                                term.reset_keyboard_modes();
-                                                prompt_break.apply(term, mark)
-                                            }
-                                            ReaderCut::Parked(_) | ReaderCut::Reply(_) => {}
-                                        }
-                                    });
-                                if fed.is_none() {
-                                    return;
-                                }
-                                if processor.sync_timeout().sync_timeout().is_some() {
-                                    let mut term = term.lock();
-                                    if quit.load(Ordering::SeqCst) {
-                                        return;
-                                    }
-                                    processor.stop_sync(&mut *term);
-                                }
-                                mode_tok.feed(&bytes, |payload| {
-                                    if let Some(mode) = payload.strip_prefix(b"133;V;") {
-                                        shell_vi_mode.store(
-                                            mode.first() == Some(&b'1'),
-                                            Ordering::Relaxed,
-                                        );
-                                    }
-                                });
-                                proxy.replaying.store(false, Ordering::Relaxed);
-                                // A replayed `?996n` was answered long ago,
-                                // but the theme may have flipped while the pane
-                                // was detached, so say what it is now.
-                                super::color_scheme::fold(&mut modes, &bytes, &color_scheme_updates);
-                                modes.take_queries();
-                                report_scheme = true;
-                                // The replay carries the pane's recent marks,
-                                // so reading it is what lets a reattached
-                                // window know whether the title it just
-                                // adopted belongs to anything still running.
-                                if chunk_retires_the_title!(&bytes) {
-                                    proxy.send_event(AlacEvent::ResetTitle);
-                                }
-                                proxy.send_event(AlacEvent::Wakeup);
-                            }
                             DaemonMsg::Output(bytes) => {
-                                // Live output only ever follows the whole
-                                // replay (the daemon sends the stored status
-                                // last, and the stream keeps that order), so
-                                // the first frame here ends the window in which
-                                // a status can still be a replayed one. Without
-                                // this, a pane that had no agent session to
-                                // replay would keep the window open until some
-                                // agent it ran *later* reported for the first
-                                // time, and that report would be discounted.
-                                awaiting_replay = false;
-                                replaying_state = false;
-                                if std::mem::take(&mut report_scheme) {
-                                    scheme_with_batch = true;
-                                }
                                 out_batch.extend_from_slice(&bytes);
                                 inbox.recycle(bytes);
                                 tr_frames += 1;
@@ -1820,14 +1444,6 @@ impl RemoteTerminal {
                                 last_exit,
                             } => {
                                 flush_batch!();
-                                // The replay says a command owns the pane
-                                // right now. If the ring it replayed had
-                                // already rolled past that command's `C`, the
-                                // title just adopted from it is the command's
-                                // and its `D` has to retire it (#889).
-                                if replaying_state && active && !at_prompt {
-                                    title_life.joined_mid_command();
-                                }
                                 if let Ok(mut guard) = shell.lock() {
                                     *guard = ShellState {
                                         active,
@@ -1866,44 +1482,13 @@ impl RemoteTerminal {
                             }
                             DaemonMsg::RemoteContext(ctx) => {
                                 flush_batch!();
+                                // The directory belonged to the previous side of the hop.
                                 if let Ok(mut guard) = cwd.lock() {
                                     *guard = None;
-                                }
-                                // A native-SSH pane's pty is the far host's,
-                                // however local the daemon that dialled it: the
-                                // daemon bridges an ssh channel straight through
-                                // and opens no ConPTY of its own. The route
-                                // cannot say so — such a pane is spawned and
-                                // attached through the local daemon like any
-                                // other — so this frame is where a client that
-                                // reopened onto an existing one finds out. A
-                                // one-way latch: the far end of an ssh channel
-                                // never becomes a local pty later, while an
-                                // `ssh` *command* (RemoteKind::Ssh) is a program
-                                // inside a ConPTY and keeps the repair.
-                                if ctx
-                                    .as_ref()
-                                    .is_some_and(|c| c.kind == RemoteKind::NativeSsh)
-                                {
-                                    local_conpty.store(false, Ordering::Relaxed);
                                 }
                                 if let Ok(mut guard) = remote.lock() {
                                     *guard = ctx;
                                 }
-                            }
-                            DaemonMsg::AuthPrompt { request_id, prompt } => {
-                                flush_batch!();
-                                if let Ok(mut guard) = auth.lock() {
-                                    guard.push_back((request_id, prompt));
-                                }
-                                proxy.send_event(AlacEvent::Wakeup);
-                            }
-                            DaemonMsg::SshStatus { phase: p } => {
-                                flush_batch!();
-                                if let Ok(mut guard) = phase.lock() {
-                                    *guard = Some(p);
-                                }
-                                proxy.send_event(AlacEvent::Wakeup);
                             }
                             DaemonMsg::Agent(a) => {
                                 flush_batch!();
@@ -1915,16 +1500,6 @@ impl RemoteTerminal {
                                 flush_batch!();
                                 if let Ok(mut guard) = agent_session.lock() {
                                     guard.state = state;
-                                    // The first such frame on an attached link
-                                    // is the pane's stored status being
-                                    // replayed, not a turn changing state now.
-                                    guard.replayed = std::mem::take(&mut awaiting_replay);
-                                }
-                                proxy.send_event(AlacEvent::Wakeup);
-                            }
-                            DaemonMsg::Lease(by) => {
-                                if let Ok(mut guard) = lease.lock() {
-                                    *guard = by;
                                 }
                                 proxy.send_event(AlacEvent::Wakeup);
                             }
@@ -1935,7 +1510,6 @@ impl RemoteTerminal {
                                 teardown(None);
                                 break 'main;
                             }
-                            _ => {}
                         }
                     }
                     flush_batch!();
@@ -1987,7 +1561,7 @@ impl RemoteTerminal {
                             if let Some(tr0) = tr0 {
                                 tr_read_t += tr0.elapsed();
                                 tr_reads += 1;
-                                if let DaemonMsg::Output(bytes) | DaemonMsg::Snapshot(bytes) = &msg {
+                                if let DaemonMsg::Output(bytes) = &msg {
                                     tr_bytes += bytes.len() as u64;
                                 }
                             }
@@ -1995,8 +1569,7 @@ impl RemoteTerminal {
                             queued.push_back(msg);
                             while let Ok(more) = inbox.try_recv() {
                                 if tr0.is_some()
-                                    && let DaemonMsg::Output(bytes) | DaemonMsg::Snapshot(bytes) =
-                                        &more
+                                    && let DaemonMsg::Output(bytes) = &more
                                 {
                                     tr_bytes += bytes.len() as u64;
                                 }
@@ -2066,32 +1639,10 @@ impl RemoteTerminal {
     /// echo, an unroutable route reaches no daemon at all, and deferral must
     /// not hang the grid on an echo nobody promised.
     fn resize_echoed(&self) -> bool {
-        if self.direct {
-            return true;
-        }
-        match &self.route {
-            PaneRoute::Remote { resize_echo, .. } => *resize_echo,
-            PaneRoute::Local | PaneRoute::Unroutable(_) => false,
-        }
-    }
-
-    /// Whether the daemon behind this pane knows size leases, asked the way
-    /// [`Self::resize_echoed`] asks: never over the network from here.
-    fn leases_supported(&self) -> bool {
-        match &self.route {
-            PaneRoute::Remote { size_lease, .. } => *size_lease,
-            PaneRoute::Local | PaneRoute::Unroutable(_) => false,
-        }
-    }
-
-    /// Asks to be told when a phone runs this pane at its own size. Only
-    /// where the daemon knows leases: an older one drops a link that sends it.
-    fn watch_leases(&self) {
-        if self.leases_supported() {
-            self.link.send(ClientMsg::Lease(
-                crate::daemon::protocol::LeaseRequest::Watch,
-            ));
-        }
+        // The pane's child is in this process and echoes `DaemonMsg::Size`
+        // when the resize lands. A socket fixture used by tests does not,
+        // unless the test says it is playing that daemon (`direct`).
+        self.direct
     }
 
     pub fn resize(&mut self, size: TermSize, cell_w: u16, cell_h: u16) {
@@ -2151,11 +1702,6 @@ impl RemoteTerminal {
 
     pub fn remote_context(&self) -> Option<RemoteContext> {
         self.remote_context.lock().ok().and_then(|g| g.clone())
-    }
-
-    /// See the field: an attach to a running pane, not a fresh spawn.
-    pub fn reattached(&self) -> bool {
-        self.reattached
     }
 
     pub fn at_prompt(&self) -> bool {
@@ -2231,21 +1777,6 @@ impl RemoteTerminal {
         self.agent_session.lock().ok().and_then(|g| g.state.clone())
     }
 
-    /// The status the daemon replayed when this link attached, handed out once.
-    ///
-    /// `Some(status)` means what [`Self::agent_session`] reports right now is
-    /// stored state from before this client existed — the caller should take it
-    /// as its starting point, not as something that just happened. Answering
-    /// only once is what keeps the very next live transition an edge again.
-    pub fn take_replayed_agent_status(&self) -> Option<Option<AgentStatus>> {
-        let mut guard = self.agent_session.lock().ok()?;
-        if !guard.replayed {
-            return None;
-        }
-        guard.replayed = false;
-        Some(guard.state.as_ref().map(|s| s.status))
-    }
-
     pub fn zle_reading(&self) -> bool {
         self.zle_reading.load(Ordering::Relaxed)
     }
@@ -2303,25 +1834,6 @@ impl RemoteTerminal {
             pane.kill();
         }
     }
-
-    #[cfg(test)]
-    pub fn take_auth_prompt(&self) -> Option<(u64, AuthPromptKind)> {
-        self.auth_prompts
-            .lock()
-            .ok()
-            .and_then(|mut q| q.pop_front())
-    }
-
-    pub fn has_pending_auth(&self) -> bool {
-        self.auth_prompts
-            .lock()
-            .map(|q| !q.is_empty())
-            .unwrap_or(false)
-    }
-
-    pub fn ssh_phase(&self) -> Option<SshPhase> {
-        self.ssh_phase.lock().ok().and_then(|g| g.clone())
-    }
 }
 
 #[cfg(test)]
@@ -2334,174 +1846,6 @@ fn daemon_not_listening(err: &anyhow::Error) -> bool {
             )
         })
     })
-}
-
-/// How long an `Attach` may stay silent before it is called unanswered.
-///
-/// Only a silent connection ever pays this: a dead pane answers `Error` at
-/// once and a live one answers `Size` at once, so the budget is not a cost in
-/// the common case. What bounds it is the caller — a local restore attaches
-/// synchronously on the UI thread, one pane after another, so N silent panes
-/// hold the window still for N times this. What argues for more is the other
-/// side of the same silence: a daemon merely slow to serve — an execve handoff
-/// keeps the listener and its backlog across the exec, and a fresh daemon is
-/// adopting panes and seeding ids before it can take an `Attach` — would have
-/// served this connection a moment later, and calling it unanswered spawns a
-/// fresh pane over a live one, carries the live pane's history onto it and
-/// starts an agent resume against a session the old process still holds. The
-/// [`AttachUnanswered`] verdict is confirmed against that case in `attach_on`
-/// rather than by waiting longer here.
-#[cfg(test)]
-fn attach_reply_wait(route: &PaneRoute) -> std::time::Duration {
-    match route.is_local() {
-        true => std::time::Duration::from_secs(2),
-        false => std::time::Duration::from_secs(15),
-    }
-}
-
-/// An `Attach` that produced no bytes within its wait — nobody served the
-/// connection. Distinct from a refusal (`Error` frame) and from a hangup so
-/// the caller can say the true thing: the pane may well still exist.
-#[derive(Debug)]
-struct AttachUnanswered {
-    pane_id: u64,
-    wait: std::time::Duration,
-}
-
-impl std::fmt::Display for AttachUnanswered {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "the daemon did not answer Attach for pane {} within {:?} (an attached pane replays \
-             its screen at once, so nobody is serving this connection)",
-            self.pane_id, self.wait
-        )
-    }
-}
-
-impl std::error::Error for AttachUnanswered {}
-
-/// Whether `err` is an `Attach` that went unanswered, as opposed to refused or
-/// hung up on. The pane behind an unanswered attach may still be alive.
-pub fn attach_unanswered(err: &anyhow::Error) -> bool {
-    err.chain()
-        .any(|cause| cause.downcast_ref::<AttachUnanswered>().is_some())
-}
-
-/// An `Attach` the daemon answered with an `Error` frame — it heard us and
-/// said no, which for a relink means the pane is gone on its machine. Typed so
-/// a retry loop can tell this apart from the failures worth retrying: silence
-/// and transport trouble pass, a refusal repeats identically forever.
-#[derive(Debug)]
-struct AttachRefused {
-    message: String,
-}
-
-impl std::fmt::Display for AttachRefused {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "daemon refused Attach: {}", self.message)
-    }
-}
-
-impl std::error::Error for AttachRefused {}
-
-/// Whether `err` is an `Attach` the daemon explicitly refused. Retrying one of
-/// these can only produce the same refusal.
-pub fn attach_refused(err: &anyhow::Error) -> bool {
-    err.chain()
-        .any(|cause| cause.downcast_ref::<AttachRefused>().is_some())
-}
-
-/// Reads far enough into the daemon's answer to an `Attach` to classify it, and
-/// hands back every byte read so the reader thread loses none of the replay.
-///
-/// Silence is a verdict, not a quiet pane. A daemon that attached replays the
-/// pane's ring before it reads a byte of our input, and the ring always holds
-/// a segment, so the first frame on a good attach is a `Size` — a quiet pane
-/// still sends that. An `Attach` that produced nothing within `wait` is one
-/// nobody is serving: a daemon still mid-restart, a socket held open by a
-/// process that will never read it. Taken for success it gave the window a
-/// pane drawn as restored whose every keystroke went into that socket — no
-/// fresh shell, no restored-screen banner, no agent resume, and Ctrl-C did
-/// nothing (#673). Taken for the failure it is, the caller spawns fresh and
-/// asks for the old screen back.
-#[cfg(test)]
-fn attach_reply_prefix(
-    stream: &mut Stream,
-    pane_id: u64,
-    wait: std::time::Duration,
-) -> anyhow::Result<Vec<u8>> {
-    use std::io::Read as _;
-
-    let _ = stream.set_read_timeout(Some(wait));
-    let mut buffered: Vec<u8> = Vec::new();
-    let mut scratch = [0u8; 4096];
-    let mut kind = None;
-    while kind.is_none() {
-        match stream.read(&mut scratch) {
-            Ok(0) => {
-                let _ = stream.set_read_timeout(None);
-                return Err(anyhow::anyhow!(
-                    "the daemon closed the connection without answering Attach for pane {pane_id}"
-                ));
-            }
-            Ok(n) => buffered.extend_from_slice(&scratch[..n]),
-            Err(e) if would_block(&e) => break,
-            Err(e) => {
-                let _ = stream.set_read_timeout(None);
-                return Err(anyhow::Error::new(e).context(format!(
-                    "reading the daemon's answer to Attach for pane {pane_id}"
-                )));
-            }
-        }
-        kind = crate::daemon::protocol::peek_frame_kind(&buffered);
-    }
-    let _ = stream.set_read_timeout(None);
-    if buffered.is_empty() {
-        return Err(anyhow::Error::new(AttachUnanswered { pane_id, wait }));
-    }
-    if !kind.is_some_and(crate::daemon::protocol::is_error_kind) {
-        return Ok(buffered);
-    }
-    let message = read_error_frame(stream, &mut buffered, wait)
-        .unwrap_or_else(|| format!("no such pane {pane_id}"));
-    Err(anyhow::Error::new(AttachRefused { message }))
-}
-
-#[cfg(test)]
-fn read_error_frame(
-    stream: &mut Stream,
-    buffered: &mut Vec<u8>,
-    wait: std::time::Duration,
-) -> Option<String> {
-    use std::io::Read as _;
-
-    let _ = stream.set_read_timeout(Some(wait));
-    let mut scratch = [0u8; 1024];
-    let message = loop {
-        match crate::daemon::protocol::take_frame(buffered) {
-            Ok(Some(frame)) => match DaemonMsg::from_frame(frame.0, frame.1) {
-                Ok(DaemonMsg::Error(message)) => break Some(message),
-                _ => break None,
-            },
-            Ok(None) => match stream.read(&mut scratch) {
-                Ok(0) => break None,
-                Ok(n) => buffered.extend_from_slice(&scratch[..n]),
-                Err(_) => break None,
-            },
-            Err(_) => break None,
-        }
-    };
-    let _ = stream.set_read_timeout(None);
-    message
-}
-
-#[cfg(test)]
-fn would_block(err: &std::io::Error) -> bool {
-    matches!(
-        err.kind(),
-        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-    )
 }
 
 #[cfg(test)]
@@ -2528,8 +1872,6 @@ impl Drop for RemoteTerminal {
                     .unwrap_or_else(|e| e.into_inner())
                     .remove(&id);
             }
-        } else {
-            self.link.send(ClientMsg::Detach);
         }
         self.stop_reader();
     }
@@ -3225,14 +2567,6 @@ fn parse_osc_notification(
     Some((title, body))
 }
 
-#[cfg(test)]
-fn connect_routed(route: &PaneRoute) -> anyhow::Result<Stream> {
-    if let PaneRoute::Unroutable(reason) = route {
-        return Err(anyhow::anyhow!("{reason}"));
-    }
-    Err(anyhow::anyhow!("there is no daemon socket"))
-}
-
 fn terminal_config_from_user(user_config: &crate::core::config::Config) -> Config {
     Config {
         scrolling_history: user_config.scrollback_limit,
@@ -3597,15 +2931,6 @@ mod replay_tests {
         }
     }
 
-    fn ws(cols: u16, rows: u16) -> WinSize {
-        WinSize {
-            cols,
-            rows,
-            cell_w: 8,
-            cell_h: 17,
-        }
-    }
-
     /// Everything the grid holds, scrollback included, one row per line.
     fn all_text(term: &RemoteTerminal) -> String {
         use alacritty_terminal::grid::Dimensions as _;
@@ -3615,28 +2940,6 @@ mod replay_tests {
         let mut out = String::new();
         let top = -(grid.history_size() as i32);
         for line in top..grid.screen_lines() as i32 {
-            let row = &grid[Line(line)];
-            let mut text = String::new();
-            for col in 0..grid.columns() {
-                text.push(row[Column(col)].c);
-            }
-            let text = text.trim_end();
-            if !text.is_empty() {
-                out.push_str(text);
-                out.push('\n');
-            }
-        }
-        out
-    }
-
-    /// The visible screen alone.
-    fn screen_text(term: &RemoteTerminal) -> String {
-        use alacritty_terminal::grid::Dimensions as _;
-        use alacritty_terminal::index::{Column, Line};
-        let t = term.term.lock();
-        let grid = t.grid();
-        let mut out = String::new();
-        for line in 0..grid.screen_lines() as i32 {
             let row = &grid[Line(line)];
             let mut text = String::new();
             for col in 0..grid.columns() {
@@ -3672,276 +2975,6 @@ mod replay_tests {
         all_text(term)
     }
 
-    /// The shape a re-attach takes: the client's grid is born at the hardcoded
-    /// attach size, and the daemon replays every ring segment at the geometry
-    /// it was recorded at.
-    #[test]
-    fn every_replayed_segment_reaches_the_grid() {
-        crate::core::config::pin_test_config_dir();
-        let (client_side, mut daemon) = socket_pair();
-        let term = RemoteTerminal::from_stream(client_side, TermSize::new(80, 24)).unwrap();
-
-        DaemonMsg::Size(ws(80, 24)).encode(&mut daemon).unwrap();
-        DaemonMsg::Snapshot(b"BIRTH-BANNER\r\n".to_vec())
-            .encode(&mut daemon)
-            .unwrap();
-        DaemonMsg::Size(ws(120, 40)).encode(&mut daemon).unwrap();
-        DaemonMsg::Snapshot(b"SECOND-SEGMENT\r\n".to_vec())
-            .encode(&mut daemon)
-            .unwrap();
-        DaemonMsg::Size(ws(120, 40)).encode(&mut daemon).unwrap();
-        DaemonMsg::Snapshot(b"THIRD-SEGMENT\r\n".to_vec())
-            .encode(&mut daemon)
-            .unwrap();
-
-        let text = settled(&term, &["BIRTH-BANNER", "SECOND-SEGMENT", "THIRD-SEGMENT"]);
-        assert!(text.contains("BIRTH-BANNER"), "grid held:\n{text}");
-        assert!(text.contains("SECOND-SEGMENT"), "grid held:\n{text}");
-        assert!(text.contains("THIRD-SEGMENT"), "grid held:\n{text}");
-        // Each segment's geometry too, or this would pass on a replay that
-        // dropped every `Size`. The unix-gated
-        // `segmented_ring_replay_reproduces_live_rendering` asserts that half
-        // already; nothing did on the platforms this module exists for.
-        assert_eq!(
-            columns(&term),
-            120,
-            "the geometry each segment was recorded at never reached the grid, \
-             so it is still at the attach size"
-        );
-        drop(daemon);
-    }
-
-    /// A real pane's ring is megabytes; one `Snapshot` frame is far larger than
-    /// the reader's 256 KiB read buffer, so the frame is assembled across many
-    /// reads — several of which time out at `QUIT_POLL` while the sender is
-    /// still pushing.
-    #[test]
-    fn a_snapshot_larger_than_one_read_still_lands_whole() {
-        crate::core::config::pin_test_config_dir();
-        let (client_side, daemon) = socket_pair();
-        let term = RemoteTerminal::from_stream(client_side, TermSize::new(80, 24)).unwrap();
-
-        let mut bulk = Vec::new();
-        bulk.extend_from_slice(b"HEAD-OF-THE-RING\r\n");
-        for i in 0..40_000 {
-            bulk.extend_from_slice(format!("line {i} of the pane's history\r\n").as_bytes());
-        }
-        bulk.extend_from_slice(b"TAIL-OF-THE-RING\r\n");
-
-        let feeder = std::thread::spawn(move || {
-            let mut daemon = daemon;
-            DaemonMsg::Size(ws(120, 40)).encode(&mut daemon).unwrap();
-            DaemonMsg::Snapshot(bulk).encode(&mut daemon).unwrap();
-            DaemonMsg::Size(ws(120, 40)).encode(&mut daemon).unwrap();
-            DaemonMsg::Snapshot(b"AFTER-THE-BULK\r\n".to_vec())
-                .encode(&mut daemon)
-                .unwrap();
-            daemon
-        });
-
-        let text = settled(&term, &["AFTER-THE-BULK"]);
-        assert!(
-            text.contains("AFTER-THE-BULK"),
-            "the frame after a multi-megabyte snapshot never arrived; grid tail:\n{}",
-            screen_text(&term)
-        );
-        assert!(
-            text.contains("TAIL-OF-THE-RING"),
-            "the snapshot itself was truncated"
-        );
-        drop(feeder.join().unwrap());
-    }
-
-    /// The view resizes to its real geometry the first time it paints, which
-    /// happens while the replay is still arriving. Against a resize-echoing
-    /// daemon the grid must not reflow when the request goes out — only when
-    /// the daemon echoes the `Size` back, which is the stream position where
-    /// the bytes stop being old-width — and neither step may cost the
-    /// replayed screen.
-    ///
-    /// The two geometries are deliberately different: at identical dimensions
-    /// a reflow and a deferred reflow look the same, so the invariant would be
-    /// unobservable.
-    #[test]
-    fn a_resize_racing_the_replay_keeps_the_replayed_screen() {
-        crate::core::config::pin_test_config_dir();
-        let (client_side, mut daemon) = socket_pair();
-        let mut term = RemoteTerminal::from_stream(client_side, TermSize::new(80, 24)).unwrap();
-        term.route = echoing_route();
-
-        DaemonMsg::Size(ws(120, 40)).encode(&mut daemon).unwrap();
-        DaemonMsg::Snapshot(b"REPLAYED-SCREEN\r\n".to_vec())
-            .encode(&mut daemon)
-            .unwrap();
-        let text = settled(&term, &["REPLAYED-SCREEN"]);
-        assert!(text.contains("REPLAYED-SCREEN"), "grid held:\n{text}");
-
-        assert_eq!(columns(&term), 120, "the replay set the grid's geometry");
-
-        // First paint: the pane is 100x30 on screen, not the 120x40 the ring
-        // was recorded at. The request goes down the link and the grid stays
-        // where the replay left it.
-        term.resize(TermSize::new(100, 30), 8, 17);
-        assert_eq!(
-            columns(&term),
-            120,
-            "the grid reflowed at request time instead of waiting for the echo"
-        );
-        let _ = daemon.set_read_timeout(Some(std::time::Duration::from_secs(5)));
-        match ClientMsg::read(&mut daemon) {
-            Ok(ClientMsg::Resize(size)) => assert_eq!((size.cols, size.rows), (100, 30)),
-            other => panic!("the resize never reached the daemon: {other:?}"),
-        }
-
-        // The echo is the stream position the reflow belongs at.
-        DaemonMsg::Size(ws(100, 30)).encode(&mut daemon).unwrap();
-        for _ in 0..600 {
-            if columns(&term) == 100 {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        let text = all_text(&term);
-        assert_eq!(columns(&term), 100, "the echo never reflowed the grid");
-        assert!(
-            text.contains("REPLAYED-SCREEN"),
-            "the first paint's resize cost the replay; grid held:\n{text}"
-        );
-        drop(daemon);
-    }
-
-    /// The attach handshake reads off the same socket the reader will, far
-    /// enough to tell an `Error` frame from a replay, and hands what it read
-    /// on as the reader's starting buffer. A whole replay can already be
-    /// sitting in the socket when it looks, so the prefix it takes is several
-    /// frames wide and the split lands mid-frame — every byte of it has to
-    /// reach the grid.
-    #[test]
-    fn the_attach_handshakes_prefix_carries_the_replay_it_swallowed() {
-        crate::core::config::pin_test_config_dir();
-        let (mut client_side, mut daemon) = socket_pair();
-
-        // The whole replay before the client looks: this is the daemon that
-        // answered instantly, which is the daemon a local attach meets.
-        DaemonMsg::Size(ws(80, 24)).encode(&mut daemon).unwrap();
-        DaemonMsg::Snapshot(b"BIRTH-BANNER\r\n".to_vec())
-            .encode(&mut daemon)
-            .unwrap();
-        DaemonMsg::Size(ws(120, 40)).encode(&mut daemon).unwrap();
-        let mut bulk = Vec::new();
-        for i in 0..400 {
-            bulk.extend_from_slice(format!("scrollback row {i}\r\n").as_bytes());
-        }
-        bulk.extend_from_slice(b"LAST-ROW-OF-THE-RING\r\n");
-        DaemonMsg::Snapshot(bulk).encode(&mut daemon).unwrap();
-
-        let buffered =
-            attach_reply_prefix(&mut client_side, 1, std::time::Duration::from_secs(2)).unwrap();
-        assert!(
-            !buffered.is_empty(),
-            "the handshake read nothing, so it proves nothing"
-        );
-        let term = RemoteTerminal::from_stream_with(
-            client_side,
-            TermSize::new(80, 24),
-            buffered,
-            PtySource::Raw,
-        )
-        .unwrap();
-
-        let text = settled(&term, &["BIRTH-BANNER", "LAST-ROW-OF-THE-RING"]);
-        assert!(text.contains("BIRTH-BANNER"), "grid held:\n{text}");
-        assert!(
-            text.contains("LAST-ROW-OF-THE-RING"),
-            "the replay the handshake swallowed never reached the grid"
-        );
-        drop(daemon);
-    }
-
-    /// Issue #711: what a prompt report costs a replay that ended inside the
-    /// alternate screen.
-    ///
-    /// A re-attach replays the pane's ring and then the pane's *state*, and
-    /// the state ends with the shell's prompt status. `active && at_prompt`
-    /// makes the reader scrub the TUI modes it finds in the grid, alternate
-    /// screen first — see `prompt_report_scrubs_stale_tui_modes`, which is the
-    /// case that is meant to reach it: a program that died without its
-    /// `?1049l` leaves the grid stranded on a screen nothing owns, and the
-    /// shell's next prompt is what proves it stale.
-    ///
-    /// On a replay the alternate screen the scrub finds is the one the ring
-    /// just rebuilt, and `?1049l` does not undo it — it swaps it away. The
-    /// grid is left holding the primary screen underneath: the banner and the
-    /// command line the pane was born with, which is exactly what #711's
-    /// reporter photographed. The client cannot tell the two apart from the
-    /// frame, so the daemon decides — it declines to claim a prompt while a
-    /// foreground command owns the pty (`daemon::pane::replayed_at_prompt`).
-    /// Both halves of that contract are pinned here, from the side that pays
-    /// for it.
-    #[test]
-    fn a_replayed_prompt_report_decides_whether_the_alternate_screen_survives() {
-        crate::core::config::pin_test_config_dir();
-
-        // A re-attach, as the daemon writes one: the shell's banner on the
-        // primary screen, the agent's alternate screen drawn over it, then the
-        // pane's stored state. The trailing `Output` is a barrier — frames are
-        // applied in order, so a grid that holds it has already been through
-        // the prompt report, and neither half can pass on a race.
-        let replayed_pane = |at_prompt: bool| {
-            let (client_side, mut daemon) = socket_pair();
-            let term = RemoteTerminal::from_stream(client_side, TermSize::new(80, 24)).unwrap();
-            DaemonMsg::Size(ws(80, 24)).encode(&mut daemon).unwrap();
-            DaemonMsg::Snapshot(
-                b"BIRTH-BANNER\r\nMac:Accounts joe$ claude --resume --fork-session\r\n".to_vec(),
-            )
-            .encode(&mut daemon)
-            .unwrap();
-            DaemonMsg::Snapshot(b"\x1b[?1049h\x1b[2J\x1b[HAGENT-SCREEN\r\n".to_vec())
-                .encode(&mut daemon)
-                .unwrap();
-            DaemonMsg::Prompt {
-                active: true,
-                at_prompt,
-                last_exit: Some(0),
-            }
-            .encode(&mut daemon)
-            .unwrap();
-            DaemonMsg::Output(b"REPORT-APPLIED\r\n".to_vec())
-                .encode(&mut daemon)
-                .unwrap();
-            let text = settled(&term, &["REPORT-APPLIED"]);
-            drop(daemon);
-            text
-        };
-
-        // A program owns the pane, so the replay reports no prompt and the
-        // screen the ring rebuilt is the screen the pane shows.
-        let text = replayed_pane(false);
-        assert!(
-            text.contains("REPORT-APPLIED"),
-            "the barrier never arrived, so nothing below is tested; grid held:\n{text}"
-        );
-        assert!(
-            text.contains("AGENT-SCREEN"),
-            "a replay that does not claim a prompt must leave the alternate screen it \
-             rebuilt alone; grid held:\n{text}"
-        );
-
-        // The same replay under the stale claim: the scrub swaps the agent's
-        // screen away, and what the pane comes back showing is the banner it
-        // was born with. That is #711.
-        let text = replayed_pane(true);
-        assert!(
-            !text.contains("AGENT-SCREEN"),
-            "a prompt report still has to scrub a stranded alternate screen, or the daemon's \
-             gate is load-bearing for nothing; grid held:\n{text}"
-        );
-        assert!(
-            text.contains("BIRTH-BANNER"),
-            "what the scrub leaves is the primary screen underneath; grid held:\n{text}"
-        );
-    }
-
     // ---- The switch, end to end, with a real daemon pane ----------------
     //
     // Everything above drives the client half against a scripted daemon. This
@@ -3952,153 +2985,6 @@ mod replay_tests {
     // the geometry the window actually has, produce output, drop the client,
     // produce more, attach again — and read the grid the second client ends up
     // with.
-
-    /// A client hung off `pane`, the way `stream_pane_with_attach` hangs one
-    /// off it: subscribe, forward every queued message onto the wire, and read
-    /// the client's own frames back the way `run_stream` does — epoch guard
-    /// included, so a displaced client's resize is dropped here exactly as the
-    /// daemon drops it.
-    ///
-    /// The route is a resize-echoing one, which is what the local daemon is:
-    /// the grid must not reflow until the `Size` the daemon echoes back.
-    fn attach_client(
-        pane: &std::sync::Arc<tty7_core::daemon::pane::DaemonPane>,
-    ) -> (u64, RemoteTerminal, std::thread::JoinHandle<()>) {
-        let (client_side, daemon_side) = socket_pair();
-        let mut daemon_write = daemon_side.try_clone().expect("clone the daemon half");
-        let (tx, rx) = std::sync::mpsc::channel::<DaemonMsg>();
-        let epoch = pane.attach(tx);
-        let gate = pane.gate();
-        let forward = std::thread::spawn(move || {
-            while let Ok(msg) = rx.recv() {
-                let drained = match &msg {
-                    DaemonMsg::Output(b) | DaemonMsg::Image(b) => b.len(),
-                    _ => 0,
-                };
-                let ok = msg.encode(&mut daemon_write).is_ok();
-                if drained > 0 {
-                    gate.sub(drained);
-                }
-                if !ok {
-                    break;
-                }
-            }
-        });
-        {
-            let pane = pane.clone();
-            let mut daemon_read = daemon_side;
-            std::thread::spawn(move || {
-                use std::io::Read as _;
-                let mut pending: Vec<u8> = Vec::new();
-                let mut chunk = [0u8; 65536];
-                loop {
-                    while let Ok(Some((kind, payload))) =
-                        crate::daemon::protocol::take_frame(&mut pending)
-                    {
-                        match ClientMsg::from_frame(kind, payload) {
-                            Ok(ClientMsg::Input(bytes)) if pane.controls(epoch) => {
-                                pane.write_input(&bytes)
-                            }
-                            Ok(ClientMsg::Resize(size)) if pane.controls(epoch) => {
-                                pane.resize(size)
-                            }
-                            Ok(_) => {}
-                            Err(_) => return,
-                        }
-                    }
-                    match daemon_read.read(&mut chunk) {
-                        Ok(0) | Err(_) => return,
-                        Ok(n) => pending.extend_from_slice(&chunk[..n]),
-                    }
-                }
-            });
-        }
-        let mut term = RemoteTerminal::from_stream(client_side, TermSize::new(80, 24))
-            .expect("a client over the pair");
-        term.route = echoing_route();
-        (epoch, term, forward)
-    }
-
-    /// A route whose daemon echoes `Size` when it applies a resize — which is
-    /// what `PaneRoute::Local` is against a current daemon, and what the
-    /// harness above implements.
-    ///
-    /// Built the way the neighbouring resize tests build one, rather than
-    /// through a `PaneWorkspace`: routing a workspace is not what any of these
-    /// cover, and going that way would have a change to `NativeSshSpec`'s
-    /// serde shape fail them on an `unwrap` that has nothing to do with
-    /// replay.
-    fn echoing_route() -> PaneRoute {
-        PaneRoute::Remote {
-            resize_echo: true,
-            size_lease: false,
-        }
-    }
-
-    /// A switch can rebuild a window twice, so the same pane is attached to
-    /// twice in quick succession and the window keeps the later view. That
-    /// view must still be the one the daemon obeys: the displaced attach's
-    /// teardown must not take the seat with it. Screen bytes are not replayed
-    /// — the subscriber is attached before the reader starts — so what this
-    /// checks is the seat, which only live output after the race can prove.
-    #[test]
-    fn the_later_of_two_racing_attaches_keeps_the_seat() {
-        crate::core::config::pin_test_config_dir();
-        let pane = tty7_core::daemon::pane::DaemonPane::spawn(
-            7712,
-            std::env::current_dir().ok(),
-            ws(80, 24),
-            None,
-            None,
-            None,
-            None,
-            false,
-            || {},
-        )
-        .expect("a pty-backed pane");
-
-        let (first_epoch, first, first_forward) = attach_client(&pane);
-        let (second_epoch, second, second_forward) = attach_client(&pane);
-        drop(first);
-        drop(first_forward);
-        pane.detach(first_epoch);
-
-        // `controls` answers from `subscriber_epoch` alone, and
-        // `DaemonPane::detach` clears `subscriber` without ever touching that
-        // counter. `live` is what notices a detach that dropped the wrong
-        // subscriber: the surviving view would stop receiving output.
-        let controls = pane.controls(second_epoch);
-        // The first write can land before the shell is reading. Retype until
-        // the surviving view shows it; a line that already ran just runs again.
-        let mut live = false;
-        for _ in 0..15 {
-            pane.write_input(b"echo AFTER-THE-RACE\r");
-            for _ in 0..40 {
-                if all_text(&second).contains("AFTER-THE-RACE") {
-                    live = true;
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(25));
-            }
-            if live {
-                break;
-            }
-        }
-        let text = all_text(&second);
-        pane.kill();
-        drop(second_forward);
-
-        assert!(
-            controls,
-            "the pane no longer answers to the surviving view, so nothing it \
-             types or resizes would reach the pty"
-        );
-        assert!(
-            live,
-            "the displaced attach's detach took the live seat: the surviving \
-             view stopped receiving output; grid held:\n{text}"
-        );
-    }
 
     /// What a physical Escape is written to the pane as, by the encoder a
     /// local ConPTY pane uses (#1155 is a ConPTY-only symptom), once the
@@ -4211,47 +3097,6 @@ mod replay_tests {
         );
         assert_eq!(escape, b"\x1b[27u");
         assert_eq!(reply.as_deref(), Some("\x1b[?1u"));
-    }
-
-    /// The same on a re-attach. The replay carries one prompt report for the
-    /// whole ring, and here it says a program owns the pane — so the prompt
-    /// the shell drew between the dead program and this one is only in the
-    /// ring's bytes, and has to clear the flags where it stands.
-    #[test]
-    fn a_replay_forgets_kitty_flags_from_before_an_earlier_prompt() {
-        let (escape, _) = escape_after(
-            vec![
-                DaemonMsg::Size(ws(80, 24)),
-                DaemonMsg::Snapshot(b"\x1b[>1u\x1b[?1049h\x1b[>7u".to_vec()),
-                DaemonMsg::Snapshot(
-                    b"\x1b]133;D;130\x07\x1b]133;A\x07$ \x1b]133;B\x07codex\r\n\x1b]133;C\x07"
-                        .to_vec(),
-                ),
-                DaemonMsg::Snapshot(b"\x1b[?1049h".to_vec()),
-                DaemonMsg::Prompt {
-                    active: true,
-                    at_prompt: false,
-                    last_exit: Some(130),
-                },
-            ],
-            "NEXT-PROGRAM",
-        );
-        assert_eq!(escape, b"\x1b");
-
-        // What the program after the prompt pushes is replayed as it was.
-        let (escape, _) = escape_after(
-            vec![
-                DaemonMsg::Size(ws(80, 24)),
-                DaemonMsg::Snapshot(b"\x1b[>7u\x1b]133;A\x07\x1b]133;C\x07\x1b[>1u".to_vec()),
-                DaemonMsg::Prompt {
-                    active: true,
-                    at_prompt: false,
-                    last_exit: None,
-                },
-            ],
-            "NEXT-PROGRAM",
-        );
-        assert_eq!(escape, b"\x1b[27u");
     }
 
     #[cfg(unix)]
@@ -4377,232 +3222,6 @@ mod windows_tests {
              did not unblock the reader, so join() hangs the calling thread"
         );
     }
-
-    /// The reconnect path: `relink_panes` calls this on the UI thread right
-    /// after a remote workspace re-attaches, with the old link still parked
-    /// on a zombie route. It must swap links promptly, and the adopted link
-    /// must actually work.
-    #[test]
-    fn adopt_relink_swaps_links_promptly_when_the_old_peer_stays_silent() {
-        crate::core::config::pin_test_config_dir();
-        let (old_client, mut _old_daemon) = tcp_pair();
-        let (new_client, mut new_daemon) = tcp_pair();
-        let term = RemoteTerminal::from_stream(old_client, TermSize::new(80, 24)).unwrap();
-        // Let the old reader park in read() on the silent link.
-        std::thread::sleep(std::time::Duration::from_millis(200));
-
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let mut term = term;
-            term.adopt_relink(
-                new_client,
-                Vec::new(),
-                &PaneRoute::Local,
-                TermSize::new(80, 24),
-                8,
-                16,
-            )
-            .unwrap();
-            let _ = tx.send(term);
-        });
-        let term = rx
-            .recv_timeout(std::time::Duration::from_secs(3))
-            .expect("adopt_relink blocked for over 3s against a silent old peer");
-
-        DaemonMsg::Output(b"hi".to_vec())
-            .encode(&mut new_daemon)
-            .unwrap();
-        let mut first = ' ';
-        for _ in 0..200 {
-            first = term.term.lock().grid()[alacritty_terminal::index::Line(0)]
-                [alacritty_terminal::index::Column(0)]
-            .c;
-            if first == 'h' {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        assert_eq!(first, 'h', "output on the adopted link must reach the grid");
-        assert!(
-            !term.exited_flag.load(Ordering::SeqCst),
-            "retiring the old reader must not mark the pane as exited"
-        );
-
-        // Late traffic on the abandoned link must be ignored wholesale: an
-        // Exited frame processed by the retired reader would flip
-        // `child_exited` and close the freshly adopted pane from under the
-        // user. Give the retired reader a full quit-poll tick to (mis)handle
-        // it before checking.
-        let _ = DaemonMsg::Exited { code: Some(0) }.encode(&mut _old_daemon);
-        std::thread::sleep(std::time::Duration::from_millis(700));
-        assert!(
-            !term.child_exited(),
-            "an Exited frame on the abandoned link must not close the pane"
-        );
-        assert!(
-            !term.exited_flag.load(Ordering::SeqCst),
-            "the abandoned link must not tear the adopted pane down"
-        );
-    }
-
-    /// What the daemon replays into a pane restored from a stored screen, in
-    /// the frames and the order it sends them: the dead pane's screen, then the
-    /// preamble, then the new shell's own first output.
-    fn replay_restore_into(daemon: &mut std::net::TcpStream, old_screen: &[u8], shell: &[u8]) {
-        let size = WinSize {
-            cols: 40,
-            rows: 10,
-            cell_w: 8,
-            cell_h: 17,
-        };
-        DaemonMsg::Size(size).encode(daemon).unwrap();
-        DaemonMsg::Snapshot(old_screen.to_vec())
-            .encode(daemon)
-            .unwrap();
-        DaemonMsg::Size(size).encode(daemon).unwrap();
-        DaemonMsg::Snapshot(crate::daemon::pane::restore_preamble(Some(
-            "the shell below is new",
-        )))
-        .encode(daemon)
-        .unwrap();
-        DaemonMsg::Output(shell.to_vec()).encode(daemon).unwrap();
-    }
-
-    fn row(term: &RemoteTerminal, line: i32) -> String {
-        use alacritty_terminal::grid::Dimensions as _;
-        use alacritty_terminal::index::{Column, Line};
-        let term = term.term.lock();
-        let grid = term.grid();
-        (0..grid.columns())
-            .map(|c| grid[Line(line)][Column(c)].c)
-            .collect::<String>()
-            .trim_end()
-            .to_string()
-    }
-
-    /// A restored screen must not be sitting in the viewport when the new
-    /// shell's ConPTY starts drawing on it.
-    ///
-    /// conhost addresses its own screen buffer absolutely — PSReadLine repaints
-    /// the line being typed with `ESC[6;20H` and conhost frames it the same way
-    /// — and that buffer starts blank with the cursor at the top-left. Restored
-    /// output is output conhost never produced: left on screen it shifts every
-    /// row conhost names, so the first keystroke repaints the input line on top
-    /// of the old text instead of at the prompt. The restored screen belongs in
-    /// scrollback, where it survives without claiming a row.
-    #[test]
-    fn a_restored_screen_leaves_the_new_shell_the_viewport_conpty_thinks_it_has() {
-        crate::core::config::pin_test_config_dir();
-        let (client_side, mut daemon_side) = tcp_pair();
-        let term = RemoteTerminal::from_stream(client_side, TermSize::new(40, 10)).unwrap();
-
-        // Five lines of the dead pane, then the shell painting its prompt the
-        // way conhost does: at row 1 of a buffer it believes is blank.
-        replay_restore_into(
-            &mut daemon_side,
-            b"line one\r\nline two\r\nline three\r\nline four\r\nline five\r\n",
-            b"\x1b[?25l\x1b[1;1HPS C:\\> \x1b[?25h",
-        );
-
-        let mut top = String::new();
-        for _ in 0..400 {
-            top = row(&term, 0);
-            if top.starts_with("PS C:") {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        assert_eq!(
-            top, "PS C:\\>",
-            "the shell's prompt paints where conhost put it"
-        );
-
-        for line in 1..10 {
-            assert_eq!(
-                row(&term, line),
-                "",
-                "row {line} still holds restored output, so conhost and the client \
-                 disagree about which row is which: the next repaint of the input \
-                 line lands on the old screen instead of at the prompt"
-            );
-        }
-
-        // Kept, not erased: `ESC[2J` on the primary screen scrolls the viewport
-        // into history, so the screen the daemon restored is one scroll away.
-        let depth = {
-            use alacritty_terminal::grid::Dimensions as _;
-            term.term.lock().grid().history_size() as i32
-        };
-        let history: Vec<String> = (-depth..0).map(|line| row(&term, line)).collect();
-        for wanted in [
-            "line one",
-            "line two",
-            "line three",
-            "line four",
-            "line five",
-        ] {
-            assert!(
-                history.iter().any(|row| row == wanted),
-                "{wanted:?} is not in the scrollback; the restored screen was erased \
-                 rather than scrolled away. History holds {history:?}"
-            );
-        }
-    }
-}
-
-/// Ungated on purpose: what a workspace can build a route out of is the same
-/// on every platform, and so is the name the refusal carries.
-#[cfg(test)]
-mod route_header_tests {
-    use super::*;
-    use crate::core::session::{RemoteTarget, WorkspaceId};
-
-    fn unroutable(target: RemoteTarget, label: Option<&str>) -> PaneWorkspace {
-        PaneWorkspace {
-            workspace: WorkspaceId::new(),
-            target,
-            spec: None,
-            label: label.map(str::to_string),
-            resize_echo: false,
-            size_lease: false,
-        }
-    }
-
-    /// A deleted profile is what empties `spec`, and the refusal built here is
-    /// what the pending pane prints verbatim under "could not reach
-    /// {machine}" — so this is one of the screens #485 is about. It used to
-    /// carry `{target:?}`, which for a `Profile` is its config UUID and
-    /// nothing else.
-    #[test]
-    fn an_unroutable_workspace_is_not_named_by_its_profile_uuid() {
-        let id = uuid::Uuid::new_v4();
-        let gone = RemoteTarget::Profile { id };
-
-        let named = unroutable(gone.clone(), Some("lager"));
-        let PaneRoute::Unroutable(e) = PaneRoute::for_workspace(Some(&named)) else {
-            panic!("a profile with no connection details is not a local pane");
-        };
-        assert!(
-            !e.contains(&id.to_string()),
-            "a bare profile UUID reached the UI: {e}"
-        );
-        assert!(
-            e.contains("lager"),
-            "the entry's own name is what it is called: {e}"
-        );
-        assert!(e.contains("cannot be routed"), "{e}");
-
-        // Nothing to call it by is still no reason to print the UUID.
-        let bare = unroutable(gone, None);
-        let PaneRoute::Unroutable(e) = PaneRoute::for_workspace(Some(&bare)) else {
-            panic!("a profile with no connection details is not a local pane");
-        };
-        assert!(
-            !e.contains(&id.to_string()),
-            "a bare profile UUID reached the UI: {e}"
-        );
-        assert!(e.contains("cannot be routed"), "{e}");
-    }
 }
 
 /// Issue #430, and #774 for the half of it that was still open.
@@ -4668,15 +3287,6 @@ mod parked_cursor_tests {
                 PtySource::Raw
             },
         );
-    }
-
-    #[test]
-    fn a_routed_pane_reads_a_raw_pty_whatever_the_client_was_built_for() {
-        let route = PaneRoute::Remote {
-            resize_echo: false,
-            size_lease: false,
-        };
-        assert_eq!(PtySource::for_route(&route), PtySource::Raw);
     }
 
     #[test]
@@ -4778,65 +3388,6 @@ mod parked_cursor_tests {
             "and nothing of them belongs on the row vim was editing"
         );
     }
-
-    /// The route cannot tell a native-SSH pane from a local shell: both are
-    /// spawned through this machine's daemon. What tells them apart is the
-    /// `RemoteContext` the daemon sends — and it has to, because a window
-    /// reopening onto an existing native-SSH pane attaches by id and has
-    /// nothing else to go on.
-    #[test]
-    fn a_native_ssh_context_turns_the_repair_off_mid_stream() {
-        let (term, mut daemon_side) = terminal_on(PtySource::LocalConpty, TermSize::new(80, 24));
-
-        DaemonMsg::RemoteContext(Some(RemoteContext {
-            kind: RemoteKind::NativeSsh,
-            argv: Vec::new(),
-            target: "dev@linux-box".into(),
-        }))
-        .encode(&mut daemon_side)
-        .unwrap();
-        daemon_side.flush().unwrap();
-        for _ in 0..600 {
-            if term.remote_context().is_some() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        assert!(
-            term.remote_context().is_some(),
-            "the reader never applied the context"
-        );
-        assert!(!term.is_local_conpty());
-
-        DaemonMsg::Output(b"\x1b[6;4H".to_vec())
-            .encode(&mut daemon_side)
-            .unwrap();
-        DaemonMsg::Output(b"\x1b[?25l\x1b[20;2HX\x1b[K\x1b[m\x1b[22;42H\x1b[K\x1b[?25h".to_vec())
-            .encode(&mut daemon_side)
-            .unwrap();
-        daemon_side.flush().unwrap();
-
-        let mut cursor = (0, 0);
-        for _ in 0..600 {
-            {
-                let t = term.term.lock();
-                let painted = t.grid()[alacritty_terminal::index::Line(19)]
-                    [alacritty_terminal::index::Column(1)]
-                .c;
-                if painted == 'X' {
-                    let point = t.grid().cursor.point;
-                    cursor = (point.line.0, point.column.0);
-                    break;
-                }
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        assert_eq!(
-            cursor,
-            (21, 41),
-            "an ssh channel's bytes are the far host's own; nothing parked that cursor"
-        );
-    }
 }
 
 /// Issue #774, from the client's end. A full-screen tool sets its modes once
@@ -4847,48 +3398,8 @@ mod parked_cursor_tests {
 /// reads before it decides the pane has a scrollback to move at all.
 #[cfg(test)]
 mod replayed_mode_tests {
-    use super::replay_tests::socket_pair;
     use super::*;
-    use std::io::Write as _;
     use tty7_core::core::term_modes::TerminalModes;
-
-    #[test]
-    fn a_replayed_mode_frame_puts_the_client_back_on_the_alternate_screen() {
-        crate::core::config::pin_test_config_dir();
-        // `btop`'s startup prefix, folded the way the daemon folds it out of
-        // the pty — and then re-sent from the fold, the ring having dropped
-        // the bytes themselves hours ago.
-        let mut modes = TerminalModes::new();
-        modes.feed(b"\x1b[?1049h\x1b[?1002h\x1b[?1006h");
-
-        let (client_side, mut daemon_side) = socket_pair();
-        let term = RemoteTerminal::from_stream(client_side, TermSize::new(80, 24)).unwrap();
-        DaemonMsg::Snapshot(modes.restore_bytes().expect("a fold with modes in it"))
-            .encode(&mut daemon_side)
-            .unwrap();
-        daemon_side.flush().unwrap();
-
-        for _ in 0..600 {
-            if term.term.lock().mode().contains(TermMode::ALT_SCREEN) {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-
-        let mode = *term.term.lock().mode();
-        assert!(
-            mode.contains(TermMode::ALT_SCREEN),
-            "the pane belongs on the alternate screen it never left: {mode:?}"
-        );
-        // Reporting first, SGR encoding with it: `wheel_route` sends the wheel
-        // to the application on the first and encodes the report with the
-        // second — see `wheel_routes_by_negotiated_mode_with_reporting_first`.
-        assert!(
-            mode.intersects(TermMode::MOUSE_MODE),
-            "mouse reporting is what keeps the wheel off the scrollback: {mode:?}"
-        );
-        assert!(mode.contains(TermMode::SGR_MOUSE), "{mode:?}");
-    }
 
     /// #1074, checked against the emulator itself rather than against our
     /// reading of it: wherever the ring's front falls, the prelude plus what
@@ -4971,111 +3482,11 @@ mod tests {
     use std::io::Write;
     use std::os::unix::net::UnixStream;
 
-    fn ssh_workspace() -> PaneWorkspace {
-        PaneWorkspace {
-            workspace: crate::core::session::WorkspaceId::new(),
-            target: crate::core::session::RemoteTarget::Direct {
-                user: "me".into(),
-                host: "build-box".into(),
-                port: 22,
-            },
-            spec: Some(Box::new(
-                serde_json::from_str(
-                    r#"{"host":"build-box","port":22,"user":"me","auth_mode":"auto"}"#,
-                )
-                .unwrap(),
-            )),
-            label: None,
-            resize_echo: false,
-            size_lease: false,
-        }
-    }
-
     #[test]
     fn a_local_pane_prefixes_nothing() {
         assert!(PaneRoute::Local.is_local());
         assert!(matches!(PaneRoute::for_workspace(None), PaneRoute::Local));
         assert!(matches!(PaneRoute::default(), PaneRoute::Local));
-    }
-
-    #[test]
-    fn a_remote_pane_routes_to_its_machine_on_the_pane_channel() {
-        let route = PaneRoute::for_workspace(Some(&ssh_workspace()));
-        assert!(
-            matches!(
-                route,
-                PaneRoute::Remote {
-                    resize_echo: false,
-                    ..
-                }
-            ),
-            "an ssh workspace is not a local shell"
-        );
-
-        let mut ws = ssh_workspace();
-        ws.resize_echo = true;
-        assert!(
-            matches!(
-                PaneRoute::for_workspace(Some(&ws)),
-                PaneRoute::Remote {
-                    resize_echo: true,
-                    size_lease: false,
-                    ..
-                }
-            ),
-            "what the host's hello said about the resize echo rides the route"
-        );
-    }
-
-    #[test]
-    fn a_wsl_workspace_routes_by_distro() {
-        let ws = PaneWorkspace {
-            workspace: crate::core::session::WorkspaceId::new(),
-            target: crate::core::session::RemoteTarget::Wsl {
-                distro: "Ubuntu-22.04".into(),
-            },
-            spec: None,
-            label: None,
-            resize_echo: false,
-            size_lease: false,
-        };
-        let route = PaneRoute::for_workspace(Some(&ws));
-        assert!(matches!(route, PaneRoute::Remote { .. }));
-    }
-
-    #[test]
-    fn a_local_stdio_workspace_routes_to_a_child_process_on_the_pane_dialect() {
-        let ws = PaneWorkspace {
-            workspace: crate::core::session::WorkspaceId::new(),
-            target: crate::core::session::RemoteTarget::LocalStdio {
-                program: "/tmp/tty7-server".into(),
-                args: vec!["--stdio".into()],
-            },
-            spec: None,
-            label: None,
-            resize_echo: false,
-            size_lease: false,
-        };
-        let route = PaneRoute::for_workspace(Some(&ws));
-        assert!(matches!(route, PaneRoute::Remote { .. }));
-    }
-
-    #[test]
-    fn an_unroutable_workspace_is_not_treated_as_local() {
-        let ws = PaneWorkspace {
-            workspace: crate::core::session::WorkspaceId::new(),
-            target: crate::core::session::RemoteTarget::Alias {
-                alias: "build-box".into(),
-            },
-            spec: None,
-            label: None,
-            resize_echo: false,
-            size_lease: false,
-        };
-        let route = PaneRoute::for_workspace(Some(&ws));
-        assert!(matches!(route, PaneRoute::Unroutable(_)));
-        let err = connect_routed(&route).expect_err("must not reach the local daemon");
-        assert!(err.to_string().contains("cannot be routed"), "{err}");
     }
 
     #[test]
@@ -5093,27 +3504,6 @@ mod tests {
             spawn_workspace(None, &PaneRoute::Local),
             None,
             "a pane outside any workspace must not claim one"
-        );
-
-        assert_eq!(
-            spawn_workspace(Some(ws), &PaneRoute::for_workspace(Some(&ssh_workspace()))),
-            None,
-            "a remote server has its own machine tree; this id names a workspace in ours"
-        );
-    }
-
-    #[test]
-    fn only_a_local_pane_may_restart_the_local_daemon() {
-        assert!(PaneRoute::Local.is_local());
-        assert!(PaneRoute::for_workspace(None).is_local());
-
-        assert!(
-            !PaneRoute::for_workspace(Some(&ssh_workspace())).is_local(),
-            "a routed pane's disconnect is the remote's failure, not the local daemon's"
-        );
-        assert!(
-            !PaneRoute::Unroutable("no ssh details".into()).is_local(),
-            "nothing was ever asked of the local daemon"
         );
     }
 
@@ -5246,181 +3636,6 @@ mod tests {
         let eof: anyhow::Error =
             std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "closed").into();
         assert!(!daemon_not_listening(&eof));
-    }
-
-    #[test]
-    fn an_attach_to_a_missing_pane_is_an_error_not_a_disconnect() {
-        let (mut client_side, mut daemon_side) = UnixStream::pair().unwrap();
-        DaemonMsg::Error("no such pane 7".to_string())
-            .encode(&mut daemon_side)
-            .unwrap();
-        daemon_side.flush().unwrap();
-
-        let err = attach_reply_prefix(&mut client_side, 7, attach_reply_wait(&PaneRoute::Local))
-            .expect_err("a missing pane must fail");
-        assert!(
-            format!("{err:#}").contains("no such pane 7"),
-            "the daemon's own wording is what names which pane went: {err:#}"
-        );
-    }
-
-    #[test]
-    fn an_attach_the_daemon_hangs_up_on_is_an_error() {
-        let (mut client_side, daemon_side) = UnixStream::pair().unwrap();
-        drop(daemon_side);
-        assert!(
-            attach_reply_prefix(&mut client_side, 7, attach_reply_wait(&PaneRoute::Local)).is_err()
-        );
-    }
-
-    /// #673: a daemon that attached replays the pane's ring at once, and the
-    /// ring always holds a segment, so even a pane that has printed nothing
-    /// answers with a `Size`. A connection that stays silent for the whole wait
-    /// is therefore one nobody is serving — read as success, it became a pane
-    /// the window drew as restored while every keystroke, Ctrl-C included,
-    /// went into a socket nothing drained.
-    #[test]
-    fn an_attach_nobody_answers_is_not_an_attach() {
-        let (mut client_side, _daemon_side) = UnixStream::pair().unwrap();
-        let wait = std::time::Duration::from_millis(200);
-        let err = attach_reply_prefix(&mut client_side, 7, wait)
-            .expect_err("silence for the whole wait must not pass for an attached pane");
-        assert!(
-            format!("{err:#}").contains("did not answer"),
-            "the failure has to say the daemon never answered, not that the pane is gone: {err:#}"
-        );
-        assert!(
-            attach_unanswered(&err),
-            "silence is its own verdict, told apart from a refusal or a hangup"
-        );
-        // A refusal is not it: the pane really is gone then, and the caller
-        // may say so.
-        let (mut client_side, mut daemon_side) = UnixStream::pair().unwrap();
-        DaemonMsg::Error("no such pane 7".into())
-            .encode(&mut daemon_side)
-            .unwrap();
-        daemon_side.flush().unwrap();
-        let refused = attach_reply_prefix(&mut client_side, 7, wait).expect_err("refused");
-        assert!(!attach_unanswered(&refused));
-    }
-
-    /// The relink retry loop keys off this split: a refusal means the pane is
-    /// gone on its machine and asking again can only repeat the answer, while
-    /// silence and a hangup are transport trouble worth another try.
-    #[test]
-    fn a_refused_attach_is_final_and_every_other_failure_is_not() {
-        let wait = std::time::Duration::from_millis(200);
-
-        let (mut client_side, mut daemon_side) = UnixStream::pair().unwrap();
-        DaemonMsg::Error("no such pane 7".into())
-            .encode(&mut daemon_side)
-            .unwrap();
-        daemon_side.flush().unwrap();
-        let refused = attach_reply_prefix(&mut client_side, 7, wait).expect_err("refused");
-        assert!(attach_refused(&refused));
-        assert!(
-            format!("{refused:#}").contains("no such pane 7"),
-            "the daemon's own words survive: {refused:#}"
-        );
-
-        let (mut client_side, _held_open) = UnixStream::pair().unwrap();
-        let silent = attach_reply_prefix(&mut client_side, 7, wait).expect_err("silent");
-        assert!(
-            !attach_refused(&silent),
-            "silence is not a verdict on the pane"
-        );
-
-        let (mut client_side, daemon_side) = UnixStream::pair().unwrap();
-        drop(daemon_side);
-        let hungup = attach_reply_prefix(&mut client_side, 7, wait).expect_err("hung up");
-        assert!(
-            !attach_refused(&hungup),
-            "a hangup is not a verdict on the pane"
-        );
-    }
-
-    /// The other side of the rule above: the frame a quiet pane does send is
-    /// enough. Nothing else is required of the daemon for the attach to stand.
-    #[test]
-    fn a_size_frame_alone_is_a_live_attach() {
-        let (mut client_side, mut daemon_side) = UnixStream::pair().unwrap();
-        DaemonMsg::Size(WinSize {
-            cols: 80,
-            rows: 24,
-            cell_w: 8,
-            cell_h: 17,
-        })
-        .encode(&mut daemon_side)
-        .unwrap();
-        daemon_side.flush().unwrap();
-
-        let buffered =
-            attach_reply_prefix(&mut client_side, 7, std::time::Duration::from_millis(200))
-                .expect("the daemon's first frame is the attach ack");
-        assert!(
-            !buffered.is_empty(),
-            "the Size frame was read to classify the reply; it must reach the reader"
-        );
-    }
-
-    #[test]
-    fn a_local_attach_does_not_wait_as_long_as_a_remote_one() {
-        let local = attach_reply_wait(&PaneRoute::Local);
-        let remote = attach_reply_wait(&PaneRoute::for_workspace(Some(&ssh_workspace())));
-        assert!(local < remote, "{local:?} must be the shorter wait");
-        assert!(
-            local <= std::time::Duration::from_secs(2),
-            "the UI thread is holding still for this"
-        );
-    }
-
-    #[test]
-    fn a_live_attach_hands_its_replay_bytes_to_the_reader() {
-        crate::core::config::pin_test_config_dir();
-        let (mut client_side, mut daemon_side) = UnixStream::pair().unwrap();
-        DaemonMsg::Snapshot(b"hello".to_vec())
-            .encode(&mut daemon_side)
-            .unwrap();
-        daemon_side.flush().unwrap();
-
-        let buffered =
-            attach_reply_prefix(&mut client_side, 7, attach_reply_wait(&PaneRoute::Local))
-                .expect("a live pane attaches");
-        assert!(
-            !buffered.is_empty(),
-            "the classification read the Snapshot frame; it must come back"
-        );
-        let term = RemoteTerminal::from_stream_with(
-            client_side,
-            TermSize::new(80, 24),
-            buffered,
-            PtySource::Raw,
-        )
-        .unwrap();
-
-        let mut got = String::new();
-        for _ in 0..200 {
-            {
-                let t = term.term.lock();
-                let grid = t.grid();
-                got.clear();
-                for col in 0..5usize {
-                    got.push(
-                        grid[alacritty_terminal::index::Line(0)]
-                            [alacritty_terminal::index::Column(col)]
-                        .c,
-                    );
-                }
-            }
-            if got == "hello" {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        assert_eq!(
-            got, "hello",
-            "the pre-read replay must still reach the grid"
-        );
     }
 
     #[test]
@@ -5622,42 +3837,6 @@ mod tests {
     }
 
     #[test]
-    fn reader_surfaces_auth_prompt_and_status() {
-        let (client_side, mut daemon_side) = UnixStream::pair().unwrap();
-        let term = RemoteTerminal::from_stream(client_side, TermSize::new(80, 24)).unwrap();
-
-        DaemonMsg::SshStatus {
-            phase: SshPhase::Authenticating,
-        }
-        .encode(&mut daemon_side)
-        .unwrap();
-        DaemonMsg::AuthPrompt {
-            request_id: 7,
-            prompt: AuthPromptKind::Password {
-                user: "deploy".into(),
-                host: "10.0.0.5".into(),
-            },
-        }
-        .encode(&mut daemon_side)
-        .unwrap();
-        daemon_side.flush().unwrap();
-
-        let mut prompt = None;
-        for _ in 0..200 {
-            if let Some(p) = term.take_auth_prompt() {
-                prompt = Some(p);
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        let (id, kind) = prompt.expect("auth prompt should have surfaced");
-        assert_eq!(id, 7);
-        assert!(matches!(kind, AuthPromptKind::Password { .. }));
-        assert_eq!(term.ssh_phase(), Some(SshPhase::Authenticating));
-        assert!(!term.has_pending_auth());
-    }
-
-    #[test]
     fn child_exit_is_distinguished_from_daemon_disconnect() {
         let (client_side, mut daemon_side) = UnixStream::pair().unwrap();
         let term = RemoteTerminal::from_stream(client_side, TermSize::new(80, 24)).unwrap();
@@ -5758,90 +3937,6 @@ mod tests {
             !mode.intersects(TermMode::MOUSE_MODE) && !mode.contains(TermMode::SGR_MOUSE),
             "the prompt report must disable stale mouse reporting"
         );
-    }
-
-    #[test]
-    fn snapshot_replay_suppresses_query_replies_and_side_effects() {
-        crate::core::config::pin_test_config_dir();
-        let (client_side, mut daemon_side) = UnixStream::pair().unwrap();
-        let term = RemoteTerminal::from_stream(client_side, TermSize::new(80, 24)).unwrap();
-
-        // `CSI 14t` is the one query alacritty hands out as its own event
-        // (the pixel size lives with the view) rather than as a `PtyWrite`;
-        // answered from a replay, its `CSI 4;h;w t` lands on whatever reads
-        // the pane now — a shell prompt, once the TUI that asked has quit.
-        DaemonMsg::Snapshot(
-            b"\x1b[6n\x1b]11;?\x07\x1b[14t\x1b[16t\x1b[18t\x1b]52;c;aGk=\x07\x07replayed".to_vec(),
-        )
-        .encode(&mut daemon_side)
-        .unwrap();
-        daemon_side.flush().unwrap();
-
-        let mut events = Vec::new();
-        for _ in 0..200 {
-            while let Ok(ev) = term.events.try_recv() {
-                events.push(ev);
-            }
-            if events.iter().any(|e| matches!(e, AlacEvent::Wakeup)) {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        assert!(
-            events.iter().any(|e| matches!(e, AlacEvent::Wakeup)),
-            "the replay's Wakeup should still arrive"
-        );
-        assert!(
-            !events.iter().any(|e| matches!(
-                e,
-                AlacEvent::PtyWrite(_)
-                    | AlacEvent::ColorRequest(..)
-                    | AlacEvent::TextAreaSizeRequest(_)
-                    | AlacEvent::ClipboardStore(..)
-                    | AlacEvent::ClipboardLoad(..)
-                    | AlacEvent::Bell
-            )),
-            "replayed history must not re-answer queries or replay side effects"
-        );
-
-        DaemonMsg::Output(b"\x1b[14t".to_vec())
-            .encode(&mut daemon_side)
-            .unwrap();
-        daemon_side.flush().unwrap();
-        let mut got_size_request = false;
-        for _ in 0..200 {
-            while let Ok(ev) = term.events.try_recv() {
-                if matches!(ev, AlacEvent::TextAreaSizeRequest(_)) {
-                    got_size_request = true;
-                }
-            }
-            if got_size_request {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        assert!(
-            got_size_request,
-            "a live pixel-size query must still be answered"
-        );
-
-        DaemonMsg::Output(b"\x1b[6n".to_vec())
-            .encode(&mut daemon_side)
-            .unwrap();
-        daemon_side.flush().unwrap();
-        let mut got_reply = false;
-        for _ in 0..200 {
-            while let Ok(ev) = term.events.try_recv() {
-                if matches!(ev, AlacEvent::PtyWrite(_)) {
-                    got_reply = true;
-                }
-            }
-            if got_reply {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        assert!(got_reply, "live queries must still be answered");
     }
 
     #[test]
@@ -6089,51 +4184,6 @@ mod tests {
     }
 
     #[test]
-    fn attach_replay_runs_at_the_daemon_reported_size() {
-        let (client_side, mut daemon_side) = UnixStream::pair().unwrap();
-        let term = RemoteTerminal::from_stream(client_side, TermSize::new(80, 24)).unwrap();
-
-        DaemonMsg::Size(WinSize {
-            cols: 120,
-            rows: 30,
-            cell_w: 8,
-            cell_h: 17,
-        })
-        .encode(&mut daemon_side)
-        .unwrap();
-        DaemonMsg::Snapshot(vec![b'x'; 100])
-            .encode(&mut daemon_side)
-            .unwrap();
-        daemon_side.flush().unwrap();
-
-        let (mut tail, mut wrapped) = (' ', ' ');
-        for _ in 0..200 {
-            {
-                use alacritty_terminal::grid::Dimensions as _;
-                let t = term.term.lock();
-                let grid = t.grid();
-                if grid.columns() >= 120 {
-                    tail = grid[alacritty_terminal::index::Line(0)]
-                        [alacritty_terminal::index::Column(99)]
-                    .c;
-                    wrapped = grid[alacritty_terminal::index::Line(1)]
-                        [alacritty_terminal::index::Column(0)]
-                    .c;
-                }
-            }
-            if tail == 'x' {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        assert_eq!(tail, 'x', "replay should run at the recorded 120-col width");
-        assert_eq!(
-            wrapped, ' ',
-            "a 100-char line must not wrap on a 120-col grid"
-        );
-    }
-
-    #[test]
     fn first_resize_always_syncs_then_dedups() {
         let (client_side, mut daemon_side) = UnixStream::pair().unwrap();
         let mut term = RemoteTerminal::from_stream(client_side, TermSize::new(80, 24)).unwrap();
@@ -6185,91 +4235,6 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_replay_flushes_a_dangling_sync_frame_suppressed() {
-        let (client_side, mut daemon_side) = UnixStream::pair().unwrap();
-        let term = RemoteTerminal::from_stream(client_side, TermSize::new(80, 24)).unwrap();
-
-        DaemonMsg::Snapshot(b"\x1b[?2026h\x1b[6nhi".to_vec())
-            .encode(&mut daemon_side)
-            .unwrap();
-        daemon_side.flush().unwrap();
-
-        let mut got = String::new();
-        for _ in 0..200 {
-            {
-                let t = term.term.lock();
-                let grid = t.grid();
-                got.clear();
-                for col in 0..2usize {
-                    got.push(
-                        grid[alacritty_terminal::index::Line(0)]
-                            [alacritty_terminal::index::Column(col)]
-                        .c,
-                    );
-                }
-            }
-            if got == "hi" {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        assert_eq!(
-            got, "hi",
-            "the trapped replay tail must flush with the snapshot"
-        );
-
-        let mut events = Vec::new();
-        while let Ok(ev) = term.events.try_recv() {
-            events.push(ev);
-        }
-        assert!(
-            !events.iter().any(|e| matches!(e, AlacEvent::PtyWrite(_))),
-            "a query inside the replayed sync tail must stay suppressed"
-        );
-    }
-
-    #[test]
-    fn layout_resize_reasserts_geometry_after_a_late_size_frame() {
-        use alacritty_terminal::grid::Dimensions as _;
-        let (client_side, mut daemon_side) = UnixStream::pair().unwrap();
-        let mut term = RemoteTerminal::from_stream(client_side, TermSize::new(80, 24)).unwrap();
-
-        term.resize(TermSize::new(100, 40), 8, 17);
-        assert!(matches!(
-            ClientMsg::read(&mut daemon_side).unwrap(),
-            ClientMsg::Resize(_)
-        ));
-
-        DaemonMsg::Size(WinSize {
-            cols: 120,
-            rows: 30,
-            cell_w: 8,
-            cell_h: 17,
-        })
-        .encode(&mut daemon_side)
-        .unwrap();
-        DaemonMsg::Snapshot(b"old screen".to_vec())
-            .encode(&mut daemon_side)
-            .unwrap();
-        daemon_side.flush().unwrap();
-        for _ in 0..200 {
-            if term.term.lock().columns() == 120 {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        assert_eq!(term.term.lock().columns(), 120, "replay geometry applied");
-
-        term.resize(TermSize::new(100, 40), 8, 17);
-        assert_eq!(term.term.lock().columns(), 100);
-        assert_eq!(term.term.lock().screen_lines(), 40);
-        assert!(matches!(
-            ClientMsg::read(&mut daemon_side).unwrap(),
-            ClientMsg::Resize(ws) if ws.cols == 100 && ws.rows == 40
-        ));
-    }
-
-    #[test]
     fn resize_updates_size_and_notifies_daemon() {
         let (client_side, mut daemon_side) = UnixStream::pair().unwrap();
         let mut term = RemoteTerminal::from_stream(client_side, TermSize::new(80, 24)).unwrap();
@@ -6294,10 +4259,7 @@ mod tests {
         // A remote route whose host advertised the echo. The local daemon's
         // answer rides the same gate through `local_daemon_supports`, so this
         // covers the deferral for both.
-        term.route = PaneRoute::Remote {
-            resize_echo: true,
-            size_lease: false,
-        };
+        term.direct = true;
 
         term.resize(TermSize::new(120, 30), 8, 17);
         assert!(matches!(
@@ -6358,10 +4320,7 @@ mod tests {
     fn echoing_pair() -> (RemoteTerminal, UnixStream) {
         let (client_side, daemon_side) = UnixStream::pair().unwrap();
         let mut term = RemoteTerminal::from_stream(client_side, TermSize::new(80, 24)).unwrap();
-        term.route = PaneRoute::Remote {
-            resize_echo: true,
-            size_lease: false,
-        };
+        term.direct = true;
         daemon_side
             .set_read_timeout(Some(std::time::Duration::from_millis(150)))
             .unwrap();
@@ -6485,70 +4444,6 @@ mod tests {
             Some((120, 30)),
             "a grid knocked off the requested size was left there"
         );
-    }
-
-    /// A relink re-sends the geometry the pane has now — including a resize
-    /// made after the old link had already died, which reached no daemon.
-    #[test]
-    fn a_relink_delivers_the_resize_made_while_the_link_was_down() {
-        crate::core::config::pin_test_config_dir();
-        let (old_client, mut old_daemon) = UnixStream::pair().unwrap();
-        let mut term = RemoteTerminal::from_stream(old_client, TermSize::new(80, 24)).unwrap();
-        term.resize(TermSize::new(100, 40), 8, 17);
-        assert!(matches!(
-            ClientMsg::read(&mut old_daemon).unwrap(),
-            ClientMsg::Resize(ws) if ws.cols == 100 && ws.rows == 40
-        ));
-
-        // The link drops; the layout keeps moving.
-        drop(old_daemon);
-        term.resize(TermSize::new(120, 30), 8, 17);
-
-        let (new_client, mut new_daemon) = UnixStream::pair().unwrap();
-        new_daemon
-            .set_read_timeout(Some(std::time::Duration::from_secs(3)))
-            .unwrap();
-        // What `relink_plan` hands the relink: the size the view has now.
-        let size = term.size();
-        term.adopt_relink(new_client, Vec::new(), &PaneRoute::Local, size, 8, 17)
-            .unwrap();
-        assert!(
-            matches!(
-                ClientMsg::read(&mut new_daemon).unwrap(),
-                ClientMsg::Resize(ws) if ws.cols == 120 && ws.rows == 30
-            ),
-            "the relinked daemon must be told the size the pane has now"
-        );
-    }
-    #[test]
-    fn a_remote_route_without_the_advertised_echo_reflows_at_request_time() {
-        use alacritty_terminal::grid::Dimensions as _;
-
-        crate::core::config::pin_test_config_dir();
-        let (client_side, mut daemon_side) = UnixStream::pair().unwrap();
-        let mut term = RemoteTerminal::from_stream(client_side, TermSize::new(80, 24)).unwrap();
-        // What `for_workspace` builds when the host's hello named no echo —
-        // an older server, or a link that was down when the route was made.
-        term.route = PaneRoute::Remote {
-            resize_echo: false,
-            size_lease: false,
-        };
-
-        term.resize(TermSize::new(120, 30), 8, 17);
-        assert_eq!(
-            term.term.lock().columns(),
-            120,
-            "with no promised echo the grid must reflow at request time — \
-             deferring would leave it at the old width forever"
-        );
-        assert!(matches!(
-            ClientMsg::read(&mut daemon_side).unwrap(),
-            ClientMsg::Resize(ws) if ws.cols == 120 && ws.rows == 30
-        ));
-
-        // The other route with no daemon to promise anything.
-        term.route = PaneRoute::Unroutable("no ssh details".into());
-        assert!(!term.resize_echoed(), "no route, no echo to wait for");
     }
 
     #[test]
@@ -6723,124 +4618,6 @@ mod tests {
         assert!(poll(None), "agent exit should clear it");
     }
 
-    /// The daemon replays a reattached pane's stored agent status as an
-    /// ordinary report. Nothing on the wire says so, so the link has to
-    /// remember that the first report it hears is that replay — and that
-    /// everything after it is live.
-    #[test]
-    fn a_reattached_link_marks_only_its_first_status_report_as_replayed() {
-        use crate::core::cli_agent::{AgentSessionState, AgentStatus};
-
-        crate::core::config::pin_test_config_dir();
-        let (client_side, mut daemon_side) = UnixStream::pair().unwrap();
-        let term =
-            RemoteTerminal::from_stream_reattached(client_side, TermSize::new(80, 24)).unwrap();
-        assert_eq!(
-            term.take_replayed_agent_status(),
-            None,
-            "nothing replayed until the frame actually arrives"
-        );
-
-        let report = |status, daemon: &mut UnixStream| {
-            DaemonMsg::AgentStatus(Some(AgentSessionState {
-                status,
-                message: None,
-                session_id: Some("sid-1".into()),
-                launch_argv: None,
-                rich: true,
-                cwd: None,
-                activity: 0,
-                turns: 0,
-                inferred: false,
-                readout: Default::default(),
-                since_ms: None,
-            }))
-            .encode(daemon)
-            .unwrap();
-            daemon.flush().unwrap();
-        };
-        let poll = |want: AgentStatus| {
-            for _ in 0..200 {
-                if term.agent_session().map(|s| s.status) == Some(want) {
-                    return true;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            }
-            false
-        };
-
-        report(AgentStatus::Done, &mut daemon_side);
-        assert!(poll(AgentStatus::Done), "the replayed status should land");
-        assert_eq!(
-            term.take_replayed_agent_status(),
-            Some(Some(AgentStatus::Done)),
-            "the first report on a reattached link is stored state"
-        );
-        assert_eq!(
-            term.take_replayed_agent_status(),
-            None,
-            "only one taker gets it"
-        );
-
-        report(AgentStatus::Working, &mut daemon_side);
-        assert!(poll(AgentStatus::Working), "the live status should land");
-        assert_eq!(
-            term.take_replayed_agent_status(),
-            None,
-            "everything after the replay is something the client watched happen"
-        );
-    }
-
-    /// A pane with no agent session to replay sends no status frame at all, so
-    /// the replay window has to close on its own — otherwise the first report
-    /// from an agent launched *later* would be discounted as stored state.
-    #[test]
-    fn live_output_closes_the_replay_window() {
-        use crate::core::cli_agent::{AgentSessionState, AgentStatus};
-
-        crate::core::config::pin_test_config_dir();
-        let (client_side, mut daemon_side) = UnixStream::pair().unwrap();
-        let term =
-            RemoteTerminal::from_stream_reattached(client_side, TermSize::new(80, 24)).unwrap();
-
-        DaemonMsg::Output(b"$ claude\r\n".to_vec())
-            .encode(&mut daemon_side)
-            .unwrap();
-        DaemonMsg::AgentStatus(Some(AgentSessionState {
-            status: AgentStatus::Done,
-            message: None,
-            session_id: Some("sid-1".into()),
-            launch_argv: None,
-            rich: true,
-            cwd: None,
-            activity: 0,
-            turns: 0,
-            inferred: false,
-            readout: Default::default(),
-            since_ms: None,
-        }))
-        .encode(&mut daemon_side)
-        .unwrap();
-        daemon_side.flush().unwrap();
-
-        for _ in 0..200 {
-            if term.agent_session().is_some() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        assert_eq!(
-            term.agent_session().map(|s| s.status),
-            Some(AgentStatus::Done),
-            "the status still lands"
-        );
-        assert_eq!(
-            term.take_replayed_agent_status(),
-            None,
-            "a report that follows live output is live"
-        );
-    }
-
     #[test]
     fn agent_session_follows_daemon_status_reports() {
         use crate::core::cli_agent::{AgentSessionState, AgentStatus};
@@ -6949,58 +4726,6 @@ mod tests {
     }
 
     #[test]
-    fn zle_reading_follows_live_prompt_end_marks() {
-        let (client_side, mut daemon_side) = UnixStream::pair().unwrap();
-        let term = RemoteTerminal::from_stream(client_side, TermSize::new(80, 24)).unwrap();
-        let poll = |want: bool| {
-            for _ in 0..200 {
-                if term.zle_reading() == want {
-                    return true;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            }
-            false
-        };
-        assert!(!term.zle_reading(), "conservative false before any mark");
-
-        DaemonMsg::Snapshot(b"\x1b]133;B\x07".to_vec())
-            .encode(&mut daemon_side)
-            .unwrap();
-        DaemonMsg::Output(b"\x1b]133;D;0\x07m".to_vec())
-            .encode(&mut daemon_side)
-            .unwrap();
-        daemon_side.flush().unwrap();
-        let mut synced = false;
-        for _ in 0..200 {
-            let c = term.term.lock().grid()[alacritty_terminal::index::Line(0)]
-                [alacritty_terminal::index::Column(0)]
-            .c;
-            if c == 'm' {
-                synced = true;
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        assert!(synced, "reader should have applied both frames");
-        assert!(
-            !term.zle_reading(),
-            "replayed B / live D must not arm the flag"
-        );
-
-        DaemonMsg::Output(b"\x1b]133;B\x07".to_vec())
-            .encode(&mut daemon_side)
-            .unwrap();
-        daemon_side.flush().unwrap();
-        assert!(poll(true), "live B should arm zle_reading");
-
-        DaemonMsg::Output(b"\x1b]133;C\x07".to_vec())
-            .encode(&mut daemon_side)
-            .unwrap();
-        daemon_side.flush().unwrap();
-        assert!(poll(false), "C (command start) should disarm zle_reading");
-    }
-
-    #[test]
     fn the_running_command_is_the_line_the_shell_marked_and_ends_with_it() {
         crate::core::config::pin_test_config_dir();
         let (client_side, mut daemon_side) = UnixStream::pair().unwrap();
@@ -7096,159 +4821,6 @@ mod tests {
             .unwrap();
         daemon_side.flush().unwrap();
         assert!(poll(false, false), "C still disarms zle");
-    }
-
-    #[test]
-    fn shell_vi_mode_is_restored_from_snapshot_replay() {
-        let (client_side, mut daemon_side) = UnixStream::pair().unwrap();
-        let term = RemoteTerminal::from_stream(client_side, TermSize::new(80, 24)).unwrap();
-        let poll = |vi: bool| {
-            for _ in 0..200 {
-                if term.shell_vi_mode() == vi {
-                    return true;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            }
-            false
-        };
-
-        DaemonMsg::Snapshot(b"\x1b]133;V;1\x07".to_vec())
-            .encode(&mut daemon_side)
-            .unwrap();
-        daemon_side.flush().unwrap();
-        assert!(
-            poll(true),
-            "attached clients should inherit the prompt's vi-mode state"
-        );
-        assert!(
-            !term.zle_reading(),
-            "historical replay must not imply zle is currently reading"
-        );
-
-        DaemonMsg::Snapshot(b"\x1b]133;V;0\x07".to_vec())
-            .encode(&mut daemon_side)
-            .unwrap();
-        daemon_side.flush().unwrap();
-        assert!(poll(false), "a replayed V;0 should clear vi-mode state");
-    }
-
-    fn full_dump(term: &RemoteTerminal) -> String {
-        use alacritty_terminal::grid::Dimensions as _;
-        let t = term.term.lock();
-        let grid = t.grid();
-        let mut out = String::new();
-        for l in -(grid.history_size() as i32)..grid.screen_lines() as i32 {
-            for c in 0..grid.columns() {
-                out.push(
-                    grid[alacritty_terminal::index::Line(l)][alacritty_terminal::index::Column(c)]
-                        .c,
-                );
-            }
-            out.push('\n');
-        }
-        out
-    }
-
-    fn tui_frame(lines: &[String], prev_rows: usize) -> Vec<u8> {
-        let mut b = Vec::new();
-        if prev_rows > 1 {
-            b.extend_from_slice(format!("\r\x1b[{}A\x1b[J", prev_rows - 1).as_bytes());
-        }
-        b.extend_from_slice(lines.join("\r\n").as_bytes());
-        b
-    }
-
-    #[test]
-    fn segmented_ring_replay_reproduces_live_rendering() {
-        const MARK: &str = "DUPMARK";
-        let frame_lines = |f: usize| -> Vec<String> {
-            (0..10)
-                .map(|i| format!("{MARK} f{f:02} l{i:02} {:.<74}", ""))
-                .collect()
-        };
-        let mut history = Vec::new();
-        for f in 0..8 {
-            history.extend(tui_frame(&frame_lines(f), if f == 0 { 0 } else { 10 }));
-        }
-
-        let wait_for = |term: &RemoteTerminal, needle: &str| -> String {
-            let mut dump = String::new();
-            for _ in 0..400 {
-                dump = full_dump(term);
-                if dump.contains(needle) {
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            }
-            dump
-        };
-        let ws = |cols: u16| WinSize {
-            cols,
-            rows: 24,
-            cell_w: 8,
-            cell_h: 17,
-        };
-
-        let (client_side, mut daemon_side) = UnixStream::pair().unwrap();
-        let mut live = RemoteTerminal::from_stream(client_side, TermSize::new(100, 24)).unwrap();
-        DaemonMsg::Output(history.clone())
-            .encode(&mut daemon_side)
-            .unwrap();
-        daemon_side.flush().unwrap();
-        let dump = wait_for(&live, "f07 l09");
-        assert!(dump.contains("f07 l09"), "live output should have landed");
-        live.resize(TermSize::new(80, 24), 8, 17);
-        let live_count = full_dump(&live).matches(MARK).count();
-        assert_eq!(
-            live_count, 10,
-            "live rendering is clean: each redraw erases the previous frame, \
-             so exactly one 10-line copy survives the resize"
-        );
-
-        let (client_side, mut daemon_side) = UnixStream::pair().unwrap();
-        let replay = RemoteTerminal::from_stream(client_side, TermSize::new(80, 24)).unwrap();
-        DaemonMsg::Size(ws(100)).encode(&mut daemon_side).unwrap();
-        DaemonMsg::Snapshot(history.clone())
-            .encode(&mut daemon_side)
-            .unwrap();
-        DaemonMsg::Size(ws(80)).encode(&mut daemon_side).unwrap();
-        DaemonMsg::Snapshot(Vec::new())
-            .encode(&mut daemon_side)
-            .unwrap();
-        daemon_side.flush().unwrap();
-        let dump = wait_for(&replay, "f07 l09");
-        {
-            use alacritty_terminal::grid::Dimensions as _;
-            let mut cols = 0;
-            for _ in 0..400 {
-                cols = replay.term.lock().columns();
-                if cols == 80 {
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            }
-            assert_eq!(cols, 80, "the trailing pair must end the grid at 80 cols");
-        }
-        let replay_count = dump.matches(MARK).count();
-        assert_eq!(
-            replay_count, live_count,
-            "the segmented replay must reproduce the live rendering exactly"
-        );
-
-        let (client_side, mut daemon_side) = UnixStream::pair().unwrap();
-        let flat = RemoteTerminal::from_stream(client_side, TermSize::new(80, 24)).unwrap();
-        DaemonMsg::Size(ws(80)).encode(&mut daemon_side).unwrap();
-        DaemonMsg::Snapshot(history)
-            .encode(&mut daemon_side)
-            .unwrap();
-        daemon_side.flush().unwrap();
-        let dump = wait_for(&flat, "f07 l09");
-        let flat_count = dump.matches(MARK).count();
-        assert!(
-            flat_count > live_count,
-            "flat replay at the final width should duplicate (got {flat_count}); \
-             if it stopped, the segmented path may no longer be exercising anything"
-        );
     }
 }
 

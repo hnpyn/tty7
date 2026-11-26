@@ -85,13 +85,6 @@ impl ParkedCursorScanner {
         Self::default()
     }
 
-    /// Forgets the run in progress. A replayed snapshot rebuilds the screen
-    /// from scratch, so whatever the live stream was in the middle of no longer
-    /// describes the cursor on it.
-    pub fn reset(&mut self) {
-        *self = Self::default();
-    }
-
     /// Between sequences. Text only leaves on `0x1b`.
     pub fn is_ground(&self) -> bool {
         self.state == State::Text
@@ -212,12 +205,6 @@ struct Hidden {
 }
 
 impl ParkedCursorRepair {
-    /// Drops the remembered cell, for the same reason [`ParkedCursorScanner::reset`]
-    /// drops its run.
-    pub fn reset(&mut self) {
-        self.hidden = None;
-    }
-
     /// A hide and a show further apart than this are an application keeping the
     /// cursor off for the length of some work, not a renderer bracketing one
     /// frame — whatever it shows the cursor on is its own choice and stands.

@@ -81,9 +81,6 @@ pub fn translate_ja(key: L10nKey) -> Option<&'static str> {
         L10nKey::ComposerEffortTip => "推論の強さ  ·  クリックして変更",
         L10nKey::AppMenuMinimize => "最小化",
         L10nKey::AppMenuZoom => "ズーム",
-        L10nKey::PaneRestoredScreenBanner => {
-            "復元された画面 — 以下は新しいシェルで、これより上のものは動いていません"
-        }
         L10nKey::IntegrationNoticeBlocked => {
             "“{wrapper}”がこのペインのシェルレポートを横取りしているため、インライン補完と Ctrl+R メニューは使えません。シェル独自の履歴検索は引き続き使えます。"
         }

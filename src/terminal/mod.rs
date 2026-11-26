@@ -29,7 +29,7 @@ mod smart_select;
 mod typeahead;
 pub mod view;
 
-pub use remote::{PaneRoute, PaneWorkspace, attach_refused, attach_unanswered, shutdown_panes};
+pub use remote::{PaneRoute, PaneWorkspace, shutdown_panes};
 #[cfg(target_os = "windows")]
 pub(crate) use remote::{notify_desktop_for_pane, toast_activated};
 pub use size::TermSize;

@@ -345,20 +345,6 @@ pub trait Host: Send + Sync + 'static {
     fn is_connected(&self) -> bool {
         true
     }
-
-    /// What is running inside one of this host's panes, and what it is
-    /// listening on — or `None` where this host cannot say.
-    ///
-    /// `None` is not "nothing is running": it is the answer from a host whose
-    /// panes are somebody else's to describe. The local host gives it, because
-    /// its panes belong to the daemon the caller asks directly; so does a peer
-    /// too old to know the request. Callers must keep the two apart — an empty
-    /// list means the pane really is serving nothing, and drawing "no ports"
-    /// over "we could not ask" is how a remote pane came to look idle while a
-    /// dev server was up in it.
-    fn pane_procs(&self, _pane_id: u64) -> Option<crate::daemon::protocol::PaneProcs> {
-        None
-    }
 }
 
 /// Did this watch event mean something *changed*, or only that something was

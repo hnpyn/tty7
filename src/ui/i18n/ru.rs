@@ -79,9 +79,6 @@ pub fn translate_ru(key: L10nKey) -> Option<&'static str> {
         L10nKey::ComposerEffortTip => "Глубина рассуждений · нажмите, чтобы сменить",
         L10nKey::AppMenuMinimize => "Свернуть",
         L10nKey::AppMenuZoom => "Изменить масштаб",
-        L10nKey::PaneRestoredScreenBanner => {
-            "экран восстановлен, оболочка новая: ничего из того, что выше, уже не работает"
-        }
         L10nKey::IntegrationNoticeBlocked => {
             "«{wrapper}» перехватывает сообщения оболочки в этой панели. Встроенное дополнение и меню Ctrl+R недоступны. Поиск по истории самой оболочки работает."
         }

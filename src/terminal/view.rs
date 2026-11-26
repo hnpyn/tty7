@@ -109,19 +109,13 @@ pub struct ChildExited;
 
 impl gpui::EventEmitter<ChildExited> for TerminalView {}
 
-pub struct AuthPromptReady;
-
-impl gpui::EventEmitter<AuthPromptReady> for TerminalView {}
-
 pub struct AgentSessionChanged;
 
 impl gpui::EventEmitter<AgentSessionChanged> for TerminalView {}
 
 /// A coding agent started running in this pane: its foreground went from no
 /// agent to this one. What quick launch counts as the agent being used.
-pub struct AgentDetected(
-    #[cfg_attr(not(test), allow(dead_code))] pub crate::core::cli_agent::CLIAgent,
-);
+pub struct AgentDetected(#[allow(dead_code)] pub crate::core::cli_agent::CLIAgent);
 
 impl gpui::EventEmitter<AgentDetected> for TerminalView {}
 
@@ -152,7 +146,6 @@ pub struct ShellParts {
     pub(crate) pane_id: u64,
     shell_spec: Option<ShellSpec>,
     pub(crate) workspace: Option<crate::terminal::PaneWorkspace>,
-    pub(crate) restored: bool,
     pub(crate) owner: Option<crate::core::session::WorkspaceId>,
     /// Set when a configured shell failed and the login shell was used instead.
     pub(crate) shell_notice: Option<String>,
@@ -175,9 +168,8 @@ impl gpui::Global for AgentReadMarks {}
 struct AgentReadMark {
     session: (Option<String>, Option<Vec<String>>),
     /// The status the pane's last view saw. Kept for every status, not only
-    /// `Done`, so that a pane with no mark at all is one this app never watched
-    /// an agent in — the only case where a reattach's replayed status may be
-    /// taken as a baseline (see `poll_agent_status`).
+    /// `Done`, so a later view can tell a turn the reader already saw from one
+    /// that finished after they left (#870).
     status: Option<crate::core::cli_agent::AgentStatus>,
     turns: u64,
     unread: bool,
@@ -261,8 +253,6 @@ pub struct TerminalView {
     pub pane_id: u64,
     shell_spec: Option<ShellSpec>,
     owner_workspace: Option<crate::core::session::WorkspaceId>,
-    restored: bool,
-    ssh_spec: Option<Box<crate::daemon::protocol::NativeSshSpec>>,
     remote_clipboard_write_in_flight: Option<u64>,
     remote_clipboard_write_generation: u64,
     pub focus_handle: FocusHandle,
@@ -317,20 +307,6 @@ pub struct TerminalView {
     /// it dialled, so a window full of them is still readable (#438); for a
     /// workspace pane it is the workspace's name, set in `set_workspace`.
     pub(super) default_title: String,
-    /// The link supervisor asked this pane's machine for a relink and was
-    /// refused — the pane is gone at the far end, and asking again can only
-    /// repeat the answer. Cleared when a relink is adopted anyway (the manual
-    /// reconnect path), which is the one thing that changes the question.
-    #[cfg_attr(not(test), allow(dead_code))]
-    relink_abandoned: bool,
-    /// A relink for this pane is already on the wire. Both askers set it —
-    /// the machine-level reconnect and the pump's own sweep — because the
-    /// daemon keeps exactly one subscriber per pane and a second `Attach`
-    /// kicks the first. Without this the pump would join a dial still in
-    /// flight every 250 ms, and a dial can sit for fifteen seconds waiting
-    /// for the far end's verdict.
-    #[cfg_attr(not(test), allow(dead_code))]
-    relink_inflight: bool,
     pub marked_text: String,
     last_mouse_cell: Option<(usize, usize)>,
     /// The button whose press this pane reported to the application, until
@@ -450,9 +426,6 @@ pub struct TerminalView {
     /// Whether the current scope's list is a finished load rather than the
     /// empty placeholder one starts as. Only a finished one is worth stashing.
     history_ready: bool,
-    /// A native SSH pane's far-end history is still owed to the current scope:
-    /// it was entered before the pane's connection was up.
-    history_seed_pending: bool,
     /// Bumped by every history load, so only the latest one is installed.
     history_load_gen: u64,
     ranked_cwd: Option<std::path::PathBuf>,
@@ -541,8 +514,6 @@ enum LinkAt {
 pub(crate) enum PortRoute {
     /// The port is already reachable here under its own number.
     Direct,
-    /// A local forward has to exist first; the pane's `ForwardRoute` builds it.
-    Forward,
     /// Another machine's port, with no way to reach it from here.
     #[default]
     Blocked,
@@ -552,8 +523,6 @@ pub(crate) enum PortRoute {
 pub(super) enum LoopbackPlan {
     Direct,
     NoForwardNeeded,
-    ForwardOnPane(u64),
-    ForwardOnWorkspace(Box<crate::terminal::PaneWorkspace>),
 }
 
 /// What a pane's loopback port takes to open, given how its links would be
@@ -569,7 +538,6 @@ fn port_route_of(plan: &LoopbackPlan, local: bool) -> PortRoute {
         // WSL shares this machine's loopback, so its ports are already here
         // under the same number.
         LoopbackPlan::NoForwardNeeded => PortRoute::Direct,
-        LoopbackPlan::ForwardOnPane(_) | LoopbackPlan::ForwardOnWorkspace(_) => PortRoute::Forward,
         // No plan and no forwarding: this machine's own ports open, and
         // another machine's do not.
         LoopbackPlan::Direct if local => PortRoute::Direct,
@@ -583,24 +551,14 @@ pub(super) fn loopback_plan(
     remote_kind: Option<crate::daemon::protocol::RemoteKind>,
     pane_id: u64,
 ) -> LoopbackPlan {
+    let _ = (remote_kind, pane_id);
     if !enabled {
         return LoopbackPlan::Direct;
     }
-    if let Some(ws) = workspace {
-        if ws.shares_localhost() {
-            return LoopbackPlan::NoForwardNeeded;
-        }
-        if ws.spec.is_none() {
-            log::warn!("remote workspace has no connection spec; not forwarding localhost links");
-            return LoopbackPlan::Direct;
-        }
-        return LoopbackPlan::ForwardOnWorkspace(Box::new(ws.clone()));
-    }
-    match remote_kind {
-        Some(crate::daemon::protocol::RemoteKind::NativeSsh) => {
-            LoopbackPlan::ForwardOnPane(pane_id)
-        }
-        _ => LoopbackPlan::Direct,
+    if workspace.is_some_and(|ws| ws.shares_localhost()) {
+        LoopbackPlan::NoForwardNeeded
+    } else {
+        LoopbackPlan::Direct
     }
 }
 
@@ -689,8 +647,6 @@ enum HistorySeedSource {
     None,
     /// The workspace host's own shell history files, through its `Host`.
     WorkspaceHost,
-    /// The far end's shell history files, over the pane's own SSH connection.
-    PaneSftp,
 }
 
 fn history_seed_source(
@@ -698,21 +654,13 @@ fn history_seed_source(
     host_is_local: bool,
     remote: Option<crate::daemon::protocol::RemoteKind>,
 ) -> HistorySeedSource {
-    use crate::daemon::protocol::RemoteKind;
     if scope_is_local {
         return HistorySeedSource::None;
     }
     match remote {
-        // tty7 holds this pane's SSH connection itself, so the far end's
-        // files are one SFTP read away — and with shell integration on, the
-        // prompt editor is the only history the user gets (#1142).
-        Some(RemoteKind::NativeSsh) => HistorySeedSource::PaneSftp,
-        // The Host reaches the workspace machine's home directory and nothing
-        // beyond it. A pane that has ssh'ed onward from there is scoped to the
-        // *inner* target, and seeding that scope from the workspace host's
-        // ~/.zsh_history would offer commands from the wrong box — the exact
-        // confusion scoping exists to prevent. Those panes start from what
-        // tty7 recorded for the inner target, like bare ssh.
+        // A pane that has ssh'ed onward is scoped to the inner target. Seeding
+        // that scope from the workspace host's history would offer commands
+        // from the wrong box. Those panes start from what tty7 recorded.
         Some(_) => HistorySeedSource::None,
         None if host_is_local => HistorySeedSource::None,
         None => HistorySeedSource::WorkspaceHost,
@@ -1079,41 +1027,6 @@ fn write_clipboard_image(img: &gpui::Image) -> Option<std::path::PathBuf> {
     Some(path)
 }
 
-/// The connection a paste should be uploaded over, when this pane runs on a
-/// remote host reachable over the daemon's russh stack: either a native SSH
-/// workspace pane or a standalone native SSH pane. WSL shares localhost and
-/// needs path translation instead, and a workspace without connection details
-/// has no channel to piggyback on — both keep the local-path behavior.
-fn remote_paste_spec<'a>(
-    workspace: Option<&'a crate::terminal::PaneWorkspace>,
-    ssh_spec: Option<&'a crate::daemon::protocol::NativeSshSpec>,
-) -> Option<&'a crate::daemon::protocol::NativeSshSpec> {
-    if let Some(ws) = workspace {
-        if ws.shares_localhost() {
-            return None;
-        }
-        return ws.spec.as_deref();
-    }
-    ssh_spec
-}
-
-/// Whether this pane may hand a remote program's image to the system clipboard.
-///
-/// The daemon is the gate. It holds the `NativeSshSpec` that dialled the host
-/// and answers a write the profile forbids with `EPERM` before a byte of image
-/// reaches this process; a pane it never granted the permission to sends no
-/// `ClipboardWrite` at all. This is a second opinion, and it can only give one
-/// when the pane kept a copy of that spec. A pane restored by attaching to its
-/// id did not keep one — reading that absence as "forbidden" is what put the
-/// permission to sleep on the first restart after the user granted it. So:
-/// refuse what this side can see is forbidden, and defer otherwise.
-fn allows_remote_clipboard_write(
-    workspace: Option<&crate::terminal::PaneWorkspace>,
-    ssh_spec: Option<&crate::daemon::protocol::NativeSshSpec>,
-) -> bool {
-    remote_paste_spec(workspace, ssh_spec).is_none_or(|spec| spec.remote_clipboard_write)
-}
-
 /// Whether a pane stages the clipboard image to a file instead of forwarding
 /// SYN and letting the agent read the clipboard itself.
 ///
@@ -1242,35 +1155,6 @@ fn local_path_for_pane(local: &str, shares_localhost: bool) -> String {
         return wsl_path(local).unwrap_or_else(|| local.to_string());
     }
     local.to_string()
-}
-
-/// Staging pastes under the SSH user's own home keeps them out of the
-/// world-writable `/tmp`, where any local account could pre-create the
-/// directory, read what lands in it, or swap a pasted file for one of its own
-/// before the pane's agent opens it.
-#[cfg(test)]
-const REMOTE_CLIPBOARD_PATH: [&str; 3] = [".cache", "tty7", "clipboard"];
-
-/// Owner-only, and *only* owner: a staging directory anyone else can enter is
-/// one anyone else can read the pasted files out of.
-#[cfg(test)]
-const REMOTE_CLIPBOARD_MODE: u32 = 0o700;
-
-/// Whether a prepared staging directory may be uploaded into.
-///
-/// The mode is what a `stat` reported after a `chmod 0700` the daemon watched
-/// succeed, which is the ownership proof: POSIX only lets a file's owner
-/// change its mode. A symlink is refused because `stat` follows links.
-#[cfg(test)]
-fn staging_dir_is_safe(
-    is_symlink: bool,
-    kind: Option<crate::daemon::protocol::SftpEntryKind>,
-    mode: u32,
-) -> bool {
-    use crate::daemon::protocol::SftpEntryKind;
-    !is_symlink
-        && matches!(kind, Some(SftpEntryKind::Dir))
-        && mode & 0o7777 == REMOTE_CLIPBOARD_MODE
 }
 
 /// The staging directory to reuse on the next paste. A failed preparation is
@@ -1452,75 +1336,22 @@ impl TerminalView {
         use_config_shell: bool,
     ) -> anyhow::Result<ShellParts> {
         let route = crate::terminal::PaneRoute::for_workspace(workspace.as_ref());
-        let attached = match restore_pane {
-            Some(id) => match RemoteTerminal::attach_on(&route, TermSize::new(80, 24), 8, 17, id) {
-                Ok(terminal) => Some((terminal, id, None)),
-                Err(e) if crate::terminal::attach_unanswered(&e) => {
-                    // Not "gone": nobody answered, which a daemon still coming
-                    // up also does. Whoever finds an orphaned shell later
-                    // reads this line.
-                    log::warn!("attach to pane {id} went unanswered ({e:#}); spawning fresh");
-                    None
-                }
-                Err(e) if crate::terminal::attach_refused(&e) => {
-                    log::info!("pane {id} is gone on its machine ({e:#}); spawning fresh");
-                    None
-                }
-                // The daemon never got to say either way: the link to its
-                // machine would not open, or broke before it answered. The pane
-                // is most likely still running over there, so a fresh shell in
-                // its place would orphan it — its scrollback, its agent session,
-                // whatever it was doing — and put a stranger in its tab. Fail,
-                // and let a retry reach the pane itself.
-                Err(e) if !route.is_local() => {
-                    log::info!("pane {id} could not be reached to reattach ({e:#})");
-                    return Err(e.context(format!(
-                        "could not reach pane {id}, which may still be running"
-                    )));
-                }
-                Err(e) => {
-                    log::info!("pane {id} is gone ({e:#}); spawning fresh");
-                    None
-                }
-            },
-            None => None,
-        };
-        let restored = attached.is_some();
-        let (terminal, pane_id, shell_spec) = match attached {
-            Some(parts) => parts,
-            None => {
-                // The pane this one stands in for is gone, but its screen may
-                // not be: if the daemon kept a copy, the new pane opens showing
-                // it, under a line saying the shell below is new. Asking costs
-                // nothing when there is no copy — the daemon answers by
-                // spawning the blank pane it would have spawned anyway.
-                let restore = restore_pane.map(|pane_id| crate::daemon::protocol::RestoreFrom {
-                    pane_id,
-                    banner: Some(
-                        crate::ui::i18n::t(crate::ui::i18n::L10nKey::PaneRestoredScreenBanner)
-                            .to_string(),
-                    ),
-                });
-                let (terminal, id) = RemoteTerminal::spawn_on(
-                    &route,
-                    TermSize::new(80, 24),
-                    8,
-                    17,
-                    working_directory,
-                    shell.clone(),
-                    owner.map(|id| id.to_string()),
-                    restore,
-                    use_config_shell,
-                )?;
-                (terminal, id, shell)
-            }
-        };
+        let _ = restore_pane;
+        let (terminal, pane_id) = RemoteTerminal::spawn_on(
+            &route,
+            TermSize::new(80, 24),
+            8,
+            17,
+            working_directory,
+            shell.clone(),
+            owner.map(|id| id.to_string()),
+            use_config_shell,
+        )?;
         Ok(ShellParts {
             terminal,
             pane_id,
-            shell_spec,
+            shell_spec: shell,
             workspace,
-            restored,
             owner,
             shell_notice: None,
         })
@@ -1534,7 +1365,6 @@ impl TerminalView {
         let mut view = Self::with_terminal(parts.terminal, parts.pane_id, window, cx);
         view.shell_spec = parts.shell_spec;
         view.owner_workspace = parts.owner;
-        view.restored = parts.restored;
         view.set_workspace(parts.workspace);
         view
     }
@@ -1556,7 +1386,7 @@ impl TerminalView {
             .map(crate::core::config::gpui_font_features);
         let report_mouse = config.mouse_reporting;
         let prompt_editor = config.prompt_editor;
-        let agent_detection_armed = !terminal.reattached();
+        let agent_detection_armed = true;
         let mut font = gpui::font(font_family);
         font.fallbacks = Some(gpui::FontFallbacks::from_fonts(fallbacks.clone()));
         if let Some(features) = &font_features {
@@ -1705,8 +1535,6 @@ impl TerminalView {
             pane_id,
             shell_spec: None,
             owner_workspace: None,
-            restored: false,
-            ssh_spec: None,
             remote_clipboard_write_in_flight: None,
             remote_clipboard_write_generation: 0,
             focus_handle,
@@ -1734,8 +1562,6 @@ impl TerminalView {
             title: DEFAULT_TITLE.to_string(),
             pending_title: None,
             default_title: DEFAULT_TITLE.to_string(),
-            relink_abandoned: false,
-            relink_inflight: false,
             marked_text: String::new(),
             last_mouse_cell: None,
             mouse_grab: None,
@@ -1796,7 +1622,6 @@ impl TerminalView {
             history_scope: super::history::Scope::Local,
             history_cache: Vec::new(),
             history_ready: true,
-            history_seed_pending: false,
             history_load_gen: 0,
             ranked_cwd: None,
             history_nav: None,
@@ -1963,30 +1788,6 @@ impl TerminalView {
         })
     }
 
-    #[cfg(test)]
-    #[allow(clippy::too_many_arguments)]
-    pub fn adopt_relink(
-        &mut self,
-        stream: crate::terminal::remote::Stream,
-        buffered: Vec<u8>,
-        route: &crate::terminal::PaneRoute,
-        size: TermSize,
-        cell_w: u16,
-        cell_h: u16,
-        cx: &mut Context<Self>,
-    ) -> anyhow::Result<()> {
-        self.remote_clipboard_write_generation =
-            self.remote_clipboard_write_generation.wrapping_add(1);
-        self.remote_clipboard_write_in_flight = None;
-        self.terminal
-            .adopt_relink(stream, buffered, route, size, cell_w, cell_h)?;
-        self.relink_abandoned = false;
-        self.relink_inflight = false;
-        self.title = self.default_title.clone();
-        cx.notify();
-        Ok(())
-    }
-
     pub fn host_cwd(&self) -> Option<std::path::PathBuf> {
         self.cwd_is_on_host().then(|| self.cwd())?
     }
@@ -2136,44 +1937,6 @@ impl TerminalView {
         self.shell_spec.as_ref().map(|s| s.program.clone())
     }
 
-    /// Whether this pane is a workspace pane whose link died under it — the
-    /// far-end session should still be alive, so the link supervisor keeps
-    /// asking for it back. A child that exited is over, not disconnected, and
-    /// a pane whose machine already refused the relink is past asking.
-    #[cfg(test)]
-    pub fn wants_relink(&self) -> bool {
-        self.workspace.is_some()
-            && self.terminal.exited
-            && !self.terminal.child_exited()
-            && !self.relink_abandoned
-            && !self.relink_inflight
-    }
-
-    /// Claims this pane for one relink attempt. Every path that dials for a
-    /// pane calls this first, so the other paths leave it alone until the
-    /// attempt reports back through `relink_settled` or `adopt_relink`.
-    #[cfg(test)]
-    pub fn mark_relinking(&mut self) {
-        self.relink_inflight = true;
-    }
-
-    /// Releases the claim `mark_relinking` took, for the attempts that end
-    /// without a stream to adopt. A pane freed this way is up for asking
-    /// again on the next sweep.
-    #[cfg(test)]
-    pub fn relink_settled(&mut self) {
-        self.relink_inflight = false;
-    }
-
-    /// Records that this pane's machine refused to give the pane back — it is
-    /// gone at the far end — so the link supervisor stops asking. The pane
-    /// keeps its disconnected face; only the retrying stops.
-    #[cfg(test)]
-    pub fn abandon_relink(&mut self) {
-        self.relink_abandoned = true;
-        self.relink_inflight = false;
-    }
-
     /// Takes a title the program set, and gives it to the tab only once it has
     /// stood for `TITLE_SETTLE`.
     ///
@@ -2215,18 +1978,8 @@ impl TerminalView {
         if self.remote_clipboard_write_in_flight.is_some() {
             return;
         }
-        let write = loop {
-            let Some(write) = self.terminal.pop_clipboard_write() else {
-                return;
-            };
-            if allows_remote_clipboard_write(self.workspace.as_ref(), self.ssh_spec.as_deref()) {
-                break write;
-            }
-            self.terminal.finish_clipboard_write();
-            self.terminal.write(tty7_core::core::clipboard::response(
-                write.id.as_deref(),
-                "EPERM",
-            ));
+        let Some(write) = self.terminal.pop_clipboard_write() else {
+            return;
         };
 
         let generation = self.remote_clipboard_write_generation;
@@ -2267,9 +2020,6 @@ impl TerminalView {
         self.terminal.poll_exited();
         self.sync_typeahead_owner();
         self.poll_remote_clipboard_write(cx);
-        if self.terminal.has_pending_auth() {
-            cx.emit(AuthPromptReady);
-        }
         match ev {
             AlacEvent::Wakeup => {
                 // The grid moved under whatever the search bar last measured.
@@ -3536,8 +3286,7 @@ impl TerminalView {
     /// this took the paste over. `false` leaves the caller forwarding SYN —
     /// see [`stages_clipboard_image`] for when that is the better path.
     fn paste_clipboard_image_as_path(&mut self, img: &gpui::Image, cx: &mut Context<Self>) -> bool {
-        let is_remote =
-            remote_paste_spec(self.workspace.as_ref(), self.ssh_spec.as_deref()).is_some();
+        let is_remote = false;
         if !stages_clipboard_image(is_remote) {
             return false;
         }
@@ -3818,7 +3567,6 @@ impl TerminalView {
     fn follow_history_scope(&mut self, cx: &mut Context<Self>) {
         let scope = self.desired_history_scope();
         if scope == self.history_scope {
-            self.seed_history_when_connected(cx);
             return;
         }
         self.flush_pending_history();
@@ -3852,33 +3600,8 @@ impl TerminalView {
         self.rerank_history(ranked_cwd.as_deref());
         cx.notify();
 
-        self.history_seed_pending = false;
         let fetch = self.history_seed_fetch(cx);
         self.spawn_history_load(scope, fetch, cx);
-    }
-
-    fn ssh_connected(&self) -> bool {
-        matches!(
-            self.terminal.ssh_phase(),
-            Some(crate::daemon::protocol::SshPhase::Connected)
-        )
-    }
-
-    /// The far-end seed a native SSH pane deferred until its connection was
-    /// up, fetched the first time it is.
-    fn seed_history_when_connected(&mut self, cx: &mut Context<Self>) {
-        if !self.history_seed_pending || !self.ssh_connected() {
-            return;
-        }
-        self.history_seed_pending = false;
-        let fetch = self.history_seed_fetch(cx);
-        if matches!(fetch, HistorySeedFetch::None) {
-            return;
-        }
-        // A command still waiting for its exit code stays pending: the load
-        // will not hold it, and `install_loaded_history` keeps it from the
-        // list it replaces. Flushing here would record it without the exit.
-        self.spawn_history_load(self.history_scope.clone(), fetch, cx);
     }
 
     /// Load `scope`'s list off the UI thread and install it, unless the pane
@@ -3952,7 +3675,6 @@ impl TerminalView {
             HistorySeedSource::WorkspaceHost => {
                 HistorySeedFetch::Host(self.workspace_host_history_files(cx))
             }
-            HistorySeedSource::PaneSftp => HistorySeedFetch::None,
         }
     }
 
@@ -4019,33 +3741,6 @@ impl TerminalView {
     ) -> bool {
         use crate::core::cli_agent::AgentStatus;
 
-        // Attaching to a pane the daemon kept alive — the app restarting onto
-        // last session's tabs above all — has the daemon replay the pane's
-        // stored agent status as an ordinary report. When this app has never
-        // watched the pane, that is a baseline, not an edge: the turn it
-        // describes ended before this view existed, often before this process
-        // did, and reading it as "a result just landed" is what used to bring
-        // every restored agent tab up wearing an unread badge for output its
-        // reader had long since read.
-        //
-        // When an earlier view of this app did watch the pane (a workspace
-        // switched out and back, a window reopened from the tray), its read
-        // mark knows more than the replay does, so the replay stays an edge and
-        // the mark decides below: the same finished turn takes its badge back
-        // as the reader left it, anything else is news (#870).
-        let adopted_baseline = match self.terminal.take_replayed_agent_status() {
-            Some(restored)
-                if !cx
-                    .try_global::<AgentReadMarks>()
-                    .is_some_and(|marks| marks.0.contains_key(&(self.host_id, self.pane_id))) =>
-            {
-                self.last_agent_status = restored;
-                self.agent_status_seen = true;
-                true
-            }
-            _ => false,
-        };
-
         let session = self.terminal.agent_session();
         if session.as_ref().is_some_and(|s| s.rich) {
             self.agent_was_rich = true;
@@ -4065,11 +3760,6 @@ impl TerminalView {
 
         let status = session.as_ref().map(|s| s.status);
         let turns = session.as_ref().map_or(0, |s| s.turns);
-        if adopted_baseline {
-            // From here on this app is watching the pane, so a later rebuild
-            // must find a mark rather than adopt its own replay.
-            self.record_agent_read_mark(turns, cx);
-        }
         if status == self.last_agent_status {
             return false;
         }
@@ -5140,19 +4830,8 @@ impl TerminalView {
     }
 
     fn remote_ssh_cwd(&self) -> Option<String> {
-        let owned = match self.terminal.remote_context() {
-            Some(remote) => remote.kind == crate::daemon::protocol::RemoteKind::NativeSsh,
-            // A WSL workspace carries no SSH spec: there is no connection to
-            // list over, and its panes complete through the `\\wsl$` share
-            // instead — so only a spec-carrying (SSH) workspace claims the
-            // remote-listing path.
-            None => self.workspace.as_ref().is_some_and(|w| w.spec.is_some()),
-        };
-        if !owned {
-            return None;
-        }
-        let cwd = self.cwd()?.to_string_lossy().into_owned();
-        cwd.starts_with('/').then_some(cwd)
+        let _ = (self.terminal.remote_context(), self.workspace.as_ref());
+        None
     }
 
     fn spawn_remote_path_completion(
@@ -8131,9 +7810,8 @@ mod tests {
     };
     use super::{SCROLL_ANIM_FRAME, scroll_anim_step};
     use super::{
-        TitleSettle, files_cwd, local_path_for_pane, remote_paste_spec, settle_title,
-        stages_clipboard_image, staging_cache, staging_dir_is_safe, wsl_path, wsl_share_distro,
-        wsl_share_path,
+        TitleSettle, files_cwd, local_path_for_pane, settle_title, stages_clipboard_image,
+        staging_cache, wsl_path, wsl_share_distro, wsl_share_path,
     };
     use super::{
         before_input, description_budget, drag_scroll_step, elide, encode_mouse,
@@ -8151,25 +7829,6 @@ mod tests {
     use crate::core::session::{RemoteTarget, WorkspaceId};
     use crate::daemon::protocol::RemoteKind;
     use crate::terminal::PaneWorkspace;
-
-    /// #1142: a native SSH host pane runs tty7's prompt editor over the far
-    /// shell, so the far shell's own history is never consulted — the
-    /// editor's list is all ↑, Ctrl+R and the ghost suggestion have. That
-    /// list has to be seeded from the far end's files, over the pane's own
-    /// connection, the way a workspace pane's is.
-    #[test]
-    fn a_native_ssh_pane_seeds_its_history_from_the_far_end() {
-        use super::{HistorySeedSource, history_seed_source};
-        assert_eq!(
-            history_seed_source(false, true, Some(RemoteKind::NativeSsh)),
-            HistorySeedSource::PaneSftp,
-        );
-        // Inside a workspace, too: the connection is the pane's own either way.
-        assert_eq!(
-            history_seed_source(false, false, Some(RemoteKind::NativeSsh)),
-            HistorySeedSource::PaneSftp,
-        );
-    }
 
     #[test]
     fn history_seeding_keeps_to_the_machine_the_scope_names() {
@@ -8405,21 +8064,11 @@ mod tests {
         assert!(typeahead_boundary("d", &ctrl_alt).is_none());
     }
 
-    fn ws(target: RemoteTarget, with_spec: bool) -> PaneWorkspace {
+    fn ws(target: RemoteTarget) -> PaneWorkspace {
         PaneWorkspace {
             workspace: WorkspaceId::new(),
             target,
-            spec: with_spec.then(|| {
-                Box::new(
-                    serde_json::from_str(
-                        r#"{"host":"dev.box","port":22,"user":"me","auth_mode":"auto"}"#,
-                    )
-                    .unwrap(),
-                )
-            }),
             label: None,
-            resize_echo: false,
-            size_lease: false,
         }
     }
 
@@ -8428,42 +8077,10 @@ mod tests {
         assert_eq!(loopback_plan(true, None, None, 1), LoopbackPlan::Direct);
     }
 
-    #[test]
-    fn ssh_pane_forwards_on_the_pane() {
-        assert_eq!(
-            loopback_plan(true, None, Some(RemoteKind::NativeSsh), 7),
-            LoopbackPlan::ForwardOnPane(7)
-        );
-        assert_eq!(
-            loopback_plan(true, None, Some(RemoteKind::Wsl), 7),
-            LoopbackPlan::Direct
-        );
-    }
-
-    #[test]
-    fn remote_workspace_pane_forwards_on_the_workspace() {
-        let w = ws(RemoteTarget::direct("me", "dev.box", 22), true);
-        assert_eq!(
-            loopback_plan(true, Some(&w), None, 7),
-            LoopbackPlan::ForwardOnWorkspace(Box::new(w.clone())),
-            "no RemoteContext, but still forwarded"
-        );
-        assert_eq!(
-            loopback_plan(true, Some(&w), Some(RemoteKind::NativeSsh), 7),
-            LoopbackPlan::ForwardOnWorkspace(Box::new(w))
-        );
-    }
-
-    /// What the Ports list asks about every listener it found. The middle
-    /// case is the one that matters: a remote pane's port is not unreachable,
-    /// it is one forward away.
+    /// What the Ports list asks about every listener it found.
     #[test]
     fn a_remote_port_is_a_forward_away_rather_than_out_of_reach() {
         use super::port_route_of;
-        assert_eq!(
-            port_route_of(&LoopbackPlan::ForwardOnPane(7), false),
-            PortRoute::Forward
-        );
         assert_eq!(
             port_route_of(&LoopbackPlan::NoForwardNeeded, false),
             PortRoute::Direct,
@@ -8484,12 +8101,9 @@ mod tests {
 
     #[test]
     fn wsl_workspace_needs_no_forward() {
-        let w = ws(
-            RemoteTarget::Wsl {
-                distro: "Ubuntu".into(),
-            },
-            false,
-        );
+        let w = ws(RemoteTarget::Wsl {
+            distro: "Ubuntu".into(),
+        });
         assert_eq!(
             loopback_plan(true, Some(&w), None, 7),
             LoopbackPlan::NoForwardNeeded
@@ -8498,39 +8112,8 @@ mod tests {
 
     #[test]
     fn workspace_without_a_spec_does_not_forward() {
-        let w = ws(RemoteTarget::direct("me", "dev.box", 22), false);
+        let w = ws(RemoteTarget::direct("me", "dev.box", 22));
         assert_eq!(loopback_plan(true, Some(&w), None, 7), LoopbackPlan::Direct);
-    }
-
-    /// The SSH user a paste would be uploaded for, or `None` when the pane
-    /// keeps the local-path behavior.
-    fn remote_paste_user<'a>(
-        workspace: Option<&'a crate::terminal::PaneWorkspace>,
-        ssh_spec: Option<&'a crate::daemon::protocol::NativeSshSpec>,
-    ) -> Option<&'a str> {
-        remote_paste_spec(workspace, ssh_spec).map(|s| s.user.as_str())
-    }
-
-    fn native_spec() -> crate::daemon::protocol::NativeSshSpec {
-        serde_json::from_str(r#"{"host":"dev.box","port":22,"user":"me","auth_mode":"auto"}"#)
-            .unwrap()
-    }
-
-    #[test]
-    fn local_pane_pastes_the_local_image_path() {
-        assert_eq!(remote_paste_user(None, None), None);
-    }
-
-    #[test]
-    fn ssh_workspace_panes_upload_images_for_the_ssh_user() {
-        let w = ws(RemoteTarget::direct("me", "dev.box", 22), true);
-        assert_eq!(remote_paste_user(Some(&w), None), Some("me"));
-    }
-
-    #[test]
-    fn standalone_ssh_panes_upload_images_for_the_ssh_user() {
-        let spec = native_spec();
-        assert_eq!(remote_paste_user(None, Some(&spec)), Some("me"));
     }
 
     fn wsl_context(distro: &str) -> crate::daemon::protocol::RemoteContext {
@@ -8563,12 +8146,9 @@ mod tests {
     /// their host is never `LOCAL` — and the distro is still on this machine.
     #[test]
     fn a_wsl_workspace_pane_completes_over_the_share_its_target_names() {
-        let w = ws(
-            RemoteTarget::Wsl {
-                distro: "Ubuntu-24.04".into(),
-            },
-            false,
-        );
+        let w = ws(RemoteTarget::Wsl {
+            distro: "Ubuntu-24.04".into(),
+        });
         assert_eq!(
             wsl_share_distro(None, Some(&w), false),
             Some("Ubuntu-24.04".to_string())
@@ -8577,63 +8157,9 @@ mod tests {
 
     #[test]
     fn panes_with_no_distro_of_their_own_have_no_share() {
-        let ssh = ws(RemoteTarget::direct("me", "dev.box", 22), true);
+        let ssh = ws(RemoteTarget::direct("me", "dev.box", 22));
         assert_eq!(wsl_share_distro(None, Some(&ssh), false), None);
         assert_eq!(wsl_share_distro(None, None, true), None);
-    }
-
-    #[test]
-    fn wsl_and_specless_workspaces_keep_the_local_image_path() {
-        let wsl = ws(
-            RemoteTarget::Wsl {
-                distro: "Ubuntu".into(),
-            },
-            false,
-        );
-        assert_eq!(remote_paste_user(Some(&wsl), None), None);
-        let bare = ws(RemoteTarget::direct("me", "dev.box", 22), false);
-        assert_eq!(remote_paste_user(Some(&bare), None), None);
-    }
-
-    #[test]
-    fn a_staging_dir_is_only_safe_when_it_is_a_private_directory_we_own() {
-        use crate::daemon::protocol::SftpEntryKind;
-        // `chmod 0700` succeeded and the mode came back as asked: ours.
-        assert!(staging_dir_is_safe(
-            false,
-            Some(SftpEntryKind::Dir),
-            0o040700
-        ));
-        // A mode anyone else can enter is one anyone else can read pastes from.
-        assert!(!staging_dir_is_safe(
-            false,
-            Some(SftpEntryKind::Dir),
-            0o040755
-        ));
-        assert!(!staging_dir_is_safe(
-            false,
-            Some(SftpEntryKind::Dir),
-            0o040701
-        ));
-        // Sticky/setgid bits mean someone else set the terms.
-        assert!(!staging_dir_is_safe(
-            false,
-            Some(SftpEntryKind::Dir),
-            0o041700
-        ));
-        // A symlink is judged by its target by `stat`, so refuse it outright.
-        assert!(!staging_dir_is_safe(
-            true,
-            Some(SftpEntryKind::Dir),
-            0o040700
-        ));
-        // A file (or a path that vanished) is not a staging dir.
-        assert!(!staging_dir_is_safe(
-            false,
-            Some(SftpEntryKind::File),
-            0o100700
-        ));
-        assert!(!staging_dir_is_safe(false, None, 0o040700));
     }
 
     #[test]
@@ -8651,21 +8177,6 @@ mod tests {
             stages_clipboard_image(false),
             cfg!(not(target_os = "macos"))
         );
-    }
-
-    /// A pane restored by attaching to its id carries no copy of the spec that
-    /// dialled the host. The daemon still has one, and still refuses a write
-    /// the profile forbids — so a missing copy here is not a verdict.
-    #[test]
-    fn a_pane_without_its_own_spec_defers_to_the_daemons_verdict() {
-        let mut spec: crate::daemon::protocol::NativeSshSpec = serde_json::from_str(
-            r#"{"host":"build-box","port":22,"user":"me","auth_mode":"auto"}"#,
-        )
-        .unwrap();
-        assert!(!super::allows_remote_clipboard_write(None, Some(&spec)));
-        spec.remote_clipboard_write = true;
-        assert!(super::allows_remote_clipboard_write(None, Some(&spec)));
-        assert!(super::allows_remote_clipboard_write(None, None));
     }
 
     #[test]
@@ -8815,28 +8326,6 @@ mod tests {
     }
 
     #[test]
-    fn staged_images_land_under_the_remote_users_own_home() {
-        let mut dir = "/home/me".to_string();
-        for component in super::REMOTE_CLIPBOARD_PATH {
-            dir = if dir.is_empty() || dir == "/" {
-                format!("/{}", component.trim_start_matches('/'))
-            } else {
-                format!(
-                    "{}/{}",
-                    dir.trim_end_matches('/'),
-                    component.trim_start_matches('/')
-                )
-            };
-        }
-        assert_eq!(dir, "/home/me/.cache/tty7/clipboard");
-        assert!(
-            !dir.starts_with("/tmp"),
-            "a world-writable staging dir is exactly what this avoids"
-        );
-        assert_eq!(super::REMOTE_CLIPBOARD_MODE, 0o700);
-    }
-
-    #[test]
     fn the_pasted_image_name_stands_alone_as_a_remote_path_component() {
         use gpui::{Image, ImageFormat};
         let safe_local_name = |name: &str| {
@@ -8855,19 +8344,6 @@ mod tests {
         let path = super::write_clipboard_image(&Image::from_bytes(ImageFormat::Png, png)).unwrap();
         let name = path.file_name().unwrap().to_string_lossy().into_owned();
         assert!(safe_local_name(&name), "{name} must not traverse or nest");
-    }
-
-    #[test]
-    fn the_off_switch_disables_every_route() {
-        let w = ws(RemoteTarget::direct("me", "dev.box", 22), true);
-        assert_eq!(
-            loopback_plan(false, Some(&w), None, 7),
-            LoopbackPlan::Direct
-        );
-        assert_eq!(
-            loopback_plan(false, None, Some(RemoteKind::NativeSsh), 7),
-            LoopbackPlan::Direct
-        );
     }
 
     #[test]
@@ -10125,10 +9601,7 @@ mod tests {
         let ws = PaneWorkspace {
             workspace: WorkspaceId::new(),
             target: target.clone(),
-            spec: None,
             label: None,
-            resize_echo: false,
-            size_lease: false,
         };
 
         let remote = ws.target.host_id();
@@ -10143,10 +9616,7 @@ mod tests {
         let sibling = PaneWorkspace {
             workspace: WorkspaceId::new(),
             target,
-            spec: None,
             label: None,
-            resize_echo: false,
-            size_lease: false,
         };
         assert_eq!(sibling.target.host_id(), remote);
     }
@@ -10204,7 +9674,7 @@ pub(crate) fn quiet_reattached_test_pane(
     cx: &mut gpui::App,
 ) -> (gpui::Entity<TerminalView>, crate::terminal::remote::Stream) {
     let (client_side, daemon_side) = test_stream_pair();
-    let terminal = RemoteTerminal::from_stream_reattached(client_side, TermSize::new(80, 24))
+    let terminal = RemoteTerminal::from_stream(client_side, TermSize::new(80, 24))
         .expect("quiet reattached test terminal");
     let view = cx.new(|cx| TerminalView::with_terminal(terminal, pane_id, window, cx));
     (view, daemon_side)
@@ -10703,67 +10173,6 @@ mod gpui_tests {
             .unwrap();
     }
 
-    /// Reinstalling or restarting the app leaves the daemon — and every agent
-    /// in it — running, so each restored tab reattaches to a pane whose agent
-    /// finished its turn long ago. The daemon replays that status, and reading
-    /// it as a turn that just landed put an unread badge on every agent tab in
-    /// the window the moment it opened.
-    #[gpui::test]
-    fn a_restored_pane_does_not_badge_the_turn_it_reattached_to(cx: &mut TestAppContext) {
-        use crate::core::cli_agent::AgentStatus;
-
-        crate::core::config::pin_test_config_dir();
-        let (window, _root_daemon) = harness(cx);
-        let (pane, mut daemon) = window
-            .update(cx, |_, window, cx| {
-                super::quiet_reattached_test_pane(2, window, cx)
-            })
-            .unwrap();
-        window
-            .update(cx, |view, window, cx| {
-                view.focus_handle.clone().focus(window, cx);
-            })
-            .unwrap();
-        cx.run_until_parked();
-
-        report_agent_status(AgentStatus::Done, &pane, cx, &mut daemon);
-        window
-            .update(cx, |_, window, cx| {
-                pane.update(cx, |pane, cx| {
-                    pane.poll_agent_status(false, window, cx);
-                    assert!(
-                        !pane.agent_result_unread(),
-                        "the replayed status is where this pane starts, not a result that \
-                         just arrived"
-                    );
-                });
-            })
-            .unwrap();
-
-        // And the pane is still armed: the next turn it actually watches finish
-        // badges exactly as it would have without the reattach.
-        report_agent_status(AgentStatus::Working, &pane, cx, &mut daemon);
-        window
-            .update(cx, |_, window, cx| {
-                pane.update(cx, |pane, cx| {
-                    pane.poll_agent_status(false, window, cx);
-                });
-            })
-            .unwrap();
-        report_agent_status(AgentStatus::Done, &pane, cx, &mut daemon);
-        window
-            .update(cx, |_, window, cx| {
-                pane.update(cx, |pane, cx| {
-                    pane.poll_agent_status(false, window, cx);
-                    assert!(
-                        pane.agent_result_unread(),
-                        "a turn that finished while the reader was elsewhere is unread"
-                    );
-                });
-            })
-            .unwrap();
-    }
-
     /// Build `pane_id`'s first view (unfocused), let it watch `status` at
     /// `turns`, then rebuild the pane the way restoring a workspace does — a
     /// reattach, whose head is the daemon replaying `replayed` — and read the
@@ -10831,67 +10240,6 @@ mod gpui_tests {
             rebuild_by_reattach((AgentStatus::Done, 1), (AgentStatus::Done, 2), cx),
             "the second turn finished unseen"
         );
-    }
-
-    /// A relink keeps the view and what it last saw. A turn that was running
-    /// when the link dropped and finished before it came back reaches the view
-    /// only as the daemon's replay, and that replay has to badge: nobody saw
-    /// the turn finish.
-    #[gpui::test]
-    fn a_turn_that_finished_while_the_link_was_down_still_badges(cx: &mut TestAppContext) {
-        use crate::core::cli_agent::AgentStatus;
-
-        crate::core::config::pin_test_config_dir();
-        let (window, _root_daemon) = harness(cx);
-        let (pane, mut daemon) = window
-            .update(cx, |_, window, cx| {
-                super::quiet_reattached_test_pane(2, window, cx)
-            })
-            .unwrap();
-        window
-            .update(cx, |view, window, cx| {
-                view.focus_handle.clone().focus(window, cx);
-            })
-            .unwrap();
-        cx.run_until_parked();
-
-        report_agent_status(AgentStatus::Working, &pane, cx, &mut daemon);
-        window
-            .update(cx, |_, window, cx| {
-                pane.update(cx, |pane, cx| {
-                    pane.poll_agent_status(false, window, cx);
-                    assert!(!pane.agent_result_unread(), "the turn is still running");
-                });
-            })
-            .unwrap();
-
-        let (new_client, mut new_daemon) = super::test_stream_pair();
-        pane.update(cx, |pane, cx| {
-            pane.adopt_relink(
-                new_client,
-                Vec::new(),
-                &crate::terminal::PaneRoute::Local,
-                TermSize::new(80, 24),
-                8,
-                17,
-                cx,
-            )
-            .expect("the swap itself cannot fail");
-        });
-        drop(daemon);
-
-        report_agent_status(AgentStatus::Done, &pane, cx, &mut new_daemon);
-        window
-            .update(cx, |_, window, cx| {
-                pane.update(cx, |pane, cx| {
-                    pane.poll_agent_status(false, window, cx);
-                    assert!(
-                        pane.agent_result_unread(),
-                        "the turn finished while the link was down, so nobody read it"
-                    );
-                });
-            })
-            .unwrap();
     }
 
     #[gpui::test]
@@ -12003,249 +11351,6 @@ mod gpui_tests {
             pumped_input(cx, &mut daemon, 2),
             None,
             "each query is answered once"
-        );
-    }
-
-    #[gpui::test]
-    fn a_reattach_that_replays_2031_reports_the_scheme_once(cx: &mut TestAppContext) {
-        let (_window, mut daemon) = harness(cx);
-        cx.update(|cx| gpui_component::Theme::global_mut(cx).background = gpui::black());
-        // What a replay sends: the modes ahead of the ring, then each ring
-        // segment behind its size, then the shell's state. Nothing live
-        // follows: an idle pane still hears once.
-        let size = crate::daemon::protocol::WinSize {
-            cols: 80,
-            rows: 24,
-            cell_w: 8,
-            cell_h: 16,
-        };
-        let mut replay = Vec::new();
-        for frame in [
-            DaemonMsg::Snapshot(b"\x1b[?2031h".to_vec()),
-            DaemonMsg::Size(size),
-            DaemonMsg::Snapshot(b"\x1b[?996n".to_vec()),
-            DaemonMsg::Snapshot(b"$ ".to_vec()),
-            DaemonMsg::Prompt {
-                active: true,
-                at_prompt: false,
-                last_exit: None,
-            },
-        ] {
-            frame.encode(&mut replay).unwrap();
-        }
-        std::io::Write::write_all(&mut daemon, &replay).unwrap();
-        assert_eq!(
-            pumped_input(cx, &mut daemon, 20).as_deref(),
-            Some("\x1b[?997;1n"),
-            "the theme may have flipped while detached"
-        );
-        assert_eq!(
-            pumped_input(cx, &mut daemon, 2),
-            None,
-            "one report for the whole replay, and the replayed 996 is not answered"
-        );
-    }
-
-    /// A program that switched 2031 on and died without `?2031l` leaves a
-    /// replay whose last word is still `?2031h`. The shell that owns the pane
-    /// now never asked, so neither a reattach nor a theme flip may type a
-    /// report into its command line.
-    #[gpui::test]
-    fn a_dead_programs_2031_never_reaches_the_shell(cx: &mut TestAppContext) {
-        let set_background = |cx: &mut TestAppContext, bg: gpui::Hsla| {
-            cx.update(|cx| gpui_component::Theme::global_mut(cx).background = bg)
-        };
-        let dead = b"\x1b]133;C;claude\x07\x1b[?2031hclaude output\r\n";
-        let prompt = b"\x1b]133;D;137\x07\x1b]133;A\x07$ \x1b]133;B\x07";
-        let restored = crate::daemon::pane::restore_preamble(Some("this shell is new"));
-
-        for tail in [&prompt[..], &restored[..]] {
-            let (_window, mut daemon) = harness(cx);
-            set_background(cx, gpui::white());
-            let mut replay = Vec::new();
-            for frame in [
-                DaemonMsg::Snapshot(dead.to_vec()),
-                DaemonMsg::Snapshot(tail.to_vec()),
-            ] {
-                frame.encode(&mut replay).unwrap();
-            }
-            std::io::Write::write_all(&mut daemon, &replay).unwrap();
-            assert_eq!(
-                pumped_input(cx, &mut daemon, 2),
-                None,
-                "a reattach reports nothing"
-            );
-            set_background(cx, gpui::black());
-            assert_eq!(pumped_input(cx, &mut daemon, 2), None, "nor does a flip");
-        }
-
-        // A ring takes many reads. One that ends after the segment holding
-        // `?2031h` and before the one holding the prompt is not the end of
-        // the replay.
-        let (_window, mut daemon) = harness(cx);
-        set_background(cx, gpui::white());
-        let size = crate::daemon::protocol::WinSize {
-            cols: 80,
-            rows: 24,
-            cell_w: 8,
-            cell_h: 16,
-        };
-        let mut head = Vec::new();
-        DaemonMsg::Size(size).encode(&mut head).unwrap();
-        DaemonMsg::Snapshot(dead.to_vec())
-            .encode(&mut head)
-            .unwrap();
-        std::io::Write::write_all(&mut daemon, &head).unwrap();
-        assert_eq!(
-            pumped_input(cx, &mut daemon, 2),
-            None,
-            "half a replay reports nothing"
-        );
-        let mut rest = Vec::new();
-        DaemonMsg::Size(size).encode(&mut rest).unwrap();
-        DaemonMsg::Snapshot(prompt.to_vec())
-            .encode(&mut rest)
-            .unwrap();
-        DaemonMsg::Prompt {
-            active: true,
-            at_prompt: true,
-            last_exit: Some(137),
-        }
-        .encode(&mut rest)
-        .unwrap();
-        std::io::Write::write_all(&mut daemon, &rest).unwrap();
-        assert_eq!(pumped_input(cx, &mut daemon, 2), None, "nor does the rest");
-
-        // Live, the same: the program's exit and the next prompt end it.
-        let (_window, mut live) = harness(cx);
-        set_background(cx, gpui::white());
-        DaemonMsg::Output(dead.to_vec()).encode(&mut live).unwrap();
-        assert_eq!(pumped_input(cx, &mut live, 1), None);
-        set_background(cx, gpui::black());
-        assert_eq!(
-            pumped_input(cx, &mut live, 20).as_deref(),
-            Some("\x1b[?997;1n")
-        );
-        DaemonMsg::Output(prompt.to_vec())
-            .encode(&mut live)
-            .unwrap();
-        assert_eq!(pumped_input(cx, &mut live, 1), None);
-        set_background(cx, gpui::white());
-        assert_eq!(
-            pumped_input(cx, &mut live, 2),
-            None,
-            "a shell at its prompt hears nothing"
-        );
-        DaemonMsg::Output(b"\x1b[?996n".to_vec())
-            .encode(&mut live)
-            .unwrap();
-        assert_eq!(
-            pumped_input(cx, &mut live, 20).as_deref(),
-            Some("\x1b[?997;2n"),
-            "a live 996 is still answered"
-        );
-    }
-
-    #[gpui::test]
-    fn allowed_remote_clipboard_image_reaches_the_system_clipboard(cx: &mut TestAppContext) {
-        use gpui::ClipboardEntry;
-
-        let (window, mut daemon) = harness(cx);
-        window
-            .update(cx, |view, _, _| {
-                let mut spec: crate::daemon::protocol::NativeSshSpec = serde_json::from_str(
-                    r#"{"host":"build-box","port":22,"user":"me","auth_mode":"auto"}"#,
-                )
-                .unwrap();
-                spec.remote_clipboard_write = true;
-                view.ssh_spec = Some(Box::new(spec));
-            })
-            .unwrap();
-
-        let pixel = image::RgbaImage::from_pixel(1, 1, image::Rgba([4, 5, 6, 255]));
-        let mut png = Vec::new();
-        image::DynamicImage::ImageRgba8(pixel)
-            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
-            .unwrap();
-        let write = tty7_core::core::clipboard::ClipboardWrite {
-            mime: "image/png".into(),
-            data: png.clone(),
-            id: Some("copy-1".into()),
-        };
-        DaemonMsg::ClipboardWrite(write.encode_frame())
-            .encode(&mut daemon)
-            .unwrap();
-
-        for _ in 0..400 {
-            cx.run_until_parked();
-            let copied = cx.update(|cx| {
-                cx.read_from_clipboard().and_then(|item| {
-                    item.entries().iter().find_map(|entry| match entry {
-                        ClipboardEntry::Image(image) => Some(image.bytes.clone()),
-                        _ => None,
-                    })
-                })
-            });
-            if copied.as_deref() == Some(png.as_slice()) {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        let copied = cx.update(|cx| cx.read_from_clipboard());
-        assert!(copied.is_some_and(|item| {
-            item.entries()
-                .iter()
-                .any(|entry| matches!(entry, ClipboardEntry::Image(image) if image.bytes == png))
-        }));
-        assert_eq!(
-            next_input(&mut daemon),
-            tty7_core::core::clipboard::response(Some("copy-1"), "DONE")
-        );
-    }
-
-    #[gpui::test]
-    fn disabled_remote_clipboard_image_is_rejected_without_overwriting(cx: &mut TestAppContext) {
-        let (window, mut daemon) = harness(cx);
-        window
-            .update(cx, |view, _, _| {
-                view.ssh_spec = Some(Box::new(
-                    serde_json::from_str(
-                        r#"{"host":"build-box","port":22,"user":"me","auth_mode":"auto"}"#,
-                    )
-                    .unwrap(),
-                ));
-            })
-            .unwrap();
-        cx.update(|cx| cx.write_to_clipboard(ClipboardItem::new_string("keep me".into())));
-
-        let write = tty7_core::core::clipboard::ClipboardWrite {
-            mime: "image/png".into(),
-            data: vec![1, 2, 3],
-            id: Some("copy-2".into()),
-        };
-        DaemonMsg::ClipboardWrite(write.encode_frame())
-            .encode(&mut daemon)
-            .unwrap();
-        let mut reply = None;
-        for _ in 0..100 {
-            cx.run_until_parked();
-            reply = next_input_until_timeout(&mut daemon);
-            if reply.is_some() {
-                break;
-            }
-        }
-
-        assert_eq!(
-            reply,
-            Some(tty7_core::core::clipboard::response(
-                Some("copy-2"),
-                "EPERM"
-            ))
-        );
-        assert_eq!(
-            cx.update(|cx| cx.read_from_clipboard().and_then(|item| item.text()))
-                .as_deref(),
-            Some("keep me")
         );
     }
 
@@ -14695,15 +13800,7 @@ mod gpui_tests {
         view.set_workspace(Some(PaneWorkspace {
             workspace: id,
             target: host.target,
-            spec: Some(Box::new(
-                serde_json::from_str(
-                    r#"{"host":"build-box","port":22,"user":"me","auth_mode":"auto"}"#,
-                )
-                .unwrap(),
-            )),
             label: None,
-            resize_echo: false,
-            size_lease: false,
         }));
         id
     }
@@ -14781,56 +13878,6 @@ mod gpui_tests {
                     view.remote_completion_notice_text().as_deref(),
                     Some("remote listing failed — boom"),
                     "a failed listing is not the same silence as an empty one"
-                );
-            })
-            .unwrap();
-    }
-
-    #[gpui::test]
-    fn a_tab_on_a_detached_remote_pane_never_asks_for_a_listing(cx: &mut TestAppContext) {
-        use std::io::Write as _;
-        crate::core::config::pin_test_config_dir();
-        let (window, mut daemon) = harness(cx);
-        DaemonMsg::Prompt {
-            active: true,
-            at_prompt: true,
-            last_exit: None,
-        }
-        .encode(&mut daemon)
-        .unwrap();
-        DaemonMsg::Cwd(std::path::PathBuf::from("/home/me/proj"))
-            .encode(&mut daemon)
-            .unwrap();
-        daemon.flush().unwrap();
-        wait_for_input_active(&window, cx);
-        for _ in 0..200 {
-            if window
-                .update(cx, |view, _, _| view.cwd().is_some())
-                .unwrap()
-            {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-
-        window
-            .update(cx, |view, _, cx| {
-                view.cmd.set("ls /home/me/");
-                bind_to_a_disconnected_remote_workspace(view, cx);
-                assert!(
-                    view.remote_ssh_cwd().is_some(),
-                    "the pane has to look remote enough to want a listing at all"
-                );
-
-                view.tab_pressed(true, cx);
-                assert!(
-                    !view.remote_completion_inflight,
-                    "a Tab must not send an SFTP listing down a link that is not attached"
-                );
-                assert_eq!(
-                    view.cmd.text(),
-                    "ls /home/me/",
-                    "and the line stays where it was"
                 );
             })
             .unwrap();
@@ -14954,55 +14001,11 @@ mod gpui_tests {
                 view.set_workspace(Some(PaneWorkspace {
                     workspace: WorkspaceId::new(),
                     target: RemoteTarget::direct("me", "build-box", 22),
-                    spec: None,
                     label: Some("hummingbot".into()),
-                    resize_echo: false,
-                    size_lease: false,
                 }));
                 assert_eq!(view.title, "hummingbot", "an untitled tab shows the name");
                 view.handle_event(AlacEvent::Exit, cx);
                 assert_eq!(view.title, "hummingbot — disconnected");
-            })
-            .unwrap();
-    }
-
-    /// What the link supervisor's relink sweep keys off: a workspace pane
-    /// whose link died asks to come back, until its machine refuses.
-    #[gpui::test]
-    fn only_a_dead_workspace_pane_wants_a_relink(cx: &mut TestAppContext) {
-        let (window, _daemon) = harness(cx);
-        window
-            .update(cx, |view, _, cx| {
-                bind_to_a_disconnected_remote_workspace(view, cx);
-                assert!(!view.wants_relink(), "a live pane asks for nothing");
-                view.handle_event(AlacEvent::Exit, cx);
-                assert!(view.wants_relink());
-                view.abandon_relink();
-                assert!(!view.wants_relink(), "a refusal is final");
-            })
-            .unwrap();
-    }
-
-    /// The daemon keeps one subscriber per pane, so a second `Attach` for a
-    /// pane already being dialled for kicks the first off. A pane claimed for
-    /// an attempt therefore asks for nothing until that attempt reports back —
-    /// otherwise the pump, which sweeps every 250 ms, would join a dial that
-    /// can sit fifteen seconds waiting for the far end's verdict.
-    #[gpui::test]
-    fn a_pane_already_being_dialled_for_asks_for_nothing(cx: &mut TestAppContext) {
-        let (window, _daemon) = harness(cx);
-        window
-            .update(cx, |view, _, cx| {
-                bind_to_a_disconnected_remote_workspace(view, cx);
-                view.handle_event(AlacEvent::Exit, cx);
-                assert!(view.wants_relink());
-                view.mark_relinking();
-                assert!(!view.wants_relink(), "the attempt on the wire owns it");
-                view.relink_settled();
-                assert!(
-                    view.wants_relink(),
-                    "an attempt that came back wrong frees it"
-                );
             })
             .unwrap();
     }
@@ -15046,88 +14049,6 @@ mod gpui_tests {
             })
             .unwrap();
         assert_eq!(next_input(&mut daemon), b"z".to_vec());
-    }
-
-    #[gpui::test]
-    fn a_relink_moves_the_pane_onto_the_new_socket_and_resets_the_mirror(cx: &mut TestAppContext) {
-        let (window, mut old_daemon) = harness(cx);
-        let read_row = |cx: &mut TestAppContext, len: usize| -> String {
-            window
-                .update(cx, |view, _, _| {
-                    let term = view.terminal.term.clone();
-                    let term = term.lock();
-                    let grid = term.grid();
-                    (0..len)
-                        .map(|c| grid[alacritty_terminal::index::Line(0)][Column(c)].c)
-                        .collect()
-                })
-                .unwrap()
-        };
-
-        DaemonMsg::Output(b"before".to_vec())
-            .encode(&mut old_daemon)
-            .unwrap();
-        let mut seen = String::new();
-        for _ in 0..400 {
-            cx.run_until_parked();
-            seen = read_row(cx, 6);
-            if seen == "before" {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        assert_eq!(seen, "before", "the pre-drop screen is what we relink over");
-
-        let (new_client, mut new_daemon) = super::test_stream_pair();
-        window
-            .update(cx, |view, _, cx| {
-                view.adopt_relink(
-                    new_client,
-                    Vec::new(),
-                    &crate::terminal::PaneRoute::Local,
-                    TermSize::new(100, 30),
-                    8,
-                    17,
-                    cx,
-                )
-                .expect("the swap itself cannot fail");
-                assert_eq!(
-                    view.title, "ntty7",
-                    "a relinked pane is not \"process exited\""
-                );
-            })
-            .unwrap();
-        assert_ne!(
-            read_row(cx, 6),
-            "before",
-            "the mirror must be reset before the daemon replays onto it"
-        );
-
-        let resize = loop {
-            match ClientMsg::read(&mut new_daemon).expect("the new socket is live") {
-                ClientMsg::Resize(win) => break win,
-                _ => continue,
-            }
-        };
-        assert_eq!((resize.cols, resize.rows), (100, 30));
-
-        window
-            .update(cx, |view, _, cx| view.send_to_pty(b"after", cx))
-            .unwrap();
-        assert_eq!(next_input(&mut new_daemon), b"after".to_vec());
-
-        let mut leftovers: Vec<Vec<u8>> = Vec::new();
-        loop {
-            match ClientMsg::read(&mut old_daemon) {
-                Ok(ClientMsg::Input(bytes)) => leftovers.push(bytes),
-                Ok(_) => continue,
-                Err(_) => break,
-            }
-        }
-        assert!(
-            leftovers.is_empty(),
-            "the retired socket must never see another byte: {leftovers:?}"
-        );
     }
 
     #[gpui::test]
@@ -16542,23 +15463,6 @@ mod gpui_tests {
             Some((4, 12)),
             "`?25h` must bring the caret back where the program parked it"
         );
-
-        // Switching back to the tab: a brand new view replays the screen the
-        // daemon kept, then the prompt state, which says a program is running.
-        let (window, mut daemon) = harness(cx);
-        DaemonMsg::Snapshot(stream).encode(&mut daemon).unwrap();
-        DaemonMsg::Prompt {
-            active: true,
-            at_prompt: false,
-            last_exit: None,
-        }
-        .encode(&mut daemon)
-        .unwrap();
-        let replayed = paint_until(&window, cx, true, &|p| p.is_none());
-        assert_eq!(
-            replayed, None,
-            "a re-attached pane painted its caret over a TUI that reset DECTCEM"
-        );
     }
 
     #[gpui::test]
@@ -16743,53 +15647,6 @@ mod gpui_tests {
             .unwrap();
     }
 
-    #[gpui::test]
-    fn a_remote_workspace_pane_reports_its_cwd_as_remote(cx: &mut TestAppContext) {
-        use std::io::Write as _;
-        let (window, mut daemon) = harness(cx);
-        DaemonMsg::Cwd(std::path::PathBuf::from("/home/me/proj"))
-            .encode(&mut daemon)
-            .unwrap();
-        daemon.flush().unwrap();
-        for _ in 0..200 {
-            let seen = window
-                .update(cx, |view, _, _| view.cwd().is_some())
-                .unwrap();
-            if seen {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-
-        window
-            .update(cx, |view, _, cx| {
-                assert_eq!(
-                    view.local_cwd(),
-                    Some(std::path::PathBuf::from("/home/me/proj"))
-                );
-                assert_eq!(view.remote_ssh_cwd(), None);
-
-                bind_to_a_disconnected_remote_workspace(view, cx);
-
-                assert!(
-                    view.remote_context().is_none(),
-                    "the far daemon reports a plain local pane — if this ever \
-                     stops holding, the binding below is no longer the only signal"
-                );
-                assert_eq!(
-                    view.local_cwd(),
-                    None,
-                    "a routed pane's cwd is not a path on this machine"
-                );
-                assert_eq!(
-                    view.remote_ssh_cwd(),
-                    Some("/home/me/proj".to_string()),
-                    "Tab must ask the workspace's connection about it"
-                );
-            })
-            .unwrap();
-    }
-
     /// #541: the history menu floats over live grid cells, and a `div` that
     /// carries no handler of its own inserts no hitbox — so the press went
     /// straight through to the grid behind the menu, which cleared the
@@ -16888,96 +15745,6 @@ mod gpui_tests {
                 );
             })
             .unwrap();
-    }
-
-    /// Quick launch counts an agent each time one starts. Reattaching to a pane
-    /// whose agent was already running — every agent tab after an app restart
-    /// — is not a start, and counting it bumped every agent once per launch of
-    /// the app. Once that pane's agent exits, the next one is a start again.
-    #[gpui::test]
-    fn only_an_agent_that_starts_under_this_view_counts_as_detected(cx: &mut TestAppContext) {
-        use crate::core::cli_agent::CLIAgent;
-
-        crate::core::config::pin_test_config_dir();
-        let (window, _root_daemon) = harness(cx);
-        let detected = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
-        let pane = |reattached: bool, cx: &mut TestAppContext| {
-            let (pane, daemon) = window
-                .update(cx, |_, window, cx| {
-                    if reattached {
-                        super::quiet_reattached_test_pane(2, window, cx)
-                    } else {
-                        super::quiet_test_pane(3, window, cx)
-                    }
-                })
-                .unwrap();
-            let seen = detected.clone();
-            cx.update(|cx| {
-                cx.subscribe(&pane, move |_, ev: &AgentDetected, _| {
-                    seen.borrow_mut().push(ev.0)
-                })
-                .detach()
-            });
-            (pane, daemon)
-        };
-        let report = |agent: Option<CLIAgent>,
-                      at_prompt: bool,
-                      pane: &Entity<TerminalView>,
-                      daemon: &mut Stream,
-                      cx: &mut TestAppContext| {
-            DaemonMsg::Agent(agent).encode(daemon).unwrap();
-            for _ in 0..200 {
-                if pane.read_with(cx, |p, _| p.terminal.foreground_agent()) == agent {
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            }
-            pane.update(cx, |p, cx| p.poll_agent_detection(at_prompt, cx));
-            cx.run_until_parked();
-        };
-
-        let (restored, mut restored_daemon) = pane(true, cx);
-        report(
-            Some(CLIAgent::Claude),
-            false,
-            &restored,
-            &mut restored_daemon,
-            cx,
-        );
-        report(
-            Some(CLIAgent::Claude),
-            false,
-            &restored,
-            &mut restored_daemon,
-            cx,
-        );
-        assert_eq!(
-            *detected.borrow(),
-            vec![],
-            "already running when reattached"
-        );
-        report(None, true, &restored, &mut restored_daemon, cx);
-        report(
-            Some(CLIAgent::Codex),
-            false,
-            &restored,
-            &mut restored_daemon,
-            cx,
-        );
-        assert_eq!(
-            *detected.borrow(),
-            vec![CLIAgent::Codex],
-            "started after the reattach"
-        );
-
-        let (fresh, mut fresh_daemon) = pane(false, cx);
-        report(Some(CLIAgent::Claude), false, &fresh, &mut fresh_daemon, cx);
-        report(Some(CLIAgent::Claude), false, &fresh, &mut fresh_daemon, cx);
-        assert_eq!(
-            *detected.borrow(),
-            vec![CLIAgent::Codex, CLIAgent::Claude],
-            "a spawned pane counts its first agent, once"
-        );
     }
 
     /// #958: `prompt_cursor_style` shapes the shell's own caret at a prompt,
@@ -17222,6 +15989,89 @@ mod gpui_tests {
             })
             .unwrap();
     }
+
+    /// A clipboard image the daemon forwarded is written to this machine's
+    /// clipboard, and the pane answers `DONE`.
+    #[gpui::test]
+    fn a_clipboard_image_reaches_the_system_clipboard(cx: &mut TestAppContext) {
+        use gpui::ClipboardEntry;
+
+        let (_window, mut daemon) = harness(cx);
+        let pixel = image::RgbaImage::from_pixel(1, 1, image::Rgba([4, 5, 6, 255]));
+        let mut png = Vec::new();
+        image::DynamicImage::ImageRgba8(pixel)
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        let write = tty7_core::core::clipboard::ClipboardWrite {
+            mime: "image/png".into(),
+            data: png.clone(),
+            id: Some("copy-1".into()),
+        };
+        DaemonMsg::ClipboardWrite(write.encode_frame())
+            .encode(&mut daemon)
+            .unwrap();
+
+        for _ in 0..400 {
+            cx.run_until_parked();
+            let copied = cx.update(|cx| {
+                cx.read_from_clipboard().and_then(|item| {
+                    item.entries().iter().find_map(|entry| match entry {
+                        ClipboardEntry::Image(image) => Some(image.bytes.clone()),
+                        _ => None,
+                    })
+                })
+            });
+            if copied.as_deref() == Some(png.as_slice()) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let copied = cx.update(|cx| cx.read_from_clipboard());
+        assert!(copied.is_some_and(|item| {
+            item.entries()
+                .iter()
+                .any(|entry| matches!(entry, ClipboardEntry::Image(image) if image.bytes == png))
+        }));
+        assert_eq!(
+            next_input(&mut daemon),
+            tty7_core::core::clipboard::response(Some("copy-1"), "DONE")
+        );
+    }
+
+    /// A new pane reports an agent once when it starts. Polling again while
+    /// that same agent is still running is not another start.
+    #[gpui::test]
+    fn a_running_agent_is_detected_once(cx: &mut TestAppContext) {
+        use crate::core::cli_agent::CLIAgent;
+
+        let (window, _root) = harness(cx);
+        let detected = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let (pane, mut daemon) = window
+            .update(cx, |_, window, cx| super::quiet_test_pane(3, window, cx))
+            .unwrap();
+        let seen = detected.clone();
+        cx.update(|cx| {
+            cx.subscribe(&pane, move |_, ev: &AgentDetected, _| {
+                seen.borrow_mut().push(ev.0);
+            })
+            .detach();
+        });
+
+        let mut report = |agent: Option<CLIAgent>, at_prompt: bool, cx: &mut TestAppContext| {
+            DaemonMsg::Agent(agent).encode(&mut daemon).unwrap();
+            for _ in 0..200 {
+                if pane.read_with(cx, |p, _| p.terminal.foreground_agent()) == agent {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            pane.update(cx, |p, cx| p.poll_agent_detection(at_prompt, cx));
+            cx.run_until_parked();
+        };
+        report(Some(CLIAgent::Claude), false, cx);
+        report(Some(CLIAgent::Claude), false, cx);
+        assert_eq!(*detected.borrow(), vec![CLIAgent::Claude]);
+    }
 }
 
 /// The window between the shell reporting a prompt and its line editor
@@ -17373,44 +16223,6 @@ mod prompt_handover_tests {
             view.terminal.zle_reading()
         });
         titled(cx, &window, Some("me@box:~/dev"));
-    }
-
-    /// #889 on a reattached window: a long session outran the daemon's replay
-    /// ring, so the replay carries the program's title but not the `C` that
-    /// started it. The replayed prompt state says a command owns the pane,
-    /// and that is enough to know the title is the command's to lose at `D`.
-    #[gpui::test]
-    fn a_reattached_window_retires_a_title_whose_c_rolled_out_of_the_replay(
-        cx: &mut TestAppContext,
-    ) {
-        crate::core::config::pin_test_config_dir();
-        cx.executor().allow_parking();
-        let (client_side, mut daemon) = test_stream_pair();
-        cx.update(|cx| {
-            gpui_component::init(cx);
-            cx.set_global(Config::default());
-        });
-        let window = cx.add_window(|window, cx| {
-            let terminal =
-                RemoteTerminal::from_stream_reattached(client_side, TermSize::new(80, 24))
-                    .expect("reattached link-backed terminal");
-            TerminalView::with_terminal(terminal, 1, window, cx)
-        });
-
-        DaemonMsg::Snapshot(b"\x1b]2;\xe2\x9c\xb3 fixing the switcher\x1b\\redraw".to_vec())
-            .encode(&mut daemon)
-            .unwrap();
-        DaemonMsg::Prompt {
-            active: true,
-            at_prompt: false,
-            last_exit: None,
-        }
-        .encode(&mut daemon)
-        .unwrap();
-        titled(cx, &window, Some("✳ fixing the switcher"));
-
-        output(&mut daemon, b"\x1b]133;D;0\x07");
-        titled(cx, &window, None);
     }
 
     /// Printable text arrives the way the platform delivers it — through the

@@ -24,14 +24,9 @@ pub(super) fn report(bg: Rgb) -> String {
     format!("\x1b[?997;{}n", if is_dark(rgb) { 1 } else { 2 })
 }
 
-/// Fold pane output into `modes` and publish whether 2031 is on.
-pub(super) fn fold(modes: &mut TerminalModes, bytes: &[u8], on: &AtomicBool) {
-    modes.feed(bytes);
-    on.store(modes.is_on(COLOR_SCHEME_UPDATES), Ordering::Relaxed);
-}
-
-/// [`fold`], and report each tracked query at the offset one past its final
-/// byte so a reply can be written at that point in the batch.
+/// Fold pane output into `modes`, publish whether 2031 is on, and report each
+/// tracked query at the offset one past its final byte so a reply can be
+/// written at that point in the batch.
 pub(super) fn fold_reporting(
     modes: &mut TerminalModes,
     bytes: &[u8],

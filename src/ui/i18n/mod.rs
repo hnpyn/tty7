@@ -135,7 +135,6 @@ l10n_keys! {
     ComposerEffortTip,
     AppMenuMinimize,
     AppMenuZoom,
-    PaneRestoredScreenBanner,
     IntegrationNoticeBlocked,
     IntegrationNoticeNotEngaged,
     PaneTitleDisconnected,

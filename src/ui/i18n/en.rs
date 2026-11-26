@@ -79,9 +79,6 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         L10nKey::ComposerEffortTip => "Reasoning effort  ·  click to change",
         L10nKey::AppMenuMinimize => "Minimize",
         L10nKey::AppMenuZoom => "Zoom",
-        L10nKey::PaneRestoredScreenBanner => {
-            "restored screen — this shell is new, nothing above it is still running"
-        }
         L10nKey::IntegrationNoticeBlocked => {
             "\u{201c}{wrapper}\u{201d} is intercepting shell reports in this pane, so inline completion and the Ctrl+R menu are unavailable. The shell's own history search still works."
         }
