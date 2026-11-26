@@ -18,9 +18,6 @@ serde_json.workspace = true
 # The gitignore matcher chain (`core::gitignore`) the file tree dims entries with.
 ignore = "0.4"
 
-# Format-preserving TOML editing for `core::agent_hooks`.
-toml_edit = "0.25"
-
 # Cross-platform PTY: a Unix pty on Unix, ConPTY on Windows.
 portable-pty = "0.8"
 

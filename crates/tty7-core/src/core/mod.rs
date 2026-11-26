@@ -1,4 +1,3 @@
-pub mod agent_hooks;
 pub mod appearance;
 pub mod cli_agent;
 pub mod clipboard;

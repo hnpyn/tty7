@@ -381,6 +381,7 @@ fn system_locale_identifier() -> Option<String> {
 }
 
 const TERM_PROGRAM_NAME: &str = "tty7";
+const NTTY7_ENV_MARKER: &str = "NTTY7";
 
 /// The config dir this server runs on, not a socket path.
 ///
@@ -481,10 +482,7 @@ fn pane_environment(
     let mut env = vec![
         ("TERM".to_string(), "xterm-256color".to_string()),
         ("COLORTERM".to_string(), "truecolor".to_string()),
-        (
-            crate::core::agent_hooks::TTY7_ENV_MARKER.to_string(),
-            version.to_string(),
-        ),
+        (NTTY7_ENV_MARKER.to_string(), version.to_string()),
         ("TERM_PROGRAM".to_string(), TERM_PROGRAM_NAME.to_string()),
         ("TERM_PROGRAM_VERSION".to_string(), version.to_string()),
         // tty7 renders OSC 8 links, but `supports-hyperlinks` (Claude Code,
@@ -8064,11 +8062,7 @@ mod tests {
             env.get("TERM_PROGRAM_VERSION").map(String::as_str),
             Some(version)
         );
-        assert_eq!(
-            env.get(crate::core::agent_hooks::TTY7_ENV_MARKER)
-                .map(String::as_str),
-            Some(version)
-        );
+        assert_eq!(env.get(NTTY7_ENV_MARKER).map(String::as_str), Some(version));
         assert_eq!(
             env.get("TERM").map(String::as_str),
             Some("xterm-256color"),
@@ -8475,9 +8469,7 @@ mod tests {
         let cmd = build_shell_command(None, &Some(PathBuf::from("/tmp")), 42, Some("ws-main"))
             .expect("build default shell command")
             .0;
-        let tty7 = cmd
-            .get_env(crate::core::agent_hooks::TTY7_ENV_MARKER)
-            .and_then(|v| v.to_str());
+        let tty7 = cmd.get_env(NTTY7_ENV_MARKER).and_then(|v| v.to_str());
         assert_eq!(
             tty7,
             Some(env!("CARGO_PKG_VERSION")),

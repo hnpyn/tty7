@@ -7431,7 +7431,6 @@ dependencies = [
  "indexmap",
  "toml_datetime 1.1.1+spec-1.1.0",
  "toml_parser",
- "toml_writer",
  "winnow 1.0.4",
 ]
 
@@ -7654,7 +7653,6 @@ dependencies = [
  "serde_json",
  "smol",
  "tempfile",
- "toml_edit 0.25.15+spec-1.1.0",
  "windows-sys 0.59.0",
 ]
 
