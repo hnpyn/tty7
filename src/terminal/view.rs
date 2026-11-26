@@ -145,8 +145,6 @@ pub struct ShellParts {
     terminal: RemoteTerminal,
     pub(crate) pane_id: u64,
     shell_spec: Option<ShellSpec>,
-    pub(crate) workspace: Option<crate::terminal::PaneWorkspace>,
-    pub(crate) owner: Option<crate::core::session::WorkspaceId>,
     /// Set when a configured shell failed and the login shell was used instead.
     pub(crate) shell_notice: Option<String>,
 }
@@ -249,10 +247,8 @@ fn link_path_style(
 pub struct TerminalView {
     pub terminal: RemoteTerminal,
     host_id: crate::ui::host_ops::HostId,
-    workspace: Option<crate::terminal::PaneWorkspace>,
     pub pane_id: u64,
     shell_spec: Option<ShellSpec>,
-    owner_workspace: Option<crate::core::session::WorkspaceId>,
     remote_clipboard_write_in_flight: Option<u64>,
     remote_clipboard_write_generation: u64,
     pub focus_handle: FocusHandle,
@@ -303,9 +299,7 @@ pub struct TerminalView {
     pending_title: Option<String>,
     /// What the pane is called before anything running in it says otherwise —
     /// and what it goes back to when the program resets the title or the
-    /// session ends. "tty7" for a local shell; for an SSH pane it is the host
-    /// it dialled, so a window full of them is still readable (#438); for a
-    /// workspace pane it is the workspace's name, set in `set_workspace`.
+    /// session ends.
     pub(super) default_title: String,
     pub marked_text: String,
     last_mouse_cell: Option<(usize, usize)>,
@@ -323,10 +317,6 @@ pub struct TerminalView {
     ime_anchor: Option<gpui::Bounds<Pixels>>,
     last_hover_cell: Option<(usize, usize)>,
     link_modifier_down: bool,
-    /// What this pane's host has said about paths printed in it, for panes
-    /// that cannot answer that from the local filesystem. Empty and unused on
-    /// a local pane, which resolves inline instead.
-    link_probes: super::link_probe::LinkProbeCache,
     /// The repository the pane's directory sits in, once the host has been
     /// asked, and the directory that answer belongs to. A second root for
     /// relative paths: build output routinely names files from the workspace
@@ -508,60 +498,6 @@ enum LinkAt {
     None,
 }
 
-/// What it takes to open one of a pane's loopback ports from this machine.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[cfg(test)]
-pub(crate) enum PortRoute {
-    /// The port is already reachable here under its own number.
-    Direct,
-    /// Another machine's port, with no way to reach it from here.
-    #[default]
-    Blocked,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub(super) enum LoopbackPlan {
-    Direct,
-    NoForwardNeeded,
-}
-
-/// What a pane's loopback port takes to open, given how its links would be
-/// forwarded and whether the daemon listing it is this machine's.
-///
-/// Deliberately not "is the pane local": a remote pane's :3000 is perfectly
-/// reachable once a forward exists, and building that forward is something
-/// this app already knows how to do. Answering only "local or not" is what
-/// left the Ports list showing a port it then refused to open.
-#[cfg(test)]
-fn port_route_of(plan: &LoopbackPlan, local: bool) -> PortRoute {
-    match plan {
-        // WSL shares this machine's loopback, so its ports are already here
-        // under the same number.
-        LoopbackPlan::NoForwardNeeded => PortRoute::Direct,
-        // No plan and no forwarding: this machine's own ports open, and
-        // another machine's do not.
-        LoopbackPlan::Direct if local => PortRoute::Direct,
-        LoopbackPlan::Direct => PortRoute::Blocked,
-    }
-}
-
-pub(super) fn loopback_plan(
-    enabled: bool,
-    workspace: Option<&crate::terminal::PaneWorkspace>,
-    remote_kind: Option<crate::daemon::protocol::RemoteKind>,
-    pane_id: u64,
-) -> LoopbackPlan {
-    let _ = (remote_kind, pane_id);
-    if !enabled {
-        return LoopbackPlan::Direct;
-    }
-    if workspace.is_some_and(|ws| ws.shares_localhost()) {
-        LoopbackPlan::NoForwardNeeded
-    } else {
-        LoopbackPlan::Direct
-    }
-}
-
 struct PendingHistory {
     line: String,
     cwd: Option<std::path::PathBuf>,
@@ -634,61 +570,6 @@ fn settle_title(showing: &str, waiting: bool, incoming: &str) -> TitleSettle {
     match waiting {
         true => TitleSettle::Queue,
         false => TitleSettle::QueueAndWait,
-    }
-}
-
-const MAX_HISTORY_BYTES: u64 = 4 << 20;
-
-/// Where a remote scope's list is seeded from, besides what tty7 itself
-/// recorded for it.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum HistorySeedSource {
-    /// Nothing to seed from: tty7's own record is all there is.
-    None,
-    /// The workspace host's own shell history files, through its `Host`.
-    WorkspaceHost,
-}
-
-fn history_seed_source(
-    scope_is_local: bool,
-    host_is_local: bool,
-    remote: Option<crate::daemon::protocol::RemoteKind>,
-) -> HistorySeedSource {
-    if scope_is_local {
-        return HistorySeedSource::None;
-    }
-    match remote {
-        // A pane that has ssh'ed onward is scoped to the inner target. Seeding
-        // that scope from the workspace host's history would offer commands
-        // from the wrong box. Those panes start from what tty7 recorded.
-        Some(_) => HistorySeedSource::None,
-        None if host_is_local => HistorySeedSource::None,
-        None => HistorySeedSource::WorkspaceHost,
-    }
-}
-
-/// What a history load reads besides tty7's own record of the scope.
-enum HistorySeedFetch {
-    None,
-    Host(Vec<(crate::ui::host_ops::SharedHost, std::path::PathBuf)>),
-}
-
-impl HistorySeedFetch {
-    /// The far end's shell history files, each with the file name that picks
-    /// its parser. Blocking. A file that is missing, too large or unreadable is
-    /// skipped, and a connection that is gone yields nothing: a seed is a
-    /// convenience, never worth an error on screen.
-    fn read(self) -> Vec<(String, Vec<u8>)> {
-        match self {
-            HistorySeedFetch::None => Vec::new(),
-            HistorySeedFetch::Host(files) => files
-                .into_iter()
-                .filter_map(|(host, path)| {
-                    let name = path.file_name()?.to_string_lossy().into_owned();
-                    Some((name, host.read_file(&path, MAX_HISTORY_BYTES).ok()?))
-                })
-                .collect(),
-        }
     }
 }
 
@@ -1040,35 +921,9 @@ fn stages_clipboard_image(is_remote: bool) -> bool {
     cfg!(not(target_os = "macos")) || is_remote
 }
 
-/// The WSL view of a Windows path: `C:\x\y` becomes `/mnt/c/x/y`.
-///
-/// `None` for anything without a drive letter — a UNC temp directory has no
-/// automount mapping, and `C:x` is drive-relative rather than absolute.
-///
-/// The `/mnt` prefix is WSL's default automount root, not a guaranteed one:
-/// `[automount] root=` in `/etc/wsl.conf` can move it. Asking the distro
-/// (`wslpath -u`) would be exact, but it is a round trip through the daemon on
-/// a keystroke path, and a moved automount root is rare enough that a wrong
-/// path — which the user sees, in their own line, before they send it — beats
-/// making every paste wait on a subprocess.
-fn wsl_path(windows: &str) -> Option<String> {
-    let mut chars = windows.chars();
-    let drive = chars.next()?.to_ascii_lowercase();
-    if !drive.is_ascii_alphabetic() || chars.next()? != ':' {
-        return None;
-    }
-    if !matches!(chars.next()?, '\\' | '/') {
-        return None;
-    }
-    Some(format!(
-        "/mnt/{drive}/{}",
-        chars.as_str().replace('\\', "/")
-    ))
-}
-
-/// The Windows spelling of a WSL pane's POSIX cwd — [`wsl_path`]'s inverse,
-/// for reading rather than writing: the distro's `\\wsl$` share is how a
-/// local `read_dir` can list a directory this process cannot reach natively.
+/// The Windows spelling of a WSL pane's POSIX cwd. The distro's `\\wsl$`
+/// share is how a local `read_dir` can list a directory this process cannot
+/// reach natively.
 ///
 /// Everything stays on the share, `/mnt/<drive>` included. Mapping the
 /// automount back to the drive letter would list faster, but an absolute
@@ -1090,27 +945,16 @@ fn wsl_share_path(distro: &str, posix: &str) -> Option<std::path::PathBuf> {
 /// The distro whose `\\wsl$` share holds a pane's filesystem, or `None` when
 /// the pane is not a WSL one and Tab belongs to the shell.
 ///
-/// The two kinds of WSL pane are told apart by who reports the distro. A pane
-/// that runs `wsl.exe` is tagged by its remote context, and it reaches the
-/// distro of whichever machine *hosts* it — so only this machine's panes may
-/// take the share; a remote host's same-named distro would list the wrong
-/// files. A pane in a WSL workspace is tagged by its workspace target instead,
-/// and needs no such check: tty7 reaches those distros by running `wsl.exe`
-/// here, so the share is this machine's by construction — even though the
-/// pane's host, being the distro's own server, is not `HostId::LOCAL`.
+/// A pane that runs `wsl.exe` is tagged by its remote context. Only this
+/// machine's panes may take the share; a remote host's same-named distro
+/// would list the wrong files.
 fn wsl_share_distro(
     remote: Option<&crate::daemon::protocol::RemoteContext>,
-    workspace: Option<&crate::terminal::PaneWorkspace>,
     host_is_local: bool,
 ) -> Option<String> {
-    match remote {
-        Some(remote) => (remote.kind == crate::daemon::protocol::RemoteKind::Wsl && host_is_local)
-            .then(|| remote.target.clone()),
-        None => match &workspace?.target {
-            crate::core::session::RemoteTarget::Wsl { distro } => Some(distro.clone()),
-            _ => None,
-        },
-    }
+    let remote = remote?;
+    (remote.kind == crate::daemon::protocol::RemoteKind::Wsl && host_is_local)
+        .then(|| remote.target.clone())
 }
 
 /// The directory the Files panel lists for a pane, spelled so the pane's
@@ -1140,21 +984,6 @@ fn files_cwd(
         true => wsl_share_path(distro, &spelled),
         false => Some(cwd),
     }
-}
-
-/// A local path — a staged image, a copied or dropped file — as the pane's own
-/// filesystem spells it.
-///
-/// A WSL pane shares this machine's disk but not its path syntax: an agent in
-/// there reads `/mnt/c/…` and cannot open `C:\…` at all, which is why the
-/// upload route skips WSL — there is nothing to copy, only a name to rewrite.
-/// A path with no mapping falls back to the Windows one, which at least tells
-/// the user where the file is.
-fn local_path_for_pane(local: &str, shares_localhost: bool) -> String {
-    if shares_localhost {
-        return wsl_path(local).unwrap_or_else(|| local.to_string());
-    }
-    local.to_string()
 }
 
 /// The staging directory to reuse on the next paste. A failed preparation is
@@ -1283,24 +1112,14 @@ impl TerminalView {
     }
 
     pub fn spawn_shell_terminal_in(
-        workspace: Option<crate::terminal::PaneWorkspace>,
         working_directory: Option<std::path::PathBuf>,
-        restore_pane: Option<u64>,
         shell: Option<ShellSpec>,
-        owner: Option<crate::core::session::WorkspaceId>,
     ) -> anyhow::Result<ShellParts> {
         // `shell: None` still reads `config.json`. A broken `shell.program`
         // has to fall back to the login shell, or a Dock launch dies before
         // the window exists and the user cannot open Settings to fix it.
         let customized = shell.is_none() && crate::core::config::shell_command().is_some();
-        match Self::open_shell_terminal(
-            workspace.clone(),
-            working_directory.clone(),
-            restore_pane,
-            shell.clone(),
-            owner,
-            true,
-        ) {
+        match Self::open_shell_terminal(working_directory.clone(), shell.clone(), true) {
             Ok(parts) => Ok(parts),
             Err(error) if customized => {
                 let program = crate::core::config::shell_command()
@@ -1309,14 +1128,7 @@ impl TerminalView {
                 log::warn!(
                     "configured shell {program} failed to start ({error:#}); using the login shell"
                 );
-                let mut parts = Self::open_shell_terminal(
-                    workspace,
-                    working_directory,
-                    restore_pane,
-                    None,
-                    owner,
-                    false,
-                )?;
+                let mut parts = Self::open_shell_terminal(working_directory, None, false)?;
                 parts.shell_notice = Some(crate::ui::i18n::t_fmt(
                     crate::ui::i18n::L10nKey::ShellFellBack,
                     &[("shell", program.as_str())],
@@ -1328,31 +1140,24 @@ impl TerminalView {
     }
 
     fn open_shell_terminal(
-        workspace: Option<crate::terminal::PaneWorkspace>,
         working_directory: Option<std::path::PathBuf>,
-        restore_pane: Option<u64>,
         shell: Option<ShellSpec>,
-        owner: Option<crate::core::session::WorkspaceId>,
         use_config_shell: bool,
     ) -> anyhow::Result<ShellParts> {
-        let route = crate::terminal::PaneRoute::for_workspace(workspace.as_ref());
-        let _ = restore_pane;
         let (terminal, pane_id) = RemoteTerminal::spawn_on(
-            &route,
+            &crate::terminal::PaneRoute::Local,
             TermSize::new(80, 24),
             8,
             17,
             working_directory,
             shell.clone(),
-            owner.map(|id| id.to_string()),
+            None,
             use_config_shell,
         )?;
         Ok(ShellParts {
             terminal,
             pane_id,
             shell_spec: shell,
-            workspace,
-            owner,
             shell_notice: None,
         })
     }
@@ -1364,8 +1169,6 @@ impl TerminalView {
     ) -> Self {
         let mut view = Self::with_terminal(parts.terminal, parts.pane_id, window, cx);
         view.shell_spec = parts.shell_spec;
-        view.owner_workspace = parts.owner;
-        view.set_workspace(parts.workspace);
         view
     }
 
@@ -1531,10 +1334,8 @@ impl TerminalView {
         Self {
             terminal,
             host_id: crate::ui::host_ops::HostId::LOCAL,
-            workspace: None,
             pane_id,
             shell_spec: None,
-            owner_workspace: None,
             remote_clipboard_write_in_flight: None,
             remote_clipboard_write_generation: 0,
             focus_handle,
@@ -1570,7 +1371,6 @@ impl TerminalView {
             report_mouse,
             last_hover_cell: None,
             link_modifier_down: false,
-            link_probes: Default::default(),
             link_repo_root: None,
             link_repo_root_pending: false,
             context_menu_allowed: true,
@@ -1712,11 +1512,7 @@ impl TerminalView {
 
     /// `name` with the suffix that says how this pane ended.
     fn ended_title(&self, name: &str) -> String {
-        let key = if self.workspace().is_some() && !self.terminal.child_exited() {
-            L10nKey::PaneTitleDisconnected
-        } else {
-            L10nKey::PaneTitleProcessExited
-        };
+        let key = L10nKey::PaneTitleProcessExited;
         t_fmt(key, &[("title", name)])
     }
 
@@ -1749,43 +1545,6 @@ impl TerminalView {
 
     pub fn host_id(&self) -> crate::ui::host_ops::HostId {
         self.host_id
-    }
-
-    pub fn workspace(&self) -> Option<&crate::terminal::PaneWorkspace> {
-        self.workspace.as_ref()
-    }
-
-    pub fn set_workspace(&mut self, workspace: Option<crate::terminal::PaneWorkspace>) {
-        self.host_id = workspace
-            .as_ref()
-            .map_or(crate::ui::host_ops::HostId::LOCAL, |w| w.target.host_id());
-        // The pane answers to its workspace's name from here on: untitled tabs
-        // show it, and a dead link's "— disconnected" suffix hangs off it
-        // instead of the bare app name.
-        if let Some(label) = workspace.as_ref().and_then(|w| w.label.clone()) {
-            if self.title == self.default_title {
-                self.title = label.clone();
-            }
-            self.default_title = label;
-        }
-        self.workspace = workspace;
-    }
-
-    pub fn pane_route(&self) -> crate::terminal::PaneRoute {
-        crate::terminal::PaneRoute::for_workspace(self.workspace.as_ref())
-    }
-
-    fn accepts_input(&self, _cx: &gpui::App) -> bool {
-        // The workbench link supervisor is gone. A pane bound to a remote
-        // workspace has nobody to attach it, so it stays read-only; a local
-        // pane types as it always did.
-        !self.workspace.as_ref().is_some_and(|workspace| {
-            workspace.target.is_ssh()
-                || matches!(
-                    workspace.target,
-                    crate::core::session::RemoteTarget::Wsl { .. }
-                )
-        })
     }
 
     pub fn host_cwd(&self) -> Option<std::path::PathBuf> {
@@ -1916,7 +1675,6 @@ impl TerminalView {
     pub fn files_cwd(&self) -> Option<std::path::PathBuf> {
         let distro = wsl_share_distro(
             self.terminal.remote_context().as_ref(),
-            self.workspace.as_ref(),
             self.host_id.is_local(),
         );
         let cwd = self
@@ -2101,9 +1859,7 @@ impl TerminalView {
     }
 
     fn on_key_down(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        let link_dropped_on_a_remote_pane =
-            self.workspace().is_some() && !self.terminal.child_exited();
-        if self.terminal.exited && !link_dropped_on_a_remote_pane {
+        if self.terminal.exited {
             return;
         }
         if self.integration_notice.take().is_some() {
@@ -2177,10 +1933,6 @@ impl TerminalView {
                 }
                 CmdKey::Bubble | CmdKey::FallThrough => {}
             }
-        }
-
-        if !self.accepts_input(cx) {
-            return;
         }
 
         #[cfg(target_os = "macos")]
@@ -2310,7 +2062,7 @@ impl TerminalView {
                 if self.input_active() {
                     self.editor_move_edge(false, m.shift);
                     cx.notify();
-                } else if cfg!(target_os = "macos") && self.accepts_input(cx) {
+                } else if cfg!(target_os = "macos") {
                     self.send_shortcut_bytes(&[0x01], "a", cx);
                 }
                 CmdKey::Consumed
@@ -2319,7 +2071,7 @@ impl TerminalView {
                 if self.input_active() {
                     self.editor_move_edge(true, m.shift);
                     cx.notify();
-                } else if cfg!(target_os = "macos") && self.accepts_input(cx) {
+                } else if cfg!(target_os = "macos") {
                     self.send_shortcut_bytes(&[0x05], "e", cx);
                 }
                 CmdKey::Consumed
@@ -2332,7 +2084,7 @@ impl TerminalView {
                     self.close_completion();
                     self.cursor_visible = true;
                     cx.notify();
-                } else if cfg!(target_os = "macos") && self.accepts_input(cx) {
+                } else if cfg!(target_os = "macos") {
                     self.send_shortcut_bytes(&[0x15], "u", cx);
                 }
                 CmdKey::Consumed
@@ -2345,7 +2097,7 @@ impl TerminalView {
                     self.close_completion();
                     self.cursor_visible = true;
                     cx.notify();
-                } else if cfg!(target_os = "macos") && self.accepts_input(cx) {
+                } else if cfg!(target_os = "macos") {
                     self.send_shortcut_bytes(&[0x0b], "k", cx);
                 }
                 CmdKey::Consumed
@@ -2863,7 +2615,7 @@ impl TerminalView {
     }
 
     pub(super) fn send_to_pty(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
-        if self.terminal.exited || !self.accepts_input(cx) {
+        if self.terminal.exited {
             return;
         }
         self.terminal.write(bytes.to_vec());
@@ -2894,9 +2646,6 @@ impl TerminalView {
     }
 
     pub fn paste(&mut self, text: String, cx: &mut Context<Self>) {
-        if !self.accepts_input(cx) {
-            return;
-        }
         // The agent's input is under the box, so a paste meant for it goes
         // into the box — out of sight under it, it would be sent unseen.
         if self.composer_takes_typing(&text, cx) {
@@ -3233,9 +2982,8 @@ impl TerminalView {
         self.paste(text, cx);
     }
 
-    /// Paste files that live on this machine so the pane's program can open
-    /// them: uploaded first when the pane runs on an SSH host, renamed for a
-    /// WSL pane, and pasted as they are everywhere else.
+    /// Paste files that live on this machine, spelled the way this machine
+    /// names them, so the pane's program can open them.
     pub(super) fn paste_local_paths(
         &mut self,
         paths: Vec<std::path::PathBuf>,
@@ -3244,22 +2992,9 @@ impl TerminalView {
         if paths.is_empty() {
             return;
         }
-        // Every step of an upload is a blocking daemon round trip, which a
-        // keystroke handler must not make, so a remote pane pastes from a
-        // background task and this returns without touching the line.
-        if self.upload_for_remote(paths.clone(), cx) {
-            return;
-        }
-        // The upload declined: a local pane, a WSL pane, which needs a rewrite
-        // rather than a transfer, or a workspace with no SSH spec to
-        // piggyback on.
-        let shares_localhost = self
-            .workspace
-            .as_ref()
-            .is_some_and(|w| w.shares_localhost());
         let spelled: Vec<String> = paths
             .iter()
-            .map(|p| local_path_for_pane(&p.to_string_lossy(), shares_localhost))
+            .map(|p| p.to_string_lossy().into_owned())
             .collect();
         self.paste_paths(spelled, cx);
     }
@@ -3298,14 +3033,6 @@ impl TerminalView {
         // silent would be the very no-op this route exists to avoid.
         self.paste_local_paths(vec![path], cx);
         true
-    }
-
-    fn upload_for_remote(
-        &mut self,
-        _sources: Vec<std::path::PathBuf>,
-        _cx: &mut Context<Self>,
-    ) -> bool {
-        false
     }
 
     /// Same shape as `warn_paste_upload_failed`: one toast per failed open, so
@@ -3347,7 +3074,7 @@ impl TerminalView {
         // Image placements are anchored in absolute scrollback rows, so the
         // rows we just discarded moved every anchor. Drop them; the daemon does
         // not replay out-of-band image frames, so a browser redraws on its next
-        // transmit (same reasoning as the reattach path in `adopt_relink`).
+        // transmit.
         self.terminal.images().clear();
         self.scroll_frac = 0.;
         self.terminal.write(vec![0x0c_u8]);
@@ -3529,9 +3256,6 @@ impl TerminalView {
         if let Some(ctx) = self.remote_context() {
             return super::history::Scope::remote(&ctx.target);
         }
-        if !self.host_id.is_local() {
-            return super::history::Scope::remote(&format!("host-{:016x}", self.host_id.0));
-        }
         super::history::Scope::Local
     }
 
@@ -3600,26 +3324,18 @@ impl TerminalView {
         self.rerank_history(ranked_cwd.as_deref());
         cx.notify();
 
-        let fetch = self.history_seed_fetch(cx);
-        self.spawn_history_load(scope, fetch, cx);
+        self.spawn_history_load(scope, cx);
     }
 
     /// Load `scope`'s list off the UI thread and install it, unless the pane
     /// has moved on to another scope or a newer load has started meanwhile.
-    fn spawn_history_load(
-        &mut self,
-        scope: super::history::Scope,
-        fetch: HistorySeedFetch,
-        cx: &mut Context<Self>,
-    ) {
+    fn spawn_history_load(&mut self, scope: super::history::Scope, cx: &mut Context<Self>) {
         self.history_load_gen = self.history_load_gen.wrapping_add(1);
         let generation = self.history_load_gen;
         let loading = scope.clone();
         cx.spawn(async move |this, cx| {
             let loaded = cx
-                .background_spawn(async move {
-                    super::history::load_with_shell_files(&loading, fetch.read())
-                })
+                .background_spawn(async move { super::history::load(&loading) })
                 .await;
             this.update(cx, |view, cx| {
                 if view.history_scope != scope || view.history_load_gen != generation {
@@ -3663,43 +3379,6 @@ impl TerminalView {
         }
         self.history_nav = None;
         self.history_ready = true;
-    }
-
-    fn history_seed_fetch(&self, cx: &mut Context<Self>) -> HistorySeedFetch {
-        match history_seed_source(
-            self.history_scope.is_local(),
-            self.host_id.is_local(),
-            self.remote_context().map(|r| r.kind),
-        ) {
-            HistorySeedSource::None => HistorySeedFetch::None,
-            HistorySeedSource::WorkspaceHost => {
-                HistorySeedFetch::Host(self.workspace_host_history_files(cx))
-            }
-        }
-    }
-
-    fn workspace_host_history_files(
-        &self,
-        cx: &mut Context<Self>,
-    ) -> Vec<(crate::ui::host_ops::SharedHost, std::path::PathBuf)> {
-        let Some(host) = self.host(cx) else {
-            return Vec::new();
-        };
-        if !host.is_connected() {
-            return Vec::new();
-        }
-        let Some(home) = self
-            .host_id
-            .is_local()
-            .then(crate::ui::path_display::local_home)
-            .flatten()
-        else {
-            return Vec::new();
-        };
-        super::history::shell_history_names()
-            .into_iter()
-            .map(|name| (std::sync::Arc::clone(&host), host.join(&home, name)))
-            .collect()
     }
 
     fn refresh_git_status(
@@ -4089,10 +3768,6 @@ impl TerminalView {
         None
     }
 
-    fn link_inactive_reason(&self, cx: &gpui::App) -> Option<&'static str> {
-        (!self.accepts_input(cx)).then_some("the remote link is not attached")
-    }
-
     fn shell_vi_prompt(&self) -> bool {
         self.terminal.shell_vi_mode() && self.terminal.at_prompt() && !self.on_alt_screen()
     }
@@ -4277,10 +3952,6 @@ impl TerminalView {
     }
 
     fn dump_hold(&mut self, epoch: u64, cx: &mut Context<Self>) {
-        if !self.accepts_input(cx) {
-            let _ = self.hold.timeout(epoch);
-            return;
-        }
         let pasted = self.hold.pasted();
         if let Some((net, bytes)) = self.hold.timeout(epoch) {
             self.terminal.write(bytes);
@@ -4307,9 +3978,7 @@ impl TerminalView {
     fn insert_newline_fallback_action(&mut self, cx: &mut Context<Self>) {
         if self.input_active() {
             self.insert_newline_action(cx);
-        } else if (self.search.is_some() && self.search_focused)
-            || self.key_flags().kitty_active()
-            || !self.accepts_input(cx)
+        } else if (self.search.is_some() && self.search_focused) || self.key_flags().kitty_active()
         {
             cx.propagate();
         } else {
@@ -4331,7 +4000,7 @@ impl TerminalView {
     }
 
     fn submit_command(&mut self, cx: &mut Context<Self>) {
-        if self.terminal.exited || !self.accepts_input(cx) {
+        if self.terminal.exited {
             return;
         }
         self.engage_hold_into_editor();
@@ -4565,12 +4234,11 @@ impl TerminalView {
         cx.notify();
 
         let pane_id = self.pane_id;
-        let route = self.pane_route();
         cx.spawn(async move |this, cx| {
             let fg = cx
                 .background_executor()
                 .spawn(async move {
-                    RemoteTerminal::list_panes_on(&route)
+                    RemoteTerminal::list_panes_on(&crate::terminal::PaneRoute::Local)
                         .into_iter()
                         .find(|p| p.pane_id == pane_id)
                         .map(|p| p.title)
@@ -4639,9 +4307,6 @@ impl TerminalView {
     }
 
     fn handoff_line_to_shell(&mut self, chord: &[u8], cx: &mut Context<Self>) {
-        if !self.accepts_input(cx) {
-            return;
-        }
         self.engage_hold_into_editor();
         // Same reason as `submit_command`: what the record holds is on the
         // shell's own line, so it belongs in front of the line handed back.
@@ -4676,10 +4341,6 @@ impl TerminalView {
     fn tab_pressed(&mut self, forward: bool, cx: &mut Context<Self>) {
         if self.search_focused {
             cx.propagate();
-            return;
-        }
-        if let Some(reason) = self.link_inactive_reason(cx) {
-            log::debug!(target: "tty7::completion", "Tab does nothing and the line stays: {reason}");
             return;
         }
         if let Some(reason) = self.input_inactive_reason() {
@@ -4815,14 +4476,12 @@ impl TerminalView {
         Some(generation)
     }
 
-    /// The cwd to list over the distro's `\\wsl$` share, for a pane whose
-    /// filesystem is a WSL distro's: the local wsl.exe pane (tagged by its
-    /// remote context) and the WSL-workspace pane (tagged by its workspace
-    /// target) both report a POSIX cwd this process cannot read natively.
+    /// The cwd to list over the distro's `\\wsl$` share, for a local pane
+    /// running `wsl.exe`. Its remote context names the distro, and the cwd it
+    /// reports is POSIX, which this process cannot read natively.
     fn wsl_share_cwd(&self) -> Option<std::path::PathBuf> {
         let distro = wsl_share_distro(
             self.terminal.remote_context().as_ref(),
-            self.workspace.as_ref(),
             self.host_id.is_local(),
         )?;
         let cwd = self.cwd()?;
@@ -4830,7 +4489,7 @@ impl TerminalView {
     }
 
     fn remote_ssh_cwd(&self) -> Option<String> {
-        let _ = (self.terminal.remote_context(), self.workspace.as_ref());
+        let _ = self.terminal.remote_context();
         None
     }
 
@@ -5001,7 +4660,7 @@ impl TerminalView {
     }
 
     pub fn commit_text(&mut self, text: &str, cx: &mut Context<Self>) {
-        if self.terminal.exited || text.is_empty() || !self.accepts_input(cx) {
+        if self.terminal.exited || text.is_empty() {
             return;
         }
         if self.composer_takes_typing(text, cx) {
@@ -5512,8 +5171,7 @@ impl TerminalView {
         if !cx.global::<Config>().link_url {
             return false;
         }
-        let include_loopback = self.can_forward_loopback();
-        match self.resolve_link_at(col, row, true, include_loopback, cx) {
+        match self.resolve_link_at(col, row, true, cx) {
             LinkAt::Found(LinkTarget::Url(url), ..) => self.open_url(&url, window, cx),
             LinkAt::Found(
                 LinkTarget::File {
@@ -5546,8 +5204,7 @@ impl TerminalView {
             self.menu_link = None;
             return;
         }
-        let include_loopback = self.can_forward_loopback();
-        self.menu_link = match self.resolve_link_at(col, row, true, include_loopback, cx) {
+        self.menu_link = match self.resolve_link_at(col, row, true, cx) {
             LinkAt::Found(target @ LinkTarget::File { .. }, ..) => Some(target),
             _ => None,
         };
@@ -5703,19 +5360,6 @@ impl TerminalView {
         cx.open_url(url);
     }
 
-    fn loopback_plan(&self) -> LoopbackPlan {
-        loopback_plan(
-            true,
-            self.workspace.as_ref(),
-            self.terminal.remote_context().map(|r| r.kind),
-            self.pane_id,
-        )
-    }
-
-    fn can_forward_loopback(&self) -> bool {
-        !matches!(self.loopback_plan(), LoopbackPlan::Direct)
-    }
-
     pub fn hover_link_at(
         &mut self,
         col: usize,
@@ -5753,8 +5397,7 @@ impl TerminalView {
             }
             return false;
         }
-        let include_loopback = self.can_forward_loopback();
-        let next = self.link_span_at(col, row, armed, include_loopback, cx);
+        let next = self.link_span_at(col, row, armed, cx);
         if next != self.hovered_link {
             self.hovered_link = next;
             cx.notify();
@@ -5822,10 +5465,9 @@ impl TerminalView {
         col: usize,
         row: usize,
         armed: bool,
-        include_loopback: bool,
         cx: &mut Context<Self>,
     ) -> Option<HoveredLink> {
-        match self.resolve_link_at(col, row, true, include_loopback, cx) {
+        match self.resolve_link_at(col, row, true, cx) {
             LinkAt::Found(_, runs) => Some(HoveredLink { runs, armed }),
             LinkAt::Unresolved { .. } | LinkAt::None => None,
         }
@@ -5836,7 +5478,6 @@ impl TerminalView {
         col: usize,
         row: usize,
         include_files: bool,
-        include_loopback: bool,
         cx: &mut Context<Self>,
     ) -> LinkAt {
         let Some(line) = self.link_line_at(col, row) else {
@@ -5859,37 +5500,10 @@ impl TerminalView {
             true => self.link_roots(cx),
             false => super::search::LinkRoots::default(),
         };
-        let local = self.host_id.is_local();
-        // Before the first probe, not after: `retarget` empties the cache when
-        // the host has changed, and doing that between recording a wanted path
-        // and draining it would throw the question away unasked.
-        self.link_probes.retarget(self.host_id);
-        let probes = &mut self.link_probes;
-        let mut pending = false;
         let mut probe = |path: &std::path::Path, require_file: bool| {
-            let answer = match local {
-                true => super::search::local_probe(path, require_file),
-                false => probes.probe(path, require_file),
-            };
-            pending |= matches!(answer, super::search::Probe::Unknown);
-            answer
+            super::search::local_probe(path, require_file)
         };
         let link = super::search::link_at(&text, click_idx, &roots, files, &mut probe);
-        // `probe` holds the cache borrow; nothing below touches it, so the
-        // borrow ends here and `self` is whole again for the flush.
-        self.flush_link_probes(cx);
-
-        let link = link.or_else(|| {
-            include_loopback.then(|| {
-                super::loopback::loopback_url_span_at(&text, click_idx).map(|(start, end, url)| {
-                    super::search::LinkMatch {
-                        start,
-                        end,
-                        target: LinkTarget::Url(url),
-                    }
-                })
-            })?
-        });
         match link {
             Some(link) => {
                 let term = self.terminal.term.lock();
@@ -5902,7 +5516,10 @@ impl TerminalView {
                 .then(|| super::search::unresolved_candidate(&text, click_idx, roots.style))
                 .flatten()
             {
-                Some(candidate) => LinkAt::Unresolved { candidate, pending },
+                Some(candidate) => LinkAt::Unresolved {
+                    candidate,
+                    pending: false,
+                },
                 None => LinkAt::None,
             },
         }
@@ -5993,51 +5610,6 @@ impl TerminalView {
                 view.link_repo_root_pending = false;
                 view.link_repo_root = Some((cwd, root));
                 view.recompute_link_hover(cx);
-            },
-        );
-    }
-
-    /// Asks the host about every path a lookup could not answer for, in one
-    /// call, and re-runs the hover once the replies are in — the mouse may
-    /// have been resting on the link the whole time it took.
-    fn flush_link_probes(&mut self, cx: &mut Context<Self>) {
-        if self.host_id.is_local() {
-            return;
-        }
-        // The host comes first: `take_wanted` moves the paths into the
-        // in-flight set on the promise that a call is about to carry them, and
-        // a host that has gone away between the hover and here would break
-        // that promise permanently — those paths would stay `Unknown` for the
-        // life of the pane, which looks exactly like the silent nothing this
-        // whole path exists to get rid of.
-        let Some(host) = self.host(cx) else {
-            return;
-        };
-        let wanted = self.link_probes.take_wanted();
-        if wanted.is_empty() {
-            return;
-        }
-        crate::ui::host_ops::HostOps::run(
-            host,
-            cx,
-            move |h| {
-                use super::link_probe::Existence;
-                wanted
-                    .into_iter()
-                    .map(|path| {
-                        let existence = match h.stat(&path) {
-                            Ok(meta) if meta.is_dir => Existence::Dir,
-                            Ok(_) => Existence::File,
-                            Err(_) => Existence::Missing,
-                        };
-                        (path, existence)
-                    })
-                    .collect::<Vec<_>>()
-            },
-            |view, answers, cx| {
-                if view.link_probes.land(answers) {
-                    view.recompute_link_hover(cx);
-                }
             },
         );
     }
@@ -7804,14 +7376,14 @@ mod tests {
         assert!(!out.contains(" …"), "{out:?}");
     }
     use super::{
-        COMPLETION_MENU_MAX_W, LoopbackPlan, PortRoute, RawInput, SelectEndCopy, Typeahead,
-        WheelRoute, clipboard_paths, compose_notification_title, cwd_is_on_host, display_width,
-        link_path_style, loopback_plan, observe_typeahead_for_owner, typeahead_boundary,
+        COMPLETION_MENU_MAX_W, RawInput, SelectEndCopy, Typeahead, WheelRoute, clipboard_paths,
+        compose_notification_title, cwd_is_on_host, display_width, link_path_style,
+        observe_typeahead_for_owner, typeahead_boundary,
     };
     use super::{SCROLL_ANIM_FRAME, scroll_anim_step};
     use super::{
-        TitleSettle, files_cwd, local_path_for_pane, settle_title, stages_clipboard_image,
-        staging_cache, wsl_path, wsl_share_distro, wsl_share_path,
+        TitleSettle, files_cwd, settle_title, stages_clipboard_image, staging_cache,
+        wsl_share_distro, wsl_share_path,
     };
     use super::{
         before_input, description_budget, drag_scroll_step, elide, encode_mouse,
@@ -7826,36 +7398,7 @@ mod tests {
     use gpui_component::IconName;
     use std::path::{Path, PathBuf};
 
-    use crate::core::session::{RemoteTarget, WorkspaceId};
     use crate::daemon::protocol::RemoteKind;
-    use crate::terminal::PaneWorkspace;
-
-    #[test]
-    fn history_seeding_keeps_to_the_machine_the_scope_names() {
-        use super::{HistorySeedSource, history_seed_source};
-        // The workspace host's files, for the workspace host's own scope.
-        assert_eq!(
-            history_seed_source(false, false, None),
-            HistorySeedSource::WorkspaceHost,
-        );
-        // A bare `ssh` onward, from here or from a workspace host: tty7 has no
-        // connection to that box, and the files it can reach are another
-        // machine's.
-        for host_is_local in [true, false] {
-            for kind in [RemoteKind::Ssh, RemoteKind::Wsl] {
-                assert_eq!(
-                    history_seed_source(false, host_is_local, Some(kind)),
-                    HistorySeedSource::None,
-                    "{kind:?}, host local: {host_is_local}",
-                );
-            }
-        }
-        // A local scope reads this machine's shells directly.
-        assert_eq!(
-            history_seed_source(true, true, None),
-            HistorySeedSource::None,
-        );
-    }
 
     #[test]
     fn a_title_the_tab_already_shows_drops_the_one_that_was_waiting() {
@@ -8064,58 +7607,6 @@ mod tests {
         assert!(typeahead_boundary("d", &ctrl_alt).is_none());
     }
 
-    fn ws(target: RemoteTarget) -> PaneWorkspace {
-        PaneWorkspace {
-            workspace: WorkspaceId::new(),
-            target,
-            label: None,
-        }
-    }
-
-    #[test]
-    fn local_pane_opens_localhost_directly() {
-        assert_eq!(loopback_plan(true, None, None, 1), LoopbackPlan::Direct);
-    }
-
-    /// What the Ports list asks about every listener it found.
-    #[test]
-    fn a_remote_port_is_a_forward_away_rather_than_out_of_reach() {
-        use super::port_route_of;
-        assert_eq!(
-            port_route_of(&LoopbackPlan::NoForwardNeeded, false),
-            PortRoute::Direct,
-            "WSL serves onto this machine's own loopback"
-        );
-        assert_eq!(
-            port_route_of(&LoopbackPlan::Direct, true),
-            PortRoute::Direct,
-            "this machine's ports open with no help"
-        );
-        assert_eq!(
-            port_route_of(&LoopbackPlan::Direct, false),
-            PortRoute::Blocked,
-            "another machine's port with forwarding turned off is not ours to \
-             open — opening it here would reach some unrelated local service"
-        );
-    }
-
-    #[test]
-    fn wsl_workspace_needs_no_forward() {
-        let w = ws(RemoteTarget::Wsl {
-            distro: "Ubuntu".into(),
-        });
-        assert_eq!(
-            loopback_plan(true, Some(&w), None, 7),
-            LoopbackPlan::NoForwardNeeded
-        );
-    }
-
-    #[test]
-    fn workspace_without_a_spec_does_not_forward() {
-        let w = ws(RemoteTarget::direct("me", "dev.box", 22));
-        assert_eq!(loopback_plan(true, Some(&w), None, 7), LoopbackPlan::Direct);
-    }
-
     fn wsl_context(distro: &str) -> crate::daemon::protocol::RemoteContext {
         crate::daemon::protocol::RemoteContext {
             kind: RemoteKind::Wsl,
@@ -8127,7 +7618,7 @@ mod tests {
     #[test]
     fn a_wsl_exe_pane_on_this_machine_completes_over_its_own_share() {
         assert_eq!(
-            wsl_share_distro(Some(&wsl_context("Ubuntu-24.04")), None, true),
+            wsl_share_distro(Some(&wsl_context("Ubuntu-24.04")), true),
             Some("Ubuntu-24.04".to_string())
         );
     }
@@ -8137,29 +7628,14 @@ mod tests {
     #[test]
     fn a_remote_hosts_wsl_exe_pane_leaves_tab_to_the_shell() {
         assert_eq!(
-            wsl_share_distro(Some(&wsl_context("Ubuntu-24.04")), None, false),
+            wsl_share_distro(Some(&wsl_context("Ubuntu-24.04")), false),
             None
-        );
-    }
-
-    /// A WSL workspace's panes are served by the daemon inside the distro, so
-    /// their host is never `LOCAL` — and the distro is still on this machine.
-    #[test]
-    fn a_wsl_workspace_pane_completes_over_the_share_its_target_names() {
-        let w = ws(RemoteTarget::Wsl {
-            distro: "Ubuntu-24.04".into(),
-        });
-        assert_eq!(
-            wsl_share_distro(None, Some(&w), false),
-            Some("Ubuntu-24.04".to_string())
         );
     }
 
     #[test]
     fn panes_with_no_distro_of_their_own_have_no_share() {
-        let ssh = ws(RemoteTarget::direct("me", "dev.box", 22));
-        assert_eq!(wsl_share_distro(None, Some(&ssh), false), None);
-        assert_eq!(wsl_share_distro(None, None, true), None);
+        assert_eq!(wsl_share_distro(None, true), None);
     }
 
     #[test]
@@ -8200,37 +7676,6 @@ mod tests {
             id: None,
         };
         assert!(super::validate_remote_clipboard_image(mismatched).is_err());
-    }
-
-    #[test]
-    fn a_wsl_pane_gets_the_automount_path_not_the_windows_one() {
-        // The staged file really is on the pane's own disk — only its name
-        // differs — so this is a rewrite, not an upload.
-        assert_eq!(
-            local_path_for_pane(
-                r"C:\Users\me\AppData\Local\Temp\tty7-clipboard\paste-1.png",
-                true
-            ),
-            "/mnt/c/Users/me/AppData/Local/Temp/tty7-clipboard/paste-1.png"
-        );
-        assert_eq!(wsl_path(r"D:\x\y.png").as_deref(), Some("/mnt/d/x/y.png"));
-
-        // No automount mapping: the Windows path at least says where it went.
-        let unc = r"\\server\share\paste-1.png";
-        assert_eq!(wsl_path(unc), None);
-        assert_eq!(local_path_for_pane(unc, true), unc);
-        // Drive-relative, not absolute — `C:x` means "x under C:'s cwd".
-        assert_eq!(wsl_path(r"C:paste-1.png"), None);
-
-        // Every other pane keeps the path exactly as staged.
-        assert_eq!(
-            local_path_for_pane("/tmp/tty7-clipboard/paste-1.png", false),
-            "/tmp/tty7-clipboard/paste-1.png"
-        );
-        assert_eq!(
-            local_path_for_pane(r"C:\Temp\paste-1.png", false),
-            r"C:\Temp\paste-1.png"
-        );
     }
 
     #[test]
@@ -9589,37 +9034,6 @@ mod tests {
              drive its paths could hang off"
         );
     }
-
-    #[test]
-    fn a_panes_host_is_its_workspaces_machine() {
-        use crate::core::session::{RemoteTarget, WorkspaceId};
-        use crate::ui::host_ops::HostId;
-
-        let target = RemoteTarget::Alias {
-            alias: "build-box".into(),
-        };
-        let ws = PaneWorkspace {
-            workspace: WorkspaceId::new(),
-            target: target.clone(),
-            label: None,
-        };
-
-        let remote = ws.target.host_id();
-        assert_eq!(remote, target.host_id(), "the workspace's own machine");
-        assert!(!remote.is_local(), "a remote workspace is not this machine");
-        assert_eq!(
-            HostId::from_connection_key("ssh-alias:build-box"),
-            remote,
-            "the id the connection was opened under, or the registry lookup misses"
-        );
-
-        let sibling = PaneWorkspace {
-            workspace: WorkspaceId::new(),
-            target,
-            label: None,
-        };
-        assert_eq!(sibling.target.host_id(), remote);
-    }
 }
 
 #[cfg(test)]
@@ -10519,7 +9933,7 @@ mod gpui_tests {
                     !view.hover_link_at(gone, 0, true, cx),
                     "nothing underlines for a name that is not on disk"
                 );
-                match view.resolve_link_at(gone, 0, true, false, cx) {
+                match view.resolve_link_at(gone, 0, true, cx) {
                     LinkAt::Unresolved { candidate, pending } => {
                         assert_eq!(candidate.path, "scratchpad/gone.md");
                         assert!(
@@ -10731,73 +10145,6 @@ mod gpui_tests {
             })
             .unwrap();
         let _ = std::fs::remove_file(&file);
-    }
-
-    /// A path a remote pane printed stays *wanted* until a host has actually
-    /// been asked about it.
-    ///
-    /// `take_wanted` moves paths into the in-flight set on the promise that a
-    /// call is carrying them; a lookup that finds no host to make that call
-    /// must not have made the promise. Otherwise those paths sit "not answered
-    /// yet" for the life of the pane — no underline, and a click that says
-    /// nothing, which is the silence this whole path exists to remove.
-    ///
-    /// Was unix-only because the path it prints is: `Path::new("/etc/hosts")`
-    /// is not absolute on Windows, so `FileCandidate::paths` measured it from
-    /// the roots rather than letting it stand alone — and a workspace that
-    /// never connected has no roots, so nothing was ever wanted. Which was
-    /// itself the divergence: a Windows tty7 looking at a *remote* Linux pane
-    /// never probed the POSIX paths that pane printed.
-    ///
-    /// #795 settled that. `paths` now asks the pane's own
-    /// [`super::search::PathStyle`] rather than this machine's, and a remote
-    /// pane that has not reported a cwd is read as `Posix`, so `/etc/hosts`
-    /// stands alone on every client. The gate is only still here because
-    /// nothing has run this test on Windows yet; lifting it belongs in a
-    /// change that can show it green, not in a merge.
-    #[cfg(unix)]
-    #[gpui::test]
-    fn a_probe_with_no_host_to_ask_stays_wanted(cx: &mut TestAppContext) {
-        let (window, daemon) = harness(cx);
-        daemon.send(DaemonMsg::Output(b"see /etc/hosts now\r\n".to_vec()));
-        for _ in 0..200 {
-            let seen = window
-                .update(cx, |view, _, _| {
-                    view.terminal.term.lock().grid()[Line(0)][Column(4)].c == '/'
-                })
-                .unwrap();
-            if seen {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-
-        window
-            .update(cx, |view, _, cx| {
-                bind_to_a_disconnected_remote_workspace(view, cx);
-                assert!(
-                    view.host(cx).is_none(),
-                    "a workspace that never connected has nothing to ask"
-                );
-                assert!(
-                    view.cwd_is_on_host(),
-                    "the pane's paths are the far side's, whether or not it is up"
-                );
-                assert!(
-                    !view.hover_link_at(4, 0, true, cx),
-                    "nothing underlines while the answer is still unknown"
-                );
-                assert_eq!(
-                    view.link_probes.take_wanted(),
-                    vec![std::path::PathBuf::from("/etc/hosts")],
-                    "and the question survives, ready for a host to answer it"
-                );
-                assert!(
-                    !view.link_roots(cx).local_home,
-                    "this machine's $HOME describes nobody over there"
-                );
-            })
-            .unwrap();
     }
 
     #[gpui::test]
@@ -13672,78 +13019,6 @@ mod gpui_tests {
         assert_eq!(next_input(&daemon), b"ping".to_vec());
     }
 
-    fn bind_to_a_disconnected_remote_workspace(
-        view: &mut TerminalView,
-        _cx: &mut Context<TerminalView>,
-    ) -> crate::core::session::WorkspaceId {
-        use crate::core::session::{RemoteRef, RemoteTarget, WorkspaceId};
-        use crate::terminal::PaneWorkspace;
-        let host = RemoteRef::new(
-            RemoteTarget::direct("me", "build-box", 22),
-            WorkspaceId::new(),
-        );
-        let id = host.workspace;
-        view.set_workspace(Some(PaneWorkspace {
-            workspace: id,
-            target: host.target,
-            label: None,
-        }));
-        id
-    }
-
-    #[gpui::test]
-    fn a_disconnected_remote_pane_keeps_the_line_instead_of_handing_it_to_nowhere(
-        cx: &mut TestAppContext,
-    ) {
-        crate::core::config::pin_test_config_dir();
-        let (window, daemon) = harness(cx);
-        cx.update(crate::ui::keymap::init);
-        daemon.send(DaemonMsg::Prompt {
-            active: true,
-            at_prompt: true,
-            last_exit: None,
-        });
-        wait_for_input_active(&window, cx);
-
-        window
-            .update(cx, |view, window, cx| {
-                window.activate_window();
-                view.focus_handle.focus(window, cx);
-                view.cmd.set("zzqqx");
-                bind_to_a_disconnected_remote_workspace(view, cx);
-            })
-            .unwrap();
-
-        let mut vcx = gpui::VisualTestContext::from_window(window.into(), cx);
-        vcx.simulate_keystrokes("tab");
-
-        window
-            .update(cx, |view, _, cx| {
-                assert_eq!(
-                    view.cmd.text(),
-                    "zzqqx",
-                    "a Tab dispatched through SendTab must not empty the line"
-                );
-                assert!(
-                    view.editor_handoff.is_none(),
-                    "nothing was handed off, so the editor keeps the prompt"
-                );
-
-                view.submit_command(cx);
-                assert_eq!(
-                    view.cmd.text(),
-                    "zzqqx",
-                    "submit_command guards the link too, even though on_key_down already does"
-                );
-            })
-            .unwrap();
-        assert_eq!(
-            next_input_until_timeout(&daemon),
-            None,
-            "not one byte reached the wire"
-        );
-    }
-
     #[gpui::test]
     fn a_remote_listing_says_so_while_it_runs_and_when_it_fails(cx: &mut TestAppContext) {
         let (window, _daemon) = harness(cx);
@@ -13763,131 +13038,6 @@ mod gpui_tests {
                     Some("remote listing failed — boom"),
                     "a failed listing is not the same silence as an empty one"
                 );
-            })
-            .unwrap();
-    }
-
-    #[gpui::test]
-    fn a_disconnected_remote_pane_swallows_every_kind_of_typing(cx: &mut TestAppContext) {
-        let (window, daemon) = harness(cx);
-        window
-            .update(cx, |view, window, cx| {
-                bind_to_a_disconnected_remote_workspace(view, cx);
-
-                type_char(view, "x", window, cx);
-                view.commit_text("y", cx);
-                view.paste("pasted".into(), cx);
-                view.send_to_pty(b"raw", cx);
-                view.dump_hold(0, cx);
-            })
-            .unwrap();
-        assert_eq!(
-            next_input_until_timeout(&daemon),
-            None,
-            "a read-only window must not put one byte of typing on the wire"
-        );
-    }
-
-    #[gpui::test]
-    fn a_disconnected_remote_pane_still_selects_and_copies(cx: &mut TestAppContext) {
-        let (window, daemon) = harness(cx);
-        daemon.send(DaemonMsg::Output(b"secrets".to_vec()));
-        for _ in 0..400 {
-            cx.run_until_parked();
-            let ready = window
-                .update(cx, |view, _, _| {
-                    let term = view.terminal.term.clone();
-                    let term = term.lock();
-                    term.grid()[alacritty_terminal::index::Line(0)][Column(0)].c == 's'
-                })
-                .unwrap();
-            if ready {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-
-        let chord = |key: &str| KeyDownEvent {
-            keystroke: gpui::Keystroke {
-                modifiers: Modifiers {
-                    platform: true,
-                    ..Modifiers::default()
-                },
-                key: key.into(),
-                key_char: None,
-            },
-            is_held: false,
-            prefer_character_input: false,
-        };
-        window
-            .update(cx, |view, window, cx| {
-                bind_to_a_disconnected_remote_workspace(view, cx);
-                view.terminal.exited = true;
-                view.on_key_down(&chord("a"), window, cx);
-                assert!(
-                    view.terminal.term.lock().selection.is_some(),
-                    "⌘A must still select on a read-only window"
-                );
-                view.on_key_down(&chord("c"), window, cx);
-            })
-            .unwrap();
-        let copied = cx.update(|cx| cx.read_from_clipboard().and_then(|item| item.text()));
-        assert!(
-            copied.is_some_and(|t| t.contains("secrets")),
-            "⌘C must still copy on a read-only window"
-        );
-    }
-
-    #[gpui::test]
-    fn a_disconnected_remote_pane_still_answers_terminal_queries(cx: &mut TestAppContext) {
-        let (window, daemon) = harness(cx);
-        window
-            .update(cx, |view, _, cx| {
-                bind_to_a_disconnected_remote_workspace(view, cx);
-                view.handle_event(AlacEvent::PtyWrite("\x1b[?62;c".into()), cx);
-            })
-            .unwrap();
-        assert_eq!(
-            next_input(&daemon),
-            b"\x1b[?62;c".to_vec(),
-            "a query reply is the emulator's answer, not the user's typing"
-        );
-    }
-
-    #[gpui::test]
-    fn a_dropped_link_does_not_claim_the_process_exited(cx: &mut TestAppContext) {
-        let (window, _daemon) = harness(cx);
-        window
-            .update(cx, |view, _, cx| {
-                bind_to_a_disconnected_remote_workspace(view, cx);
-                view.handle_event(AlacEvent::Exit, cx);
-                assert_eq!(view.title, "ntty7 — disconnected");
-
-                view.set_workspace(None);
-                view.handle_event(AlacEvent::Exit, cx);
-                assert_eq!(view.title, "ntty7 — process exited");
-            })
-            .unwrap();
-    }
-
-    /// A workspace pane answers to its workspace's name: untitled tabs show
-    /// it, and a dead link's suffix hangs off it — not off the bare app name,
-    /// which read "ntty7 — disconnected" no matter whose link died.
-    #[gpui::test]
-    fn a_workspace_pane_answers_to_its_workspaces_name(cx: &mut TestAppContext) {
-        use crate::core::session::{RemoteTarget, WorkspaceId};
-        use crate::terminal::PaneWorkspace;
-        let (window, _daemon) = harness(cx);
-        window
-            .update(cx, |view, _, cx| {
-                view.set_workspace(Some(PaneWorkspace {
-                    workspace: WorkspaceId::new(),
-                    target: RemoteTarget::direct("me", "build-box", 22),
-                    label: Some("hummingbot".into()),
-                }));
-                assert_eq!(view.title, "hummingbot", "an untitled tab shows the name");
-                view.handle_event(AlacEvent::Exit, cx);
-                assert_eq!(view.title, "hummingbot — disconnected");
             })
             .unwrap();
     }
@@ -13917,20 +13067,6 @@ mod gpui_tests {
                 );
             })
             .unwrap();
-    }
-
-    #[gpui::test]
-    fn a_local_pane_types_exactly_as_it_always_did(cx: &mut TestAppContext) {
-        let (window, daemon) = harness(cx);
-        window
-            .update(cx, |view, window, cx| {
-                bind_to_a_disconnected_remote_workspace(view, cx);
-                view.set_workspace(None);
-                assert!(view.accepts_input(cx));
-                type_char(view, "z", window, cx);
-            })
-            .unwrap();
-        assert_eq!(next_input(&daemon), b"z".to_vec());
     }
 
     #[gpui::test]

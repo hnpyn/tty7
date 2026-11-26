@@ -4,7 +4,6 @@ pub mod host_ops;
 pub mod host_registry;
 pub mod i18n;
 pub mod keymap;
-pub mod path_display;
 pub mod prefill;
 pub mod presets;
 pub mod prompt;

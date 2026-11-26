@@ -137,7 +137,6 @@ l10n_keys! {
     AppMenuZoom,
     IntegrationNoticeBlocked,
     IntegrationNoticeNotEngaged,
-    PaneTitleDisconnected,
     PaneTitleProcessExited,
     CompletionListingRemote,
     ShellFellBack,

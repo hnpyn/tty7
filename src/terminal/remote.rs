@@ -167,24 +167,6 @@ impl PtySource {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct PaneWorkspace {
-    pub workspace: crate::core::session::WorkspaceId,
-    pub target: crate::core::session::RemoteTarget,
-    /// The name the workspace answers to — its own label, or its machine's
-    /// when it has none. A pane keeps answering to this name when its link
-    /// dies (#438 gave SSH panes their host here; without this, a workspace
-    /// pane fell back to the bare app name and the tab read "tty7 —
-    /// disconnected").
-    pub label: Option<String>,
-}
-
-impl PaneWorkspace {
-    pub fn shares_localhost(&self) -> bool {
-        matches!(self.target, crate::core::session::RemoteTarget::Wsl { .. })
-    }
-}
-
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum PaneRoute {
     #[default]
@@ -192,11 +174,6 @@ pub enum PaneRoute {
 }
 
 impl PaneRoute {
-    pub fn for_workspace(workspace: Option<&PaneWorkspace>) -> PaneRoute {
-        let _ = workspace;
-        PaneRoute::Local
-    }
-
     pub fn is_local(&self) -> bool {
         true
     }
@@ -2442,7 +2419,6 @@ mod tests {
     #[test]
     fn a_local_pane_prefixes_nothing() {
         assert!(PaneRoute::Local.is_local());
-        assert!(matches!(PaneRoute::for_workspace(None), PaneRoute::Local));
         assert!(matches!(PaneRoute::default(), PaneRoute::Local));
     }
 

@@ -15,22 +15,16 @@ log.workspace = true
 serde = { workspace = true }
 serde_json.workspace = true
 
-# The gitignore matcher chain (`core::gitignore`) the file tree dims entries with.
+# Gitignore matching for the prompt composer's `@` file completion (`core::gitignore`).
 ignore = "0.4"
 
 # Cross-platform PTY: a Unix pty on Unix, ConPTY on Windows.
 portable-pty = "0.8"
 
-# Filesystem watching for `host::local`.
-notify = "8"
-
-# `smol::channel` carries watch batches out of the coalescing thread.
-smol.workspace = true
-
 # SIMD byte search for the OSC tokenizer's fast paths.
 memchr = "2"
 
-# Base64 for byte fields in JSON (`host::Output`, OSC payloads).
+# Base64 for OSC and kitty-graphics payloads.
 base64 = "0.22"
 
 # zlib inflate for kitty graphics `o=z` payloads.

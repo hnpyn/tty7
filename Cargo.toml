@@ -48,8 +48,6 @@ serde_json.workspace = true
 # `SelectTheme` is a parameterized gpui action, and the derive needs
 # `JsonSchema` from the same schemars 1.x gpui re-exports.
 schemars = { version = "1.0", features = ["indexmap2"] }
-# Pane ids. Already used by the terminal view.
-uuid = { version = "1", features = ["v4", "serde"] }
 
 # Theme files. Themes are authored as YAML (`~/.config/ntty7/themes/*.yaml`,
 # our own schema); `plist` parses imported iTerm2 `.itermcolors` schemes (XML

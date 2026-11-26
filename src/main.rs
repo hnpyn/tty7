@@ -25,6 +25,29 @@ fn register_bundled_fonts(cx: &mut App) {
     }
 }
 
+/// Did this watch event mean something *changed*, or only that something was
+/// read?
+///
+/// The distinction does not exist on macOS, and on Linux it decides whether a
+/// watch can feed itself. `notify`'s inotify backend asks for `IN_OPEN`, so
+/// every `open(2)` under a watched directory arrives as an event — and the one
+/// thing a config reload does with an event is go and read `config.json`.
+/// Reading it is itself an event saying it may have changed, so the answer
+/// schedules the next question forever.
+///
+/// `IN_CLOSE_WRITE` also arrives as `Access`, and that one is a real write
+/// finishing, so it stays. Everything else under `Access` is a reader.
+fn is_content_change(kind: &notify::EventKind) -> bool {
+    use notify::event::{AccessKind, AccessMode};
+
+    !matches!(
+        kind,
+        notify::EventKind::Access(
+            AccessKind::Open(_) | AccessKind::Read | AccessKind::Close(AccessMode::Read),
+        )
+    )
+}
+
 fn spawn_config_watcher(cx: &mut App) {
     use notify::{RecursiveMode, Watcher};
 
@@ -47,8 +70,8 @@ fn spawn_config_watcher(cx: &mut App) {
     let handler = move |res: notify::Result<notify::Event>| {
         let Ok(event) = res else { return };
         // A reload re-reads the file, and on Linux reading it is itself an
-        // event — see `tty7_core::host::is_content_change`.
-        if !tty7_core::host::is_content_change(&event.kind) {
+        // event — see `is_content_change`.
+        if !is_content_change(&event.kind) {
             return;
         }
         let hit = event

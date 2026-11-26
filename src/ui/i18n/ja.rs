@@ -87,7 +87,6 @@ pub fn translate_ja(key: L10nKey) -> Option<&'static str> {
         L10nKey::IntegrationNoticeNotEngaged => {
             "このペインでは tty7 シェル統合が有効になっておらず、インライン補完と Ctrl+R メニューは使えません。よくある原因は、独自の引数で起動したシェル、PTY ラッパー、未対応のシェルです。"
         }
-        L10nKey::PaneTitleDisconnected => "{title} — 切断されました",
         L10nKey::PaneTitleProcessExited => "{title} — プロセスが終了しました",
         L10nKey::CompletionListingRemote => "リモートを一覧しています…",
         L10nKey::ShellFellBack => {

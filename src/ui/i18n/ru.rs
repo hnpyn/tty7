@@ -85,7 +85,6 @@ pub fn translate_ru(key: L10nKey) -> Option<&'static str> {
         L10nKey::IntegrationNoticeNotEngaged => {
             "Интеграция оболочки tty7 не включилась в этой панели. Встроенное дополнение и меню Ctrl+R недоступны. Возможные причины: свои аргументы запуска оболочки, обёртка PTY или неподдерживаемая оболочка."
         }
-        L10nKey::PaneTitleDisconnected => "{title}: нет соединения",
         L10nKey::PaneTitleProcessExited => "{title}: процесс завершён",
         L10nKey::CompletionListingRemote => "чтение удалённого списка…",
         L10nKey::ShellFellBack => {

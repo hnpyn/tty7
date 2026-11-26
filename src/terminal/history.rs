@@ -116,17 +116,9 @@ pub fn load_with_shell_files(scope: &Scope, shell_files: Vec<(String, Vec<u8>)>)
 const FISH_HISTORY_FILE: &str = "fish_history";
 
 /// fish's history relative to the XDG data dir, and relative to `$HOME` when
-/// that dir is the default `~/.local/share`. `shell_history_names` returns the
-/// second, so a test pins the two spellings to each other.
+/// that dir is the default `~/.local/share`.
 const FISH_HISTORY_UNDER_DATA_DIR: &str = "fish/fish_history";
 const FISH_HISTORY_UNDER_HOME: &str = ".local/share/fish/fish_history";
-
-/// History files worth fetching from a remote host, relative to its home dir.
-/// `load_with_shell_files` reads the file name back off these to pick a parser,
-/// so a name added here needs a reader in `parse_history_file`.
-pub fn shell_history_names() -> [&'static str; 3] {
-    [".zsh_history", ".bash_history", FISH_HISTORY_UNDER_HOME]
-}
 
 fn looks_absolute(p: &str) -> bool {
     match p.as_bytes() {
@@ -728,10 +720,6 @@ mod tests {
             "the XDG-relative and HOME-relative spellings have drifted apart"
         );
         assert!(FISH_HISTORY_UNDER_HOME.ends_with(FISH_HISTORY_FILE));
-        assert!(
-            shell_history_names().contains(&FISH_HISTORY_UNDER_HOME),
-            "a remote host must be asked for the same file the local side reads"
-        );
     }
 
     #[test]

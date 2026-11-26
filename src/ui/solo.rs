@@ -197,13 +197,7 @@ impl SoloWindow {
             crate::spawn_new_instance(Some(&cwd), display);
             return;
         }
-        let parts = match TerminalView::spawn_shell_terminal_in(
-            None,
-            Some(cwd.clone()),
-            None,
-            None,
-            None,
-        ) {
+        let parts = match TerminalView::spawn_shell_terminal_in(Some(cwd.clone()), None) {
             Ok(parts) => parts,
             Err(error) => {
                 log::error!("could not open {}: {error:#}", cwd.display());
@@ -425,7 +419,7 @@ pub(crate) fn open(cx: &mut App, cwd: Option<std::path::PathBuf>) {
     crate::mark_window_live(cwd.as_deref());
     let launched_without_path = cwd.is_none();
     let cwd = cwd.or_else(crate::core::config::working_directory_base);
-    match TerminalView::spawn_shell_terminal_in(None, cwd, None, None, None) {
+    match TerminalView::spawn_shell_terminal_in(cwd, None) {
         Ok(parts) => {
             let options = window_options(cx);
             let opened = cx.open_window(options, move |window, cx| {

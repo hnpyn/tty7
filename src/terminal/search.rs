@@ -701,13 +701,6 @@ pub(super) fn url_at(text: &str, col: usize) -> Option<String> {
 }
 
 /// What checking one candidate path came back with.
-///
-/// The third arm is what makes remote panes work at all. A local pane answers
-/// out of the filesystem in microseconds, but a pane whose paths live on
-/// another machine has to ask that machine, and the answer arrives frames
-/// later — long after the mouse event that wanted it. [`Probe::Unknown`] is
-/// that gap: it means "nobody has asked yet", and the prober is expected to go
-/// ask so the *next* look finds a real answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Probe {
     /// Something is there. Whether it is a directory travels with the answer:
@@ -716,7 +709,6 @@ pub(super) enum Probe {
         is_dir: bool,
     },
     Miss,
-    Unknown,
 }
 
 /// Answers for paths on the machine tty7 itself is running on.
@@ -1017,8 +1009,7 @@ pub(super) fn link_at(
 ///
 /// Roots are tried in order and the first [`Probe::Hit`] wins, which is what
 /// makes the pane's own directory beat the repository root when both hold a
-/// file by that name. A [`Probe::Unknown`] does not stop the walk — a later
-/// root may already be cached — it just leaves the token unresolved for now.
+/// file by that name.
 pub(super) fn resolve_candidate(
     candidate: &FileCandidate,
     roots: &LinkRoots,
@@ -1030,7 +1021,7 @@ pub(super) fn resolve_candidate(
         .into_iter()
         .find_map(|path| match probe(&path, require_file) {
             Probe::Hit { is_dir } => Some((path, is_dir)),
-            Probe::Miss | Probe::Unknown => None,
+            Probe::Miss => None,
         })
 }
 
@@ -2307,26 +2298,6 @@ mod tests {
             ),
             LinkTarget::Url(url) => panic!("expected file link, got URL {url}"),
         }
-    }
-
-    #[test]
-    fn an_unanswered_probe_resolves_to_nothing_and_asks_about_every_root() {
-        let mut asked: Vec<PathBuf> = Vec::new();
-        let roots = LinkRoots::local(vec![PathBuf::from("/work/crate"), PathBuf::from("/work")]);
-        let link = link_at("see src/lib.rs:9 there", 5, &roots, true, &mut |path, _| {
-            asked.push(path.to_path_buf());
-            Probe::Unknown
-        });
-
-        assert_eq!(link, None, "nothing underlines until the host has answered");
-        assert_eq!(
-            asked,
-            vec![
-                PathBuf::from("/work/crate/src/lib.rs"),
-                PathBuf::from("/work/src/lib.rs"),
-            ],
-            "every root is asked about, so one round trip covers them all"
-        );
     }
 
     #[test]
