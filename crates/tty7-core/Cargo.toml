@@ -46,17 +46,13 @@ core-foundation = "0.10"
 
 # Toolhelp process enumeration + `TerminateProcess`, used by `daemon::winproc`.
 # `Registry` lets `daemon::windows_env` re-read the environment hives.
-# `IpHelper` is `GetExtendedTcpTable` for `daemon::procinfo`.
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
-    "Win32_NetworkManagement_IpHelper",
     "Win32_System_Console",
     "Win32_System_Diagnostics_ToolHelp",
-    "Win32_System_ProcessStatus",
     "Win32_System_Registry",
     "Win32_System_Threading",
-    "Win32_UI_WindowsAndMessaging",
 ] }
 
 [dev-dependencies]
