@@ -808,7 +808,7 @@ impl TerminalView {
     /// different number from `pane_id`, which the daemon assigns.
     fn notify_pane(&self, lead: Option<&str>, body: &str, cx: &mut Context<Self>) {
         let title = self.notification_title(lead, cx);
-        super::remote::notify_desktop_for_pane(Some(&title), body, Some(cx.entity_id()));
+        super::notify::notify_desktop_for_pane(Some(&title), body, Some(cx.entity_id()));
     }
 
     /// Desktop notifications the program wrote (OSC 9, 99, 777), such as
@@ -854,7 +854,7 @@ impl TerminalView {
         }
         for (title, body) in notes {
             match title {
-                Some(title) => super::remote::notify_desktop_for_pane(
+                Some(title) => super::notify::notify_desktop_for_pane(
                     Some(&title),
                     &body,
                     Some(cx.entity_id()),
@@ -9622,44 +9622,19 @@ mod tests {
     }
 }
 
-/// A connected pair of [`crate::terminal::remote::Stream`]s, one for each end
-/// of a pane's link to its daemon.
-///
-/// The client half is what a pane really reads and writes; the daemon half is
-/// the test's, to speak protocol into.
-///
-/// This is the one thing a pane harness needs that Unix and Windows spell
-/// differently — `socketpair` there, a loopback connect here — and every gpui
-/// test in this crate is portable once it goes through this instead of naming
-/// `UnixStream` itself.
-#[cfg(test)]
-pub(crate) fn test_stream_pair() -> (
-    crate::terminal::remote::Stream,
-    crate::terminal::remote::Stream,
-) {
-    #[cfg(unix)]
-    {
-        std::os::unix::net::UnixStream::pair().unwrap()
-    }
-    #[cfg(windows)]
-    {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let client_side = std::net::TcpStream::connect(addr).unwrap();
-        let (daemon_side, _) = listener.accept().unwrap();
-        (client_side, daemon_side)
-    }
-}
-
 #[cfg(test)]
 pub(crate) fn quiet_test_pane(
     pane_id: u64,
     window: &mut Window,
     cx: &mut gpui::App,
-) -> (gpui::Entity<TerminalView>, crate::terminal::remote::Stream) {
-    let (client_side, daemon_side) = test_stream_pair();
-    let terminal = RemoteTerminal::from_stream(client_side, TermSize::new(80, 24))
-        .expect("quiet test terminal");
+) -> (
+    gpui::Entity<TerminalView>,
+    crate::terminal::remote::TestLink,
+) {
+    let (terminal, daemon_side) = RemoteTerminal::from_pipe(
+        TermSize::new(80, 24),
+        crate::terminal::remote::PtySource::for_route(&crate::terminal::PaneRoute::Local),
+    );
     let view = cx.new(|cx| TerminalView::with_terminal(terminal, pane_id, window, cx));
     (view, daemon_side)
 }
@@ -9672,10 +9647,14 @@ pub(crate) fn quiet_reattached_test_pane(
     pane_id: u64,
     window: &mut Window,
     cx: &mut gpui::App,
-) -> (gpui::Entity<TerminalView>, crate::terminal::remote::Stream) {
-    let (client_side, daemon_side) = test_stream_pair();
-    let terminal = RemoteTerminal::from_stream(client_side, TermSize::new(80, 24))
-        .expect("quiet reattached test terminal");
+) -> (
+    gpui::Entity<TerminalView>,
+    crate::terminal::remote::TestLink,
+) {
+    let (terminal, daemon_side) = RemoteTerminal::from_pipe(
+        TermSize::new(80, 24),
+        crate::terminal::remote::PtySource::for_route(&crate::terminal::PaneRoute::Local),
+    );
     let view = cx.new(|cx| TerminalView::with_terminal(terminal, pane_id, window, cx));
     (view, daemon_side)
 }
@@ -9685,10 +9664,10 @@ mod gpui_tests {
     use super::*;
     use crate::daemon::protocol::{ClientMsg, DaemonMsg};
     use crate::terminal::remote::PtySource;
-    use crate::terminal::remote::Stream;
+    use crate::terminal::remote::TestLink;
     use gpui::{Entity, TestAppContext, point};
 
-    fn harness(cx: &mut TestAppContext) -> (gpui::WindowHandle<TerminalView>, Stream) {
+    fn harness(cx: &mut TestAppContext) -> (gpui::WindowHandle<TerminalView>, TestLink) {
         let pty = if cfg!(windows) {
             PtySource::LocalConpty
         } else {
@@ -9700,27 +9679,19 @@ mod gpui_tests {
     fn harness_on(
         cx: &mut TestAppContext,
         pty: PtySource,
-    ) -> (gpui::WindowHandle<TerminalView>, Stream) {
+    ) -> (gpui::WindowHandle<TerminalView>, TestLink) {
         // Building a view reads the config. Whether that hit the real user
         // directory used to come down to which test happened to pin the
         // scratch dir first.
         crate::core::config::pin_test_config_dir();
         cx.executor().allow_parking();
-        let (client_side, daemon_side) = super::test_stream_pair();
         cx.update(|cx| {
             gpui_component::init(cx);
             cx.set_global(Config::default());
         });
-        let window = cx.add_window(|window, cx| {
-            let terminal = RemoteTerminal::from_stream_with(
-                client_side,
-                TermSize::new(80, 24),
-                Vec::new(),
-                pty,
-            )
-            .expect("socketpair-backed terminal");
-            TerminalView::with_terminal(terminal, 1, window, cx)
-        });
+        let (terminal, daemon_side) = RemoteTerminal::from_pipe(TermSize::new(80, 24), pty);
+        let window =
+            cx.add_window(move |window, cx| TerminalView::with_terminal(terminal, 1, window, cx));
         (window, daemon_side)
     }
 
@@ -9736,21 +9707,22 @@ mod gpui_tests {
     ) -> (
         gpui::WindowHandle<gpui_component::Root>,
         Entity<TerminalView>,
-        Stream,
+        TestLink,
     ) {
         crate::core::config::pin_test_config_dir();
         cx.executor().allow_parking();
-        let (client_side, daemon_side) = super::test_stream_pair();
         cx.update(|cx| {
             gpui_component::init(cx);
             cx.set_global(Config::default());
         });
+        let (terminal, daemon_side) = RemoteTerminal::from_pipe(
+            TermSize::new(80, 24),
+            PtySource::for_route(&crate::terminal::PaneRoute::Local),
+        );
         let built: std::rc::Rc<std::cell::RefCell<Option<Entity<TerminalView>>>> =
             std::rc::Rc::new(std::cell::RefCell::new(None));
         let out = built.clone();
         let window = cx.add_window(move |window, cx| {
-            let terminal = RemoteTerminal::from_stream(client_side, TermSize::new(80, 24))
-                .expect("socketpair-backed terminal");
             let view = cx.new(|cx| TerminalView::with_terminal(terminal, 1, window, cx));
             *out.borrow_mut() = Some(view.clone());
             gpui_component::Root::new(view, window, cx)
@@ -9766,15 +9738,13 @@ mod gpui_tests {
     fn prompt_ready(
         window: &gpui::WindowHandle<TerminalView>,
         cx: &mut TestAppContext,
-        daemon: &mut Stream,
+        daemon: &TestLink,
     ) {
-        DaemonMsg::Prompt {
+        daemon.send(DaemonMsg::Prompt {
             active: true,
             at_prompt: true,
             last_exit: None,
-        }
-        .encode(daemon)
-        .unwrap();
+        });
         for _ in 0..200 {
             if window
                 .update(cx, |view, _, _| view.terminal.at_prompt())
@@ -9790,11 +9760,9 @@ mod gpui_tests {
     fn alt_screen_ready(
         window: &gpui::WindowHandle<TerminalView>,
         cx: &mut TestAppContext,
-        daemon: &mut Stream,
+        daemon: &TestLink,
     ) {
-        DaemonMsg::Output(b"\x1b[?1049h".to_vec())
-            .encode(daemon)
-            .unwrap();
+        daemon.send(DaemonMsg::Output(b"\x1b[?1049h".to_vec()));
         for _ in 0..400 {
             cx.run_until_parked();
             if window
@@ -9813,13 +9781,11 @@ mod gpui_tests {
         use crate::core::cli_agent::{AgentSessionState, AgentStatus, CLIAgent};
 
         crate::core::config::pin_test_config_dir();
-        let (window, mut daemon) = harness(cx);
-        DaemonMsg::Agent(Some(CLIAgent::Claude))
-            .encode(&mut daemon)
-            .unwrap();
+        let (window, daemon) = harness(cx);
+        daemon.send(DaemonMsg::Agent(Some(CLIAgent::Claude)));
 
-        let report = |status: AgentStatus, daemon: &mut Stream| {
-            DaemonMsg::AgentStatus(Some(AgentSessionState {
+        let report = |status: AgentStatus, daemon: &TestLink| {
+            daemon.send(DaemonMsg::AgentStatus(Some(AgentSessionState {
                 status,
                 message: None,
                 session_id: Some("sid-abc".into()),
@@ -9831,9 +9797,7 @@ mod gpui_tests {
                 inferred: false,
                 readout: Default::default(),
                 since_ms: None,
-            }))
-            .encode(daemon)
-            .unwrap();
+            })));
         };
         let settled = |want: Option<PaneBusy>, cx: &mut TestAppContext| {
             for _ in 0..200 {
@@ -9845,7 +9809,7 @@ mod gpui_tests {
             false
         };
 
-        report(AgentStatus::Working, &mut daemon);
+        report(AgentStatus::Working, &daemon);
         assert!(
             settled(Some(PaneBusy::Agent("Claude Code")), cx),
             "a turn in flight is work closing would cut short"
@@ -9853,7 +9817,7 @@ mod gpui_tests {
 
         // The green Done badge is what sends a reader to close the tab. Asking
         // "Claude Code is still working" there is both false and in the way.
-        report(AgentStatus::Done, &mut daemon);
+        report(AgentStatus::Done, &daemon);
         assert!(
             settled(None, cx),
             "a finished turn must not hold the tab open"
@@ -9865,7 +9829,7 @@ mod gpui_tests {
         use crate::core::cli_agent::{AgentSessionState, AgentStatus};
 
         crate::core::config::pin_test_config_dir();
-        let (window, mut daemon) = harness(cx);
+        let (window, daemon) = harness(cx);
         let saves = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let view = window.update(cx, |_, _, cx| cx.entity()).unwrap();
         {
@@ -9878,7 +9842,7 @@ mod gpui_tests {
             });
         }
 
-        DaemonMsg::AgentStatus(Some(AgentSessionState {
+        daemon.send(DaemonMsg::AgentStatus(Some(AgentSessionState {
             status: AgentStatus::Idle,
             message: None,
             session_id: Some("sid-abc".into()),
@@ -9890,9 +9854,7 @@ mod gpui_tests {
             inferred: false,
             readout: Default::default(),
             since_ms: None,
-        }))
-        .encode(&mut daemon)
-        .unwrap();
+        })));
         for _ in 0..200 {
             if window
                 .update(cx, |view, _, _| view.terminal.agent_session().is_some())
@@ -9933,7 +9895,7 @@ mod gpui_tests {
         status: crate::core::cli_agent::AgentStatus,
         pane: &gpui::Entity<TerminalView>,
         cx: &mut TestAppContext,
-        daemon: &mut Stream,
+        daemon: &TestLink,
     ) {
         report_agent_turn(status, 0, pane, cx, daemon);
     }
@@ -9944,7 +9906,7 @@ mod gpui_tests {
         turns: u64,
         pane: &gpui::Entity<TerminalView>,
         cx: &mut TestAppContext,
-        daemon: &mut Stream,
+        daemon: &TestLink,
     ) {
         use crate::core::cli_agent::AgentSessionState;
 
@@ -9961,9 +9923,7 @@ mod gpui_tests {
             readout: Default::default(),
             since_ms: None,
         };
-        DaemonMsg::AgentStatus(Some(state.clone()))
-            .encode(daemon)
-            .unwrap();
+        daemon.send(DaemonMsg::AgentStatus(Some(state.clone())));
         for _ in 0..200 {
             if cx.update(|cx| pane.read(cx).terminal.agent_session()) == Some(state.clone()) {
                 return;
@@ -9998,7 +9958,7 @@ mod gpui_tests {
     fn a_rebuilt_pane_does_not_re_badge_a_turn_the_reader_already_saw(cx: &mut TestAppContext) {
         use crate::core::cli_agent::AgentStatus;
 
-        let (window, mut before_daemon) = harness(cx);
+        let (window, before_daemon) = harness(cx);
         let before = window.update(cx, |_, _, cx| cx.entity()).unwrap();
         window
             .update(cx, |view, window, cx| {
@@ -10006,7 +9966,7 @@ mod gpui_tests {
             })
             .unwrap();
         cx.run_until_parked();
-        report_agent_turn(AgentStatus::Done, 1, &before, cx, &mut before_daemon);
+        report_agent_turn(AgentStatus::Done, 1, &before, cx, &before_daemon);
         assert!(
             !poll_unread(window, &before, cx),
             "the reader watched it finish"
@@ -10014,7 +9974,7 @@ mod gpui_tests {
 
         // The same daemon pane, rebuilt the way `tabs_from_session` rebuilds it,
         // with the reader's focus somewhere else.
-        let (after, mut daemon) = window
+        let (after, daemon) = window
             .update(cx, |_, window, cx| super::quiet_test_pane(1, window, cx))
             .unwrap();
         window
@@ -10023,7 +9983,7 @@ mod gpui_tests {
             })
             .unwrap();
         cx.run_until_parked();
-        report_agent_turn(AgentStatus::Done, 1, &after, cx, &mut daemon);
+        report_agent_turn(AgentStatus::Done, 1, &after, cx, &daemon);
         assert!(
             !poll_unread(window, &after, cx),
             "rebuilding the pane is not a turn finishing"
@@ -10036,7 +9996,7 @@ mod gpui_tests {
     fn a_turn_that_finished_while_the_pane_was_away_still_badges(cx: &mut TestAppContext) {
         use crate::core::cli_agent::AgentStatus;
 
-        let (window, mut before_daemon) = harness(cx);
+        let (window, before_daemon) = harness(cx);
         let before = window.update(cx, |_, _, cx| cx.entity()).unwrap();
         window
             .update(cx, |view, window, cx| {
@@ -10044,10 +10004,10 @@ mod gpui_tests {
             })
             .unwrap();
         cx.run_until_parked();
-        report_agent_turn(AgentStatus::Working, 0, &before, cx, &mut before_daemon);
+        report_agent_turn(AgentStatus::Working, 0, &before, cx, &before_daemon);
         assert!(!poll_unread(window, &before, cx));
 
-        let (after, mut daemon) = window
+        let (after, daemon) = window
             .update(cx, |_, window, cx| super::quiet_test_pane(1, window, cx))
             .unwrap();
         window
@@ -10056,7 +10016,7 @@ mod gpui_tests {
             })
             .unwrap();
         cx.run_until_parked();
-        report_agent_turn(AgentStatus::Done, 1, &after, cx, &mut daemon);
+        report_agent_turn(AgentStatus::Done, 1, &after, cx, &daemon);
         assert!(
             poll_unread(window, &after, cx),
             "nobody saw this turn finish"
@@ -10070,7 +10030,7 @@ mod gpui_tests {
     fn a_later_turn_that_finished_while_the_pane_was_away_still_badges(cx: &mut TestAppContext) {
         use crate::core::cli_agent::AgentStatus;
 
-        let (window, mut before_daemon) = harness(cx);
+        let (window, before_daemon) = harness(cx);
         let before = window.update(cx, |_, _, cx| cx.entity()).unwrap();
         window
             .update(cx, |view, window, cx| {
@@ -10078,10 +10038,10 @@ mod gpui_tests {
             })
             .unwrap();
         cx.run_until_parked();
-        report_agent_turn(AgentStatus::Done, 1, &before, cx, &mut before_daemon);
+        report_agent_turn(AgentStatus::Done, 1, &before, cx, &before_daemon);
         assert!(!poll_unread(window, &before, cx));
 
-        let (after, mut daemon) = window
+        let (after, daemon) = window
             .update(cx, |_, window, cx| super::quiet_test_pane(1, window, cx))
             .unwrap();
         window
@@ -10090,7 +10050,7 @@ mod gpui_tests {
             })
             .unwrap();
         cx.run_until_parked();
-        report_agent_turn(AgentStatus::Done, 2, &after, cx, &mut daemon);
+        report_agent_turn(AgentStatus::Done, 2, &after, cx, &daemon);
         assert!(
             poll_unread(window, &after, cx),
             "the second turn finished unseen"
@@ -10102,17 +10062,17 @@ mod gpui_tests {
     fn an_unread_turn_is_still_unread_after_the_pane_is_rebuilt(cx: &mut TestAppContext) {
         use crate::core::cli_agent::AgentStatus;
 
-        let (window, mut before_daemon) = harness(cx);
+        let (window, before_daemon) = harness(cx);
         let before = window.update(cx, |_, _, cx| cx.entity()).unwrap();
         // Building another pane takes the window's focus off `before`.
         let (_elsewhere, _elsewhere_daemon) = window
             .update(cx, |_, window, cx| super::quiet_test_pane(5, window, cx))
             .unwrap();
         cx.run_until_parked();
-        report_agent_turn(AgentStatus::Done, 1, &before, cx, &mut before_daemon);
+        report_agent_turn(AgentStatus::Done, 1, &before, cx, &before_daemon);
         assert!(poll_unread(window, &before, cx), "nobody was looking");
 
-        let (after, mut daemon) = window
+        let (after, daemon) = window
             .update(cx, |_, window, cx| super::quiet_test_pane(1, window, cx))
             .unwrap();
         window
@@ -10121,7 +10081,7 @@ mod gpui_tests {
             })
             .unwrap();
         cx.run_until_parked();
-        report_agent_turn(AgentStatus::Done, 1, &after, cx, &mut daemon);
+        report_agent_turn(AgentStatus::Done, 1, &after, cx, &daemon);
         assert!(
             poll_unread(window, &after, cx),
             "rebuilding the pane is not reading it"
@@ -10141,7 +10101,7 @@ mod gpui_tests {
 
         crate::core::config::pin_test_config_dir();
         let (window, _root_daemon) = harness(cx);
-        let (pane, mut daemon) = window
+        let (pane, daemon) = window
             .update(cx, |_, window, cx| super::quiet_test_pane(2, window, cx))
             .unwrap();
         // Building a pane takes the window's focus (`with_terminal`), and the
@@ -10162,7 +10122,7 @@ mod gpui_tests {
             })
             .unwrap();
 
-        report_agent_status(AgentStatus::Done, &pane, cx, &mut daemon);
+        report_agent_status(AgentStatus::Done, &pane, cx, &daemon);
         window
             .update(cx, |_, window, cx| {
                 pane.update(cx, |pane, cx| {
@@ -10191,21 +10151,21 @@ mod gpui_tests {
                 .unwrap();
             cx.run_until_parked();
         };
-        let (before, mut before_daemon) = window
+        let (before, before_daemon) = window
             .update(cx, |_, window, cx| super::quiet_test_pane(2, window, cx))
             .unwrap();
         focus_root(cx);
-        report_agent_turn(watched.0, watched.1, &before, cx, &mut before_daemon);
+        report_agent_turn(watched.0, watched.1, &before, cx, &before_daemon);
         poll_unread(window, &before, cx);
         drop(before);
 
-        let (after, mut daemon) = window
+        let (after, daemon) = window
             .update(cx, |_, window, cx| {
                 super::quiet_reattached_test_pane(2, window, cx)
             })
             .unwrap();
         focus_root(cx);
-        report_agent_turn(replayed.0, replayed.1, &after, cx, &mut daemon);
+        report_agent_turn(replayed.0, replayed.1, &after, cx, &daemon);
         poll_unread(window, &after, cx)
     }
 
@@ -10247,7 +10207,7 @@ mod gpui_tests {
         use crate::core::cli_agent::AgentStatus;
 
         crate::core::config::pin_test_config_dir();
-        let (window, mut daemon) = harness(cx);
+        let (window, daemon) = harness(cx);
         let pane = window.update(cx, |_, _, cx| cx.entity()).unwrap();
         window
             .update(cx, |view, window, cx| {
@@ -10256,7 +10216,7 @@ mod gpui_tests {
             .unwrap();
         cx.run_until_parked();
 
-        report_agent_status(AgentStatus::Done, &pane, cx, &mut daemon);
+        report_agent_status(AgentStatus::Done, &pane, cx, &daemon);
         window
             .update(cx, |view, window, cx| {
                 assert!(view.focus_handle.is_focused(window));
@@ -10276,17 +10236,14 @@ mod gpui_tests {
     #[gpui::test]
     fn a_pane_follows_its_agent_into_a_worktree(cx: &mut TestAppContext) {
         use crate::core::cli_agent::{AgentSessionState, AgentStatus};
-        use std::io::Write as _;
         use std::path::PathBuf;
 
         let launched_in = PathBuf::from("/repo");
         let working_in = PathBuf::from("/repo/.claude/worktrees/wt");
 
-        let (window, mut daemon) = harness(cx);
-        DaemonMsg::Cwd(launched_in.clone())
-            .encode(&mut daemon)
-            .unwrap();
-        DaemonMsg::AgentStatus(Some(AgentSessionState {
+        let (window, daemon) = harness(cx);
+        daemon.send(DaemonMsg::Cwd(launched_in.clone()));
+        daemon.send(DaemonMsg::AgentStatus(Some(AgentSessionState {
             status: AgentStatus::Working,
             message: None,
             session_id: Some("sid-wt".into()),
@@ -10298,10 +10255,7 @@ mod gpui_tests {
             inferred: false,
             readout: Default::default(),
             since_ms: None,
-        }))
-        .encode(&mut daemon)
-        .unwrap();
-        daemon.flush().unwrap();
+        })));
         for _ in 0..200 {
             let seen = window
                 .update(cx, |view, _, _| {
@@ -10331,11 +10285,12 @@ mod gpui_tests {
             })
             .unwrap();
 
-        // Turn over: the agent is gone, and with it any claim about where the
-        // work is. Falling back to a stale worktree would be worse than the
-        // bug this fixes.
-        DaemonMsg::AgentStatus(None).encode(&mut daemon).unwrap();
-        daemon.flush().unwrap();
+        daemon.send(
+            // Turn over: the agent is gone, and with it any claim about where the
+            // work is. Falling back to a stale worktree would be worse than the
+            // bug this fixes.
+            DaemonMsg::AgentStatus(None),
+        );
         for _ in 0..200 {
             let gone = window
                 .update(cx, |view, _, _| view.agent_session().is_none())
@@ -10387,14 +10342,14 @@ mod gpui_tests {
 
     #[gpui::test]
     fn clearing_the_scrollback_drops_what_was_anchored_in_it(cx: &mut TestAppContext) {
-        let (window, mut daemon) = harness(cx);
+        let (window, daemon) = harness(cx);
 
         // Overflow the 24-row viewport so there is a scrollback to purge.
         let mut out = Vec::new();
         for i in 0..60 {
             out.extend_from_slice(format!("line {i}\r\n").as_bytes());
         }
-        DaemonMsg::Output(out).encode(&mut daemon).unwrap();
+        daemon.send(DaemonMsg::Output(out));
         for _ in 0..200 {
             let filled = window
                 .update(cx, |view, _, _| {
@@ -10442,14 +10397,14 @@ mod gpui_tests {
     fn the_scrollbar_moves_the_viewport_and_follows_it_back(cx: &mut TestAppContext) {
         use gpui_component::scroll::ScrollbarHandle as _;
 
-        let (window, mut daemon) = harness(cx);
+        let (window, daemon) = harness(cx);
 
         // Overflow the 24-row viewport so there is a scrollback to scroll.
         let mut out = Vec::new();
         for i in 0..60 {
             out.extend_from_slice(format!("line {i}\r\n").as_bytes());
         }
-        DaemonMsg::Output(out).encode(&mut daemon).unwrap();
+        daemon.send(DaemonMsg::Output(out));
         // Wait for the reader to go quiet, not just to start: a scrollback
         // still filling underneath would move every row this test names.
         let mut settled = 0;
@@ -10521,11 +10476,11 @@ mod gpui_tests {
         let notes = dir.join("scratchpad/notes.md");
         std::fs::write(&notes, b"# notes").expect("create notes.md");
 
-        let (window, mut daemon) = harness(cx);
-        DaemonMsg::Cwd(dir.clone()).encode(&mut daemon).unwrap();
-        DaemonMsg::Output(b"ready (scratchpad/notes.md) and (scratchpad/gone.md)\r\n".to_vec())
-            .encode(&mut daemon)
-            .unwrap();
+        let (window, daemon) = harness(cx);
+        daemon.send(DaemonMsg::Cwd(dir.clone()));
+        daemon.send(DaemonMsg::Output(
+            b"ready (scratchpad/notes.md) and (scratchpad/gone.md)\r\n".to_vec(),
+        ));
         for _ in 0..200 {
             let seen = window
                 .update(cx, |view, _, _| {
@@ -10621,7 +10576,7 @@ mod gpui_tests {
     #[gpui::test]
     fn a_pane_back_from_ssh_still_recalls_its_local_history(cx: &mut TestAppContext) {
         crate::core::config::pin_test_config_dir();
-        let (window, mut daemon) = harness(cx);
+        let (window, daemon) = harness(cx);
         window
             .update(cx, |view, _, _| {
                 view.history = vec!["cargo build".to_string(), "ssh box".to_string()];
@@ -10633,9 +10588,7 @@ mod gpui_tests {
             argv: vec!["ssh".into(), "box".into()],
             target: "box".into(),
         };
-        DaemonMsg::RemoteContext(Some(away))
-            .encode(&mut daemon)
-            .unwrap();
+        daemon.send(DaemonMsg::RemoteContext(Some(away)));
         for _ in 0..200 {
             if window
                 .update(cx, |view, _, _| view.remote_context().is_some())
@@ -10649,7 +10602,7 @@ mod gpui_tests {
             .update(cx, |view, _, cx| view.follow_history_scope(cx))
             .unwrap();
 
-        DaemonMsg::RemoteContext(None).encode(&mut daemon).unwrap();
+        daemon.send(DaemonMsg::RemoteContext(None));
         for _ in 0..200 {
             if window
                 .update(cx, |view, _, _| view.remote_context().is_none())
@@ -10700,20 +10653,20 @@ mod gpui_tests {
     #[gpui::test]
     fn a_pane_going_out_to_ssh_does_not_inherit_the_local_history(cx: &mut TestAppContext) {
         crate::core::config::pin_test_config_dir();
-        let (window, mut daemon) = harness(cx);
+        let (window, daemon) = harness(cx);
         window
             .update(cx, |view, _, _| {
                 view.history = vec!["rm -rf ./build".to_string()];
             })
             .unwrap();
 
-        DaemonMsg::RemoteContext(Some(crate::daemon::protocol::RemoteContext {
-            kind: crate::daemon::protocol::RemoteKind::Ssh,
-            argv: vec!["ssh".into(), "box".into()],
-            target: "box".into(),
-        }))
-        .encode(&mut daemon)
-        .unwrap();
+        daemon.send(DaemonMsg::RemoteContext(Some(
+            crate::daemon::protocol::RemoteContext {
+                kind: crate::daemon::protocol::RemoteKind::Ssh,
+                argv: vec!["ssh".into(), "box".into()],
+                target: "box".into(),
+            },
+        )));
         for _ in 0..200 {
             if window
                 .update(cx, |view, _, _| view.remote_context().is_some())
@@ -10746,17 +10699,15 @@ mod gpui_tests {
         std::fs::write(&file, b"local").expect("create local file");
         let line = format!("open {} now\r\n", file.display());
 
-        let (window, mut daemon) = harness(cx);
-        DaemonMsg::Output(line.clone().into_bytes())
-            .encode(&mut daemon)
-            .unwrap();
-        DaemonMsg::RemoteContext(Some(crate::daemon::protocol::RemoteContext {
-            kind: crate::daemon::protocol::RemoteKind::Ssh,
-            argv: vec!["ssh".into(), "box".into()],
-            target: "box".into(),
-        }))
-        .encode(&mut daemon)
-        .unwrap();
+        let (window, daemon) = harness(cx);
+        daemon.send(DaemonMsg::Output(line.clone().into_bytes()));
+        daemon.send(DaemonMsg::RemoteContext(Some(
+            crate::daemon::protocol::RemoteContext {
+                kind: crate::daemon::protocol::RemoteKind::Ssh,
+                argv: vec!["ssh".into(), "box".into()],
+                target: "box".into(),
+            },
+        )));
         for _ in 0..200 {
             let seen = window
                 .update(cx, |view, _, _| view.remote_context().is_some())
@@ -10807,10 +10758,8 @@ mod gpui_tests {
     #[cfg(unix)]
     #[gpui::test]
     fn a_probe_with_no_host_to_ask_stays_wanted(cx: &mut TestAppContext) {
-        let (window, mut daemon) = harness(cx);
-        DaemonMsg::Output(b"see /etc/hosts now\r\n".to_vec())
-            .encode(&mut daemon)
-            .unwrap();
+        let (window, daemon) = harness(cx);
+        daemon.send(DaemonMsg::Output(b"see /etc/hosts now\r\n".to_vec()));
         for _ in 0..200 {
             let seen = window
                 .update(cx, |view, _, _| {
@@ -10900,16 +10849,16 @@ mod gpui_tests {
         std::fs::create_dir_all(dir.join("a/bb/ccc/dddd")).expect("create dirs");
         std::fs::write(dir.join("a/bb/ccc/dddd/notes.md"), b"# notes").expect("create notes.md");
 
-        let (window, mut daemon) = harness(cx);
+        let (window, daemon) = harness(cx);
         window
             .update(cx, |view, _, cx| {
                 view.set_grid_size(20, 6, px(8.), px(17.), 1., cx);
             })
             .unwrap();
-        DaemonMsg::Cwd(dir.clone()).encode(&mut daemon).unwrap();
-        DaemonMsg::Output(b"see a/bb/ccc/dddd/notes.md here\r\n".to_vec())
-            .encode(&mut daemon)
-            .unwrap();
+        daemon.send(DaemonMsg::Cwd(dir.clone()));
+        daemon.send(DaemonMsg::Output(
+            b"see a/bb/ccc/dddd/notes.md here\r\n".to_vec(),
+        ));
         for _ in 0..200 {
             let seen = window
                 .update(cx, |view, _, _| {
@@ -10954,11 +10903,11 @@ mod gpui_tests {
         std::fs::create_dir_all(dir.join("文档")).expect("create dirs");
         std::fs::write(dir.join("文档/笔记.md"), b"# notes").expect("create notes");
 
-        let (window, mut daemon) = harness(cx);
-        DaemonMsg::Cwd(dir.clone()).encode(&mut daemon).unwrap();
-        DaemonMsg::Output("see 文档/笔记.md here\r\n".as_bytes().to_vec())
-            .encode(&mut daemon)
-            .unwrap();
+        let (window, daemon) = harness(cx);
+        daemon.send(DaemonMsg::Cwd(dir.clone()));
+        daemon.send(DaemonMsg::Output(
+            "see 文档/笔记.md here\r\n".as_bytes().to_vec(),
+        ));
         for _ in 0..200 {
             let seen = window
                 .update(cx, |view, _, _| {
@@ -10995,11 +10944,11 @@ mod gpui_tests {
         std::fs::create_dir_all(dir.join("scratchpad")).expect("create scratchpad dir");
         std::fs::write(dir.join("scratchpad/notes.md"), b"# notes").expect("create notes.md");
 
-        let (window, mut daemon) = harness(cx);
-        DaemonMsg::Cwd(dir.clone()).encode(&mut daemon).unwrap();
-        DaemonMsg::Output(b"\x1b[?1049hready scratchpad/notes.md\r\n".to_vec())
-            .encode(&mut daemon)
-            .unwrap();
+        let (window, daemon) = harness(cx);
+        daemon.send(DaemonMsg::Cwd(dir.clone()));
+        daemon.send(DaemonMsg::Output(
+            b"\x1b[?1049hready scratchpad/notes.md\r\n".to_vec(),
+        ));
         for _ in 0..200 {
             let seen = window
                 .update(cx, |view, _, _| {
@@ -11148,9 +11097,12 @@ mod gpui_tests {
             .unwrap();
     }
 
-    fn next_input(daemon: &mut Stream) -> Vec<u8> {
+    fn next_input(daemon: &TestLink) -> Vec<u8> {
         loop {
-            match ClientMsg::read(daemon).expect("client socket stays open") {
+            match daemon
+                .recv_client(std::time::Duration::from_secs(5))
+                .expect("client channel stays open")
+            {
                 ClientMsg::Input(bytes) => return bytes,
                 _ => continue,
             }
@@ -11180,27 +11132,22 @@ mod gpui_tests {
         }
     }
 
-    fn next_input_until_timeout(daemon: &mut Stream) -> Option<Vec<u8>> {
-        use std::io::ErrorKind;
-
-        daemon
-            .set_read_timeout(Some(std::time::Duration::from_millis(250)))
-            .unwrap();
+    fn next_input_until_timeout(daemon: &TestLink) -> Option<Vec<u8>> {
         loop {
-            match ClientMsg::read(daemon) {
+            match daemon.recv_client(std::time::Duration::from_millis(250)) {
                 Ok(ClientMsg::Input(bytes)) => return Some(bytes),
                 Ok(_) => continue,
-                Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
-                    return None;
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => return None,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    panic!("client channel closed before Input")
                 }
-                Err(e) => panic!("client socket failed before Input: {e}"),
             }
         }
     }
 
     /// `next_input_until_timeout` with the executor run between reads: a reply
     /// crosses the reader thread and the view before it is written.
-    fn pumped_input(cx: &mut TestAppContext, daemon: &mut Stream, tries: usize) -> Option<String> {
+    fn pumped_input(cx: &mut TestAppContext, daemon: &TestLink, tries: usize) -> Option<String> {
         (0..tries)
             .find_map(|_| {
                 cx.run_until_parked();
@@ -11214,64 +11161,58 @@ mod gpui_tests {
         let set_background = |cx: &mut TestAppContext, bg: gpui::Hsla| {
             cx.update(|cx| gpui_component::Theme::global_mut(cx).background = bg)
         };
-        let (_asked_window, mut asked) = harness(cx);
-        let (_plain_window, mut plain) = harness(cx);
+        let (_asked_window, asked) = harness(cx);
+        let (_plain_window, plain) = harness(cx);
         set_background(cx, gpui::white());
 
-        DaemonMsg::Output(b"\x1b[?2031$p".to_vec())
-            .encode(&mut asked)
-            .unwrap();
+        asked.send(DaemonMsg::Output(b"\x1b[?2031$p".to_vec()));
         assert_eq!(
-            pumped_input(cx, &mut asked, 20).as_deref(),
+            pumped_input(cx, &asked, 20).as_deref(),
             Some("\x1b[?2031;2$y"),
             "DECRQM reports 2031 as supported and reset before ?2031h"
         );
 
-        DaemonMsg::Output(b"\x1b[?2031h\x1b[?2031$p\x1b[?996n".to_vec())
-            .encode(&mut asked)
-            .unwrap();
+        asked.send(DaemonMsg::Output(
+            b"\x1b[?2031h\x1b[?2031$p\x1b[?996n".to_vec(),
+        ));
         assert_eq!(
-            pumped_input(cx, &mut asked, 20).as_deref(),
+            pumped_input(cx, &asked, 20).as_deref(),
             Some("\x1b[?2031;1$y"),
             "DECRQM reports 2031 as set after ?2031h, ahead of the scheme reply"
         );
         assert_eq!(
-            pumped_input(cx, &mut asked, 20).as_deref(),
+            pumped_input(cx, &asked, 20).as_deref(),
             Some("\x1b[?997;2n"),
             "996 answers the current scheme after the DECRQM"
         );
 
         set_background(cx, gpui::black());
         assert_eq!(
-            pumped_input(cx, &mut asked, 20).as_deref(),
+            pumped_input(cx, &asked, 20).as_deref(),
             Some("\x1b[?997;1n")
         );
-        DaemonMsg::Output(b"\x1b]11;?\x07".to_vec())
-            .encode(&mut asked)
-            .unwrap();
+        asked.send(DaemonMsg::Output(b"\x1b]11;?\x07".to_vec()));
         assert!(
-            pumped_input(cx, &mut asked, 20)
+            pumped_input(cx, &asked, 20)
                 .is_some_and(|reply| reply.contains("11;rgb:0000/0000/0000")),
             "OSC 11 answers with the background the flip left"
         );
 
         set_background(cx, gpui::white());
         assert_eq!(
-            pumped_input(cx, &mut asked, 20).as_deref(),
+            pumped_input(cx, &asked, 20).as_deref(),
             Some("\x1b[?997;2n")
         );
         assert_eq!(
-            pumped_input(cx, &mut plain, 2),
+            pumped_input(cx, &plain, 2),
             None,
             "a pane that never set 2031 is not written to"
         );
 
-        DaemonMsg::Output(b"\x1b[?2031l".to_vec())
-            .encode(&mut asked)
-            .unwrap();
-        assert_eq!(pumped_input(cx, &mut asked, 1), None);
+        asked.send(DaemonMsg::Output(b"\x1b[?2031l".to_vec()));
+        assert_eq!(pumped_input(cx, &asked, 1), None);
         set_background(cx, gpui::black());
-        assert_eq!(pumped_input(cx, &mut asked, 2), None, "2031 switched off");
+        assert_eq!(pumped_input(cx, &asked, 2), None, "2031 switched off");
     }
 
     /// The reply names the mode at the query, not at the end of the batch, and
@@ -11284,71 +11225,69 @@ mod gpui_tests {
             cx.update(|cx| gpui_component::Theme::global_mut(cx).background = bg)
         };
 
-        let (_window, mut daemon) = harness(cx);
+        let (_window, daemon) = harness(cx);
         set_background(cx, gpui::white());
-        DaemonMsg::Output(b"\x1b[?2031$p\x1b[?2031h".to_vec())
-            .encode(&mut daemon)
-            .unwrap();
+        daemon.send(DaemonMsg::Output(b"\x1b[?2031$p\x1b[?2031h".to_vec()));
         assert_eq!(
-            pumped_input(cx, &mut daemon, 20).as_deref(),
+            pumped_input(cx, &daemon, 20).as_deref(),
             Some("\x1b[?2031;2$y"),
             "the query landed before ?2031h, so the mode was reset"
         );
         assert_eq!(
-            pumped_input(cx, &mut daemon, 2),
+            pumped_input(cx, &daemon, 2),
             None,
             "alacritty's ;0$y is not forwarded as a second reply"
         );
         set_background(cx, gpui::black());
         assert_eq!(
-            pumped_input(cx, &mut daemon, 20).as_deref(),
+            pumped_input(cx, &daemon, 20).as_deref(),
             Some("\x1b[?997;1n"),
             "the batch still ends with the mode on"
         );
 
-        let (_window, mut daemon) = harness(cx);
+        let (_window, daemon) = harness(cx);
         set_background(cx, gpui::white());
-        DaemonMsg::Output(b"\x1b[?2031h\x1b[?2031$p\x1b[?2031l".to_vec())
-            .encode(&mut daemon)
-            .unwrap();
+        daemon.send(DaemonMsg::Output(
+            b"\x1b[?2031h\x1b[?2031$p\x1b[?2031l".to_vec(),
+        ));
         assert_eq!(
-            pumped_input(cx, &mut daemon, 20).as_deref(),
+            pumped_input(cx, &daemon, 20).as_deref(),
             Some("\x1b[?2031;1$y"),
             "the query landed while the mode was on"
         );
         set_background(cx, gpui::black());
         assert_eq!(
-            pumped_input(cx, &mut daemon, 2),
+            pumped_input(cx, &daemon, 2),
             None,
             "the batch ends with the mode off"
         );
 
-        let (_window, mut daemon) = harness(cx);
+        let (_window, daemon) = harness(cx);
         set_background(cx, gpui::white());
-        DaemonMsg::Output(b"\x1b[c\x1b[?2031h\x1b[?2031$p\x1b[?996n\x1b[>c".to_vec())
-            .encode(&mut daemon)
-            .unwrap();
+        daemon.send(DaemonMsg::Output(
+            b"\x1b[c\x1b[?2031h\x1b[?2031$p\x1b[?996n\x1b[>c".to_vec(),
+        ));
         assert_eq!(
-            pumped_input(cx, &mut daemon, 20).as_deref(),
+            pumped_input(cx, &daemon, 20).as_deref(),
             Some("\x1b[?6c"),
             "DA1 is answered before the later queries"
         );
         assert_eq!(
-            pumped_input(cx, &mut daemon, 20).as_deref(),
+            pumped_input(cx, &daemon, 20).as_deref(),
             Some("\x1b[?2031;1$y")
         );
         assert_eq!(
-            pumped_input(cx, &mut daemon, 20).as_deref(),
+            pumped_input(cx, &daemon, 20).as_deref(),
             Some("\x1b[?997;2n"),
             "the scheme reply follows the DECRQM that preceded ?996n"
         );
-        let da2 = pumped_input(cx, &mut daemon, 20).expect("DA2 reply");
+        let da2 = pumped_input(cx, &daemon, 20).expect("DA2 reply");
         assert!(
             da2.starts_with("\x1b[>0;") && da2.ends_with('c'),
             "DA2 follows the scheme reply, got {da2}"
         );
         assert_eq!(
-            pumped_input(cx, &mut daemon, 2),
+            pumped_input(cx, &daemon, 2),
             None,
             "each query is answered once"
         );
@@ -11356,7 +11295,7 @@ mod gpui_tests {
 
     #[gpui::test]
     fn ctrl_l_at_prompt_reaches_the_shell(cx: &mut TestAppContext) {
-        let (window, mut daemon) = harness(cx);
+        let (window, daemon) = harness(cx);
         window
             .update(cx, |view, _, cx| {
                 let ctrl_l = gpui::Keystroke {
@@ -11371,7 +11310,7 @@ mod gpui_tests {
             })
             .unwrap();
 
-        assert_eq!(next_input_until_timeout(&mut daemon), Some(vec![0x0c]));
+        assert_eq!(next_input_until_timeout(&daemon), Some(vec![0x0c]));
     }
 
     #[gpui::test]
@@ -11391,7 +11330,7 @@ mod gpui_tests {
         chord: &str,
         byte: u8,
     ) {
-        let (window, mut daemon) = harness(cx);
+        let (window, daemon) = harness(cx);
         window
             .update(cx, |view, window, cx| {
                 assert!(!view.input_active(), "the foreground process owns input");
@@ -11420,9 +11359,9 @@ mod gpui_tests {
             })
             .unwrap();
 
-        assert_eq!(next_input_until_timeout(&mut daemon), Some(vec![byte]));
+        assert_eq!(next_input_until_timeout(&daemon), Some(vec![byte]));
         assert_eq!(
-            next_input_until_timeout(&mut daemon),
+            next_input_until_timeout(&daemon),
             None,
             "resuming the shell must not synthesize Ctrl-U after {chord}"
         );
@@ -11430,7 +11369,7 @@ mod gpui_tests {
 
     #[gpui::test]
     fn submitted_exit_typeahead_does_not_wipe_the_returned_prompt(cx: &mut TestAppContext) {
-        let (window, mut daemon) = harness(cx);
+        let (window, daemon) = harness(cx);
         window
             .update(cx, |view, window, cx| {
                 // Ordinary SSH need not take the alternate screen or identify
@@ -11451,10 +11390,10 @@ mod gpui_tests {
             })
             .unwrap();
         for bytes in [b"e", b"x", b"i", b"t", b"\r"] {
-            assert_eq!(next_input_until_timeout(&mut daemon), Some(bytes.to_vec()));
+            assert_eq!(next_input_until_timeout(&daemon), Some(bytes.to_vec()));
         }
 
-        prompt_ready(&window, cx, &mut daemon);
+        prompt_ready(&window, cx, &daemon);
         window
             .update(cx, |view, _, _| {
                 assert!(view.input_active());
@@ -11467,7 +11406,7 @@ mod gpui_tests {
             })
             .unwrap();
         assert_eq!(
-            next_input_until_timeout(&mut daemon),
+            next_input_until_timeout(&daemon),
             None,
             "returning from exit must not inject Ctrl-U into the local prompt"
         );
@@ -11475,9 +11414,9 @@ mod gpui_tests {
 
     #[gpui::test]
     fn ctrl_v_on_the_alternate_screen_reaches_the_pty_as_syn(cx: &mut TestAppContext) {
-        let (window, mut daemon) = harness(cx);
+        let (window, daemon) = harness(cx);
         cx.update(|cx| cx.write_to_clipboard(ClipboardItem::new_string("echo hi".into())));
-        alt_screen_ready(&window, cx, &mut daemon);
+        alt_screen_ready(&window, cx, &daemon);
         window
             .update(cx, |view, window, cx| {
                 assert!(!view.input_active(), "the full-screen program owns input");
@@ -11493,9 +11432,9 @@ mod gpui_tests {
             })
             .unwrap();
 
-        assert_eq!(next_input_until_timeout(&mut daemon), Some(vec![0x16]));
+        assert_eq!(next_input_until_timeout(&daemon), Some(vec![0x16]));
         assert_eq!(
-            next_input_until_timeout(&mut daemon),
+            next_input_until_timeout(&daemon),
             None,
             "the clipboard must stay where it is: vim's Ctrl+V is blockwise select, not paste"
         );
@@ -11503,17 +11442,15 @@ mod gpui_tests {
 
     #[gpui::test]
     fn shell_vi_mode_prompt_bypasses_the_local_editor(cx: &mut TestAppContext) {
-        let (window, mut daemon) = harness(cx);
-        DaemonMsg::Prompt {
+        let (window, daemon) = harness(cx);
+        daemon.send(DaemonMsg::Prompt {
             active: true,
             at_prompt: true,
             last_exit: None,
-        }
-        .encode(&mut daemon)
-        .unwrap();
-        DaemonMsg::Output(b"\x1b]133;V;1\x07\x1b]133;B\x07".to_vec())
-            .encode(&mut daemon)
-            .unwrap();
+        });
+        daemon.send(DaemonMsg::Output(
+            b"\x1b]133;V;1\x07\x1b]133;B\x07".to_vec(),
+        ));
 
         for _ in 0..200 {
             cx.run_until_parked();
@@ -11543,21 +11480,19 @@ mod gpui_tests {
             })
             .unwrap();
         assert_eq!(
-            next_input_until_timeout(&mut daemon),
+            next_input_until_timeout(&daemon),
             Some(b"a".to_vec()),
             "shell vi-mode prompt input must reach the shell directly"
         );
 
-        DaemonMsg::Prompt {
+        daemon.send(DaemonMsg::Prompt {
             active: true,
             at_prompt: true,
             last_exit: Some(0),
-        }
-        .encode(&mut daemon)
-        .unwrap();
-        DaemonMsg::Output(b"\x1b]133;V;0\x07\x1b]133;B\x07".to_vec())
-            .encode(&mut daemon)
-            .unwrap();
+        });
+        daemon.send(DaemonMsg::Output(
+            b"\x1b]133;V;0\x07\x1b]133;B\x07".to_vec(),
+        ));
         for _ in 0..200 {
             cx.run_until_parked();
             let active = window.update(cx, |view, _, _| view.input_active()).unwrap();
@@ -11588,17 +11523,13 @@ mod gpui_tests {
     #[gpui::test]
     fn a_handoff_walks_the_cursor_back_in_ss3_under_app_cursor_mode(cx: &mut TestAppContext) {
         crate::core::config::pin_test_config_dir();
-        let (window, mut daemon) = harness(cx);
-        DaemonMsg::Output(b"\x1b[?1h".to_vec())
-            .encode(&mut daemon)
-            .unwrap();
-        DaemonMsg::Prompt {
+        let (window, daemon) = harness(cx);
+        daemon.send(DaemonMsg::Output(b"\x1b[?1h".to_vec()));
+        daemon.send(DaemonMsg::Prompt {
             active: true,
             at_prompt: true,
             last_exit: None,
-        }
-        .encode(&mut daemon)
-        .unwrap();
+        });
         wait_for_input_active(&window, cx);
 
         window
@@ -11615,12 +11546,9 @@ mod gpui_tests {
                 view.complete_tab(true, cx);
             })
             .unwrap();
+        assert_eq!(next_input_until_timeout(&daemon), Some(b"zzqqx".to_vec()));
         assert_eq!(
-            next_input_until_timeout(&mut daemon),
-            Some(b"zzqqx".to_vec())
-        );
-        assert_eq!(
-            next_input_until_timeout(&mut daemon),
+            next_input_until_timeout(&daemon),
             Some(b"\x1bOD\x1bOD".to_vec()),
             "the cursor walks back in SS3, not CSI"
         );
@@ -11628,14 +11556,12 @@ mod gpui_tests {
 
     #[gpui::test]
     fn tab_with_no_candidates_hands_the_line_to_the_shell(cx: &mut TestAppContext) {
-        let (window, mut daemon) = harness(cx);
-        DaemonMsg::Prompt {
+        let (window, daemon) = harness(cx);
+        daemon.send(DaemonMsg::Prompt {
             active: true,
             at_prompt: true,
             last_exit: None,
-        }
-        .encode(&mut daemon)
-        .unwrap();
+        });
         wait_for_input_active(&window, cx);
 
         window
@@ -11653,23 +11579,21 @@ mod gpui_tests {
             })
             .unwrap();
         assert_eq!(
-            next_input_until_timeout(&mut daemon),
+            next_input_until_timeout(&daemon),
             Some(b"zzqqx".to_vec()),
             "the edited line ships ahead of the Tab"
         );
         assert_eq!(
-            next_input_until_timeout(&mut daemon),
+            next_input_until_timeout(&daemon),
             Some(b"\t".to_vec()),
             "the Tab reaches the PTY instead of being swallowed"
         );
 
-        DaemonMsg::Prompt {
+        daemon.send(DaemonMsg::Prompt {
             active: true,
             at_prompt: true,
             last_exit: None,
-        }
-        .encode(&mut daemon)
-        .unwrap();
+        });
         for _ in 0..200 {
             cx.run_until_parked();
             let applied = window
@@ -11689,34 +11613,28 @@ mod gpui_tests {
             })
             .unwrap();
 
-        DaemonMsg::Prompt {
+        daemon.send(DaemonMsg::Prompt {
             active: true,
             at_prompt: false,
             last_exit: None,
-        }
-        .encode(&mut daemon)
-        .unwrap();
-        DaemonMsg::Prompt {
+        });
+        daemon.send(DaemonMsg::Prompt {
             active: true,
             at_prompt: true,
             last_exit: Some(0),
-        }
-        .encode(&mut daemon)
-        .unwrap();
+        });
         wait_for_input_active(&window, cx);
     }
 
     #[gpui::test]
     fn ctrl_c_after_tab_handoff_returns_the_fresh_prompt_to_the_editor(cx: &mut TestAppContext) {
         crate::core::config::pin_test_config_dir();
-        let (window, mut daemon) = harness(cx);
-        DaemonMsg::Prompt {
+        let (window, daemon) = harness(cx);
+        daemon.send(DaemonMsg::Prompt {
             active: true,
             at_prompt: true,
             last_exit: None,
-        }
-        .encode(&mut daemon)
-        .unwrap();
+        });
         wait_for_input_active(&window, cx);
 
         window
@@ -11737,22 +11655,19 @@ mod gpui_tests {
                 );
             })
             .unwrap();
-        assert_eq!(
-            next_input_until_timeout(&mut daemon),
-            Some(b"zzqqx".to_vec())
-        );
-        assert_eq!(next_input_until_timeout(&mut daemon), Some(b"\t".to_vec()));
-        assert_eq!(next_input_until_timeout(&mut daemon), Some(vec![0x03]));
+        assert_eq!(next_input_until_timeout(&daemon), Some(b"zzqqx".to_vec()));
+        assert_eq!(next_input_until_timeout(&daemon), Some(b"\t".to_vec()));
+        assert_eq!(next_input_until_timeout(&daemon), Some(vec![0x03]));
 
-        // Tab handoff never emitted C, so the shell integration reports the
-        // interrupted prompt as another A/B while the daemon is still at_prompt.
-        DaemonMsg::Prompt {
-            active: true,
-            at_prompt: true,
-            last_exit: Some(130),
-        }
-        .encode(&mut daemon)
-        .unwrap();
+        daemon.send(
+            // Tab handoff never emitted C, so the shell integration reports the
+            // interrupted prompt as another A/B while the daemon is still at_prompt.
+            DaemonMsg::Prompt {
+                active: true,
+                at_prompt: true,
+                last_exit: Some(130),
+            },
+        );
         wait_for_input_active(&window, cx);
 
         window
@@ -11766,7 +11681,7 @@ mod gpui_tests {
             })
             .unwrap();
         assert_eq!(
-            next_input_until_timeout(&mut daemon),
+            next_input_until_timeout(&daemon),
             None,
             "the fresh line must not keep going raw to the shell"
         );
@@ -11774,19 +11689,17 @@ mod gpui_tests {
 
     #[gpui::test]
     fn tab_completion_off_sends_every_tab_to_the_shell(cx: &mut TestAppContext) {
-        let (window, mut daemon) = harness(cx);
+        let (window, daemon) = harness(cx);
         cx.update(|cx| {
             let mut cfg = cx.global::<Config>().clone();
             cfg.tab_completion = false;
             cx.set_global(cfg);
         });
-        DaemonMsg::Prompt {
+        daemon.send(DaemonMsg::Prompt {
             active: true,
             at_prompt: true,
             last_exit: None,
-        }
-        .encode(&mut daemon)
-        .unwrap();
+        });
         wait_for_input_active(&window, cx);
 
         window
@@ -11799,8 +11712,8 @@ mod gpui_tests {
                 assert_eq!(view.cmd.text(), "");
             })
             .unwrap();
-        assert_eq!(next_input_until_timeout(&mut daemon), Some(b"cd ".to_vec()));
-        assert_eq!(next_input_until_timeout(&mut daemon), Some(b"\t".to_vec()));
+        assert_eq!(next_input_until_timeout(&daemon), Some(b"cd ".to_vec()));
+        assert_eq!(next_input_until_timeout(&daemon), Some(b"\t".to_vec()));
     }
 
     fn dir_candidate(text: &str, start: usize, end: usize) -> completion::Candidate {
@@ -11962,17 +11875,15 @@ mod gpui_tests {
 
     #[gpui::test]
     fn shell_vi_mode_prompt_input_is_not_typeahead(cx: &mut TestAppContext) {
-        let (window, mut daemon) = harness(cx);
-        DaemonMsg::Prompt {
+        let (window, daemon) = harness(cx);
+        daemon.send(DaemonMsg::Prompt {
             active: true,
             at_prompt: true,
             last_exit: None,
-        }
-        .encode(&mut daemon)
-        .unwrap();
-        DaemonMsg::Output(b"\x1b]133;V;1\x07\x1b]133;B\x07".to_vec())
-            .encode(&mut daemon)
-            .unwrap();
+        });
+        daemon.send(DaemonMsg::Output(
+            b"\x1b]133;V;1\x07\x1b]133;B\x07".to_vec(),
+        ));
 
         for _ in 0..200 {
             cx.run_until_parked();
@@ -11995,14 +11906,14 @@ mod gpui_tests {
             })
             .unwrap();
         assert_eq!(
-            next_input_until_timeout(&mut daemon),
+            next_input_until_timeout(&daemon),
             Some(b"i".to_vec()),
             "vi prompt input is normal shell input, not deferred gap typeahead"
         );
 
-        DaemonMsg::Output(b"\x1b]133;V;0\x07\x1b]133;B\x07".to_vec())
-            .encode(&mut daemon)
-            .unwrap();
+        daemon.send(DaemonMsg::Output(
+            b"\x1b]133;V;0\x07\x1b]133;B\x07".to_vec(),
+        ));
         for _ in 0..200 {
             cx.run_until_parked();
             let active = window.update(cx, |view, _, _| view.input_active()).unwrap();
@@ -12015,7 +11926,7 @@ mod gpui_tests {
             .update(cx, |view, _, _| assert!(view.input_active()))
             .unwrap();
         assert_eq!(
-            next_input_until_timeout(&mut daemon),
+            next_input_until_timeout(&daemon),
             None,
             "leaving shell vi-mode must not flush a stale typeahead wipe"
         );
@@ -12023,14 +11934,12 @@ mod gpui_tests {
 
     #[gpui::test]
     fn shell_vi_mode_prompt_releases_gap_hold_without_stale_typeahead(cx: &mut TestAppContext) {
-        let (window, mut daemon) = harness(cx);
-        DaemonMsg::Prompt {
+        let (window, daemon) = harness(cx);
+        daemon.send(DaemonMsg::Prompt {
             active: true,
             at_prompt: false,
             last_exit: None,
-        }
-        .encode(&mut daemon)
-        .unwrap();
+        });
         for _ in 0..200 {
             cx.run_until_parked();
             let gap = window
@@ -12047,16 +11956,14 @@ mod gpui_tests {
             .update(cx, |view, _, cx| view.commit_text("ls", cx))
             .unwrap();
 
-        DaemonMsg::Prompt {
+        daemon.send(DaemonMsg::Prompt {
             active: true,
             at_prompt: true,
             last_exit: Some(0),
-        }
-        .encode(&mut daemon)
-        .unwrap();
-        DaemonMsg::Output(b"\x1b]133;V;1\x07\x1b]133;B\x07".to_vec())
-            .encode(&mut daemon)
-            .unwrap();
+        });
+        daemon.send(DaemonMsg::Output(
+            b"\x1b]133;V;1\x07\x1b]133;B\x07".to_vec(),
+        ));
         for _ in 0..200 {
             cx.run_until_parked();
             let ready = window
@@ -12072,14 +11979,14 @@ mod gpui_tests {
         cx.executor().advance_clock(HOLD_WINDOW * 2);
         cx.run_until_parked();
         assert_eq!(
-            next_input_until_timeout(&mut daemon),
+            next_input_until_timeout(&daemon),
             Some(b"ls".to_vec()),
             "gap text typed before a vi prompt must reach the shell"
         );
 
-        DaemonMsg::Output(b"\x1b]133;V;0\x07\x1b]133;B\x07".to_vec())
-            .encode(&mut daemon)
-            .unwrap();
+        daemon.send(DaemonMsg::Output(
+            b"\x1b]133;V;0\x07\x1b]133;B\x07".to_vec(),
+        ));
         for _ in 0..200 {
             cx.run_until_parked();
             let active = window.update(cx, |view, _, _| view.input_active()).unwrap();
@@ -12099,7 +12006,7 @@ mod gpui_tests {
             })
             .unwrap();
         assert_eq!(
-            next_input_until_timeout(&mut daemon),
+            next_input_until_timeout(&daemon),
             None,
             "no stale ^U wipe once the vi prompt consumed the gap text"
         );
@@ -12182,8 +12089,8 @@ mod gpui_tests {
         std::fs::create_dir_all(&dir).ok();
         crate::core::config::set_config_dir(dir);
 
-        let (window, mut daemon) = harness(cx);
-        prompt_ready(&window, cx, &mut daemon);
+        let (window, daemon) = harness(cx);
+        prompt_ready(&window, cx, &daemon);
 
         window
             .update(cx, |view, _, cx| {
@@ -12198,7 +12105,7 @@ mod gpui_tests {
             })
             .unwrap();
         assert_eq!(
-            next_input_until_timeout(&mut daemon),
+            next_input_until_timeout(&daemon),
             Some(b"echo a\recho b\r".to_vec()),
             "the multi-line command reaches the PTY in one submit"
         );
@@ -12208,8 +12115,8 @@ mod gpui_tests {
     fn insert_newline_action_closes_the_completion_menu_but_enter_still_accepts(
         cx: &mut TestAppContext,
     ) {
-        let (window, mut daemon) = harness(cx);
-        prompt_ready(&window, cx, &mut daemon);
+        let (window, daemon) = harness(cx);
+        prompt_ready(&window, cx, &daemon);
 
         let candidate = |text: &str| completion::Candidate {
             text: text.to_string(),
@@ -12253,11 +12160,9 @@ mod gpui_tests {
     #[gpui::test]
     fn shift_enter_reaches_a_foreground_tui_with_kitty_encoding(cx: &mut TestAppContext) {
         crate::core::config::pin_test_config_dir();
-        let (window, mut daemon) = harness_on(cx, PtySource::LocalConpty);
+        let (window, daemon) = harness_on(cx, PtySource::LocalConpty);
         cx.update(crate::ui::keymap::init);
-        DaemonMsg::Output(b"\x1b[>1u".to_vec())
-            .encode(&mut daemon)
-            .unwrap();
+        daemon.send(DaemonMsg::Output(b"\x1b[>1u".to_vec()));
         for _ in 0..200 {
             cx.run_until_parked();
             if window
@@ -12280,13 +12185,13 @@ mod gpui_tests {
         vcx.simulate_keystrokes("shift-enter");
 
         assert_eq!(
-            next_input_until_timeout(&mut daemon),
+            next_input_until_timeout(&daemon),
             Some(b"\x1b[13;2u".to_vec())
         );
 
         vcx.simulate_keystrokes("ctrl-j");
         assert_eq!(
-            next_input_until_timeout(&mut daemon),
+            next_input_until_timeout(&daemon),
             Some(b"\x1b[106;5u".to_vec())
         );
     }
@@ -12294,7 +12199,7 @@ mod gpui_tests {
     #[gpui::test]
     fn shift_enter_reaches_a_foreground_tui_as_lf_without_kitty(cx: &mut TestAppContext) {
         crate::core::config::pin_test_config_dir();
-        let (window, mut daemon) = harness_on(cx, PtySource::Raw);
+        let (window, daemon) = harness_on(cx, PtySource::Raw);
         cx.update(crate::ui::keymap::init);
         window
             .update(cx, |view, window, cx| {
@@ -12307,15 +12212,15 @@ mod gpui_tests {
         let mut vcx = gpui::VisualTestContext::from_window(window.into(), cx);
         vcx.simulate_keystrokes("shift-enter");
 
-        assert_eq!(next_input_until_timeout(&mut daemon), Some(b"\n".to_vec()));
+        assert_eq!(next_input_until_timeout(&daemon), Some(b"\n".to_vec()));
 
         vcx.simulate_keystrokes("ctrl-j");
-        assert_eq!(next_input_until_timeout(&mut daemon), Some(b"\n".to_vec()));
+        assert_eq!(next_input_until_timeout(&daemon), Some(b"\n".to_vec()));
     }
 
     #[gpui::test]
     fn newline_chords_reach_conpty_as_ctrl_j_without_kitty(cx: &mut TestAppContext) {
-        let (window, mut daemon) = harness_on(cx, PtySource::LocalConpty);
+        let (window, daemon) = harness_on(cx, PtySource::LocalConpty);
         cx.update(crate::ui::keymap::init);
         window
             .update(cx, |view, window, cx| {
@@ -12329,7 +12234,7 @@ mod gpui_tests {
         for chord in ["shift-enter", "ctrl-j"] {
             vcx.simulate_keystrokes(chord);
             assert_eq!(
-                next_input_until_timeout(&mut daemon),
+                next_input_until_timeout(&daemon),
                 Some(b"\x1b[74;36;10;1;8;1_\x1b[74;36;10;0;8;1_".to_vec()),
                 "{chord} must preserve Ctrl+J for native console readers"
             );
@@ -12339,7 +12244,7 @@ mod gpui_tests {
     #[gpui::test]
     fn alt_enter_keeps_its_legacy_encoding_in_a_foreground_tui(cx: &mut TestAppContext) {
         crate::core::config::pin_test_config_dir();
-        let (window, mut daemon) = harness(cx);
+        let (window, daemon) = harness(cx);
         cx.update(crate::ui::keymap::init);
         window
             .update(cx, |view, window, cx| {
@@ -12352,10 +12257,7 @@ mod gpui_tests {
         let mut vcx = gpui::VisualTestContext::from_window(window.into(), cx);
         vcx.simulate_keystrokes("alt-enter");
 
-        assert_eq!(
-            next_input_until_timeout(&mut daemon),
-            Some(b"\x1b\r".to_vec())
-        );
+        assert_eq!(next_input_until_timeout(&daemon), Some(b"\x1b\r".to_vec()));
     }
 
     #[gpui::test]
@@ -12374,9 +12276,9 @@ mod gpui_tests {
 
     #[gpui::test]
     fn the_keymap_routes_both_newline_chords_to_the_action(cx: &mut TestAppContext) {
-        let (window, mut daemon) = harness(cx);
+        let (window, daemon) = harness(cx);
         cx.update(crate::ui::keymap::init);
-        prompt_ready(&window, cx, &mut daemon);
+        prompt_ready(&window, cx, &daemon);
         window
             .update(cx, |view, window, cx| {
                 window.activate_window();
@@ -12421,9 +12323,9 @@ mod gpui_tests {
     #[cfg(not(target_os = "macos"))]
     #[gpui::test]
     fn an_unused_find_binding_gives_f3_back_to_the_shell(cx: &mut TestAppContext) {
-        let (window, mut daemon) = harness(cx);
+        let (window, daemon) = harness(cx);
         cx.update(|cx| crate::ui::keymap::init(cx));
-        prompt_ready(&window, cx, &mut daemon);
+        prompt_ready(&window, cx, &daemon);
         window
             .update(cx, |view, window, cx| {
                 window.activate_window();
@@ -12452,12 +12354,12 @@ mod gpui_tests {
                 })
                 .unwrap();
             assert_eq!(
-                next_input_until_timeout(&mut daemon),
+                next_input_until_timeout(&daemon),
                 Some(b"echo a".to_vec()),
                 "{chord} puts the line on the shell's prompt first"
             );
             assert_eq!(
-                next_input_until_timeout(&mut daemon),
+                next_input_until_timeout(&daemon),
                 Some(seq),
                 "{chord} reaches the PTY"
             );
@@ -12495,7 +12397,7 @@ mod gpui_tests {
     fn ctrl_r_steps_matches_and_cmd_enter_runs(cx: &mut TestAppContext) {
         crate::core::config::pin_test_config_dir();
 
-        let (window, mut daemon) = harness(cx);
+        let (window, daemon) = harness(cx);
         window
             .update(cx, |view, _, cx| {
                 view.history = ["git status", "cargo build", "git commit -m x"]
@@ -12525,7 +12427,7 @@ mod gpui_tests {
             })
             .unwrap();
         assert_eq!(
-            next_input_until_timeout(&mut daemon),
+            next_input_until_timeout(&daemon),
             Some(b"git status\r".to_vec()),
             "Cmd+Enter ships the selected line to the PTY"
         );
@@ -12537,7 +12439,7 @@ mod gpui_tests {
     ) {
         crate::core::config::pin_test_config_dir();
 
-        let (window, mut daemon) = harness(cx);
+        let (window, daemon) = harness(cx);
         cx.update(|cx| {
             crate::ui::keymap::init(cx);
             cx.on_action(
@@ -12546,7 +12448,7 @@ mod gpui_tests {
                 },
             );
         });
-        prompt_ready(&window, cx, &mut daemon);
+        prompt_ready(&window, cx, &daemon);
 
         window
             .update(cx, |view, window, cx| {
@@ -12575,12 +12477,12 @@ mod gpui_tests {
             })
             .unwrap();
         assert_eq!(
-            next_input_until_timeout(&mut daemon),
+            next_input_until_timeout(&daemon),
             Some(b"cargo test\r".to_vec()),
             "cmd-enter submits the selected reverse-search entry"
         );
 
-        prompt_ready(&window, &mut vcx, &mut daemon);
+        prompt_ready(&window, &mut vcx, &daemon);
         window
             .update(&mut vcx, |view, _, _| {
                 view.cmd.set_with_cursor("git ", 4);
@@ -12613,7 +12515,7 @@ mod gpui_tests {
             })
             .unwrap();
         assert_eq!(
-            next_input_until_timeout(&mut daemon),
+            next_input_until_timeout(&daemon),
             Some(b"git status \r".to_vec()),
             "cmd-enter accepts the completion and submits the line"
         );
@@ -12627,7 +12529,7 @@ mod gpui_tests {
     /// the line goes over first, then the key.
     #[gpui::test]
     fn function_keys_hand_the_line_to_the_shell(cx: &mut TestAppContext) {
-        let (window, mut daemon) = harness(cx);
+        let (window, daemon) = harness(cx);
         for (chord, seq) in [
             ("f8", b"\x1b[19~".to_vec()),
             ("shift-f8", b"\x1b[19;2~".to_vec()),
@@ -12642,12 +12544,12 @@ mod gpui_tests {
                 })
                 .unwrap();
             assert_eq!(
-                next_input_until_timeout(&mut daemon),
+                next_input_until_timeout(&daemon),
                 Some(b"git st".to_vec()),
                 "{chord} puts the line on the shell's prompt first"
             );
             assert_eq!(
-                next_input_until_timeout(&mut daemon),
+                next_input_until_timeout(&daemon),
                 Some(seq),
                 "{chord} follows the line"
             );
@@ -12658,7 +12560,7 @@ mod gpui_tests {
     fn ctrl_j_and_ctrl_m_submit_the_line_like_enter(cx: &mut TestAppContext) {
         crate::core::config::pin_test_config_dir();
 
-        let (window, mut daemon) = harness(cx);
+        let (window, daemon) = harness(cx);
         for (chord, line) in [("ctrl-j", "echo j"), ("ctrl-m", "echo m")] {
             window
                 .update(cx, |view, _, cx| {
@@ -12668,7 +12570,7 @@ mod gpui_tests {
                 })
                 .unwrap();
             assert_eq!(
-                next_input_until_timeout(&mut daemon),
+                next_input_until_timeout(&daemon),
                 Some(format!("{line}\r").into_bytes()),
                 "{chord} ships the line to the PTY"
             );
@@ -12677,7 +12579,7 @@ mod gpui_tests {
 
     #[gpui::test]
     fn history_search_off_sends_ctrl_r_to_the_shell(cx: &mut TestAppContext) {
-        let (window, mut daemon) = harness(cx);
+        let (window, daemon) = harness(cx);
         cx.update(|cx| {
             let mut cfg = cx.global::<Config>().clone();
             cfg.history_search = false;
@@ -12696,9 +12598,9 @@ mod gpui_tests {
                 assert_eq!(view.cmd.text(), "", "the line went to the shell");
             })
             .unwrap();
-        assert_eq!(next_input_until_timeout(&mut daemon), Some(b"gi".to_vec()));
+        assert_eq!(next_input_until_timeout(&daemon), Some(b"gi".to_vec()));
         assert_eq!(
-            next_input_until_timeout(&mut daemon),
+            next_input_until_timeout(&daemon),
             Some(vec![0x12]),
             "the raw ^R follows the handed-over line"
         );
@@ -12710,14 +12612,12 @@ mod gpui_tests {
     /// widget reading the shell's own, shared history.
     #[gpui::test]
     fn prompt_editor_off_hands_typing_and_arrows_to_the_shell(cx: &mut TestAppContext) {
-        let (window, mut daemon) = harness(cx);
-        DaemonMsg::Prompt {
+        let (window, daemon) = harness(cx);
+        daemon.send(DaemonMsg::Prompt {
             active: true,
             at_prompt: true,
             last_exit: None,
-        }
-        .encode(&mut daemon)
-        .unwrap();
+        });
         // The editor engages first: this is a pane with working shell
         // integration, which the mode has to keep working.
         wait_for_input_active(&window, cx);
@@ -12752,9 +12652,9 @@ mod gpui_tests {
             })
             .unwrap();
 
-        assert_eq!(next_input_until_timeout(&mut daemon), Some(b"h".to_vec()));
+        assert_eq!(next_input_until_timeout(&daemon), Some(b"h".to_vec()));
         assert_eq!(
-            next_input_until_timeout(&mut daemon),
+            next_input_until_timeout(&daemon),
             Some(b"\x1b[A".to_vec()),
             "the physical Up key reaches the PTY for ZLE to bind"
         );
@@ -12776,14 +12676,12 @@ mod gpui_tests {
     /// it.
     #[gpui::test]
     fn prompt_editor_off_hands_over_tab_and_ctrl_r(cx: &mut TestAppContext) {
-        let (window, mut daemon) = harness(cx);
-        DaemonMsg::Prompt {
+        let (window, daemon) = harness(cx);
+        daemon.send(DaemonMsg::Prompt {
             active: true,
             at_prompt: true,
             last_exit: None,
-        }
-        .encode(&mut daemon)
-        .unwrap();
+        });
         wait_for_input_active(&window, cx);
 
         window
@@ -12807,8 +12705,8 @@ mod gpui_tests {
             })
             .unwrap();
 
-        assert_eq!(next_input_until_timeout(&mut daemon), Some(b"\t".to_vec()));
-        assert_eq!(next_input_until_timeout(&mut daemon), Some(vec![0x12]));
+        assert_eq!(next_input_until_timeout(&daemon), Some(b"\t".to_vec()));
+        assert_eq!(next_input_until_timeout(&daemon), Some(vec![0x12]));
     }
 
     /// Turning the setting off mid-line must not eat what is already typed —
@@ -12816,14 +12714,12 @@ mod gpui_tests {
     /// still on the prompt for the shell to finish.
     #[gpui::test]
     fn turning_the_prompt_editor_off_hands_the_typed_line_over(cx: &mut TestAppContext) {
-        let (window, mut daemon) = harness(cx);
-        DaemonMsg::Prompt {
+        let (window, daemon) = harness(cx);
+        daemon.send(DaemonMsg::Prompt {
             active: true,
             at_prompt: true,
             last_exit: None,
-        }
-        .encode(&mut daemon)
-        .unwrap();
+        });
         wait_for_input_active(&window, cx);
 
         window
@@ -12835,7 +12731,7 @@ mod gpui_tests {
             .unwrap();
 
         assert_eq!(
-            next_input_until_timeout(&mut daemon),
+            next_input_until_timeout(&daemon),
             Some(b"git status".to_vec()),
             "the half-typed line is on the shell's prompt now"
         );
@@ -12843,14 +12739,12 @@ mod gpui_tests {
 
     #[gpui::test]
     fn reverse_search_menu_survives_a_real_render_pass(cx: &mut TestAppContext) {
-        let (window, mut daemon) = harness(cx);
-        DaemonMsg::Prompt {
+        let (window, daemon) = harness(cx);
+        daemon.send(DaemonMsg::Prompt {
             active: true,
             at_prompt: true,
             last_exit: None,
-        }
-        .encode(&mut daemon)
-        .unwrap();
+        });
         for _ in 0..200 {
             if window
                 .update(cx, |view, _, _| view.terminal.at_prompt())
@@ -12900,7 +12794,7 @@ mod gpui_tests {
         crate::core::config::pin_test_config_dir();
         let dir = crate::core::config::config_dir_path().expect("a config dir resolves");
 
-        let (window, mut daemon) = harness(cx);
+        let (window, daemon) = harness(cx);
         let wait = |cx: &mut TestAppContext, pred: &dyn Fn(&TerminalView) -> bool, what: &str| {
             for _ in 0..200 {
                 if window.update(cx, |view, _, _| pred(view)).unwrap() {
@@ -12911,13 +12805,11 @@ mod gpui_tests {
             panic!("timed out waiting for {what}");
         };
 
-        DaemonMsg::Prompt {
+        daemon.send(DaemonMsg::Prompt {
             active: true,
             at_prompt: true,
             last_exit: None,
-        }
-        .encode(&mut daemon)
-        .unwrap();
+        });
         wait(cx, &|v| v.terminal.at_prompt(), "the initial prompt report");
 
         let marker = format!("tty7_gpui_exit_marker_{}", std::process::id());
@@ -12929,20 +12821,16 @@ mod gpui_tests {
             })
             .unwrap();
 
-        DaemonMsg::Prompt {
+        daemon.send(DaemonMsg::Prompt {
             active: true,
             at_prompt: false,
             last_exit: None,
-        }
-        .encode(&mut daemon)
-        .unwrap();
-        DaemonMsg::Prompt {
+        });
+        daemon.send(DaemonMsg::Prompt {
             active: true,
             at_prompt: true,
             last_exit: Some(3),
-        }
-        .encode(&mut daemon)
-        .unwrap();
+        });
         wait(
             cx,
             &|v| v.terminal.at_prompt() && v.terminal.last_exit_code() == Some(3),
@@ -13216,8 +13104,8 @@ mod gpui_tests {
     /// person typing cannot see it.
     #[gpui::test]
     fn typing_brings_the_view_back_to_the_prompt(cx: &mut TestAppContext) {
-        let (window, mut daemon) = harness(cx);
-        prompt_ready(&window, cx, &mut daemon);
+        let (window, daemon) = harness(cx);
+        prompt_ready(&window, cx, &daemon);
         window
             .update(cx, |view, _w, cx| {
                 assert!(
@@ -13240,8 +13128,8 @@ mod gpui_tests {
     /// it went the same way.
     #[gpui::test]
     fn pasting_brings_the_view_back_to_the_prompt(cx: &mut TestAppContext) {
-        let (window, mut daemon) = harness(cx);
-        prompt_ready(&window, cx, &mut daemon);
+        let (window, daemon) = harness(cx);
+        prompt_ready(&window, cx, &daemon);
         window
             .update(cx, |view, _w, cx| {
                 scroll_into_history(view, 10);
@@ -13492,8 +13380,8 @@ mod gpui_tests {
     #[gpui::test]
     fn ctrl_e_accepts_a_ghost_suggestion_at_the_end(cx: &mut TestAppContext) {
         crate::core::config::pin_test_config_dir();
-        let (window, mut daemon) = harness(cx);
-        prompt_ready(&window, cx, &mut daemon);
+        let (window, daemon) = harness(cx);
+        prompt_ready(&window, cx, &daemon);
 
         window
             .update(cx, |view, _, cx| {
@@ -13511,7 +13399,7 @@ mod gpui_tests {
             })
             .unwrap();
         assert_eq!(
-            next_input_until_timeout(&mut daemon),
+            next_input_until_timeout(&daemon),
             None,
             "the local editor must consume Ctrl+E instead of forwarding 0x05"
         );
@@ -13535,7 +13423,7 @@ mod gpui_tests {
 
     #[gpui::test]
     fn an_unknown_ctrl_chord_goes_to_the_shell_with_the_line(cx: &mut TestAppContext) {
-        let (window, mut daemon) = harness(cx);
+        let (window, daemon) = harness(cx);
         window
             .update(cx, |view, _, cx| {
                 view.cmd.set("echo hi");
@@ -13551,13 +13439,13 @@ mod gpui_tests {
                 );
             })
             .unwrap();
-        assert_eq!(next_input(&mut daemon), b"echo hi".to_vec());
-        assert_eq!(next_input(&mut daemon), vec![0x14], "⌃T reached the shell");
+        assert_eq!(next_input(&daemon), b"echo hi".to_vec());
+        assert_eq!(next_input(&daemon), vec![0x14], "⌃T reached the shell");
     }
 
     #[gpui::test]
     fn an_unknown_meta_chord_goes_to_the_shell_with_the_line(cx: &mut TestAppContext) {
-        let (window, mut daemon) = harness(cx);
+        let (window, daemon) = harness(cx);
         window
             .update(cx, |view, _, cx| {
                 view.cmd.set("echo hi");
@@ -13575,8 +13463,8 @@ mod gpui_tests {
                 assert_eq!(view.cmd.text(), "");
             })
             .unwrap();
-        assert_eq!(next_input(&mut daemon), b"echo hi".to_vec());
-        assert_eq!(next_input(&mut daemon), b"\x1bu".to_vec());
+        assert_eq!(next_input(&daemon), b"echo hi".to_vec());
+        assert_eq!(next_input(&daemon), b"\x1bu".to_vec());
     }
 
     #[gpui::test]
@@ -13663,14 +13551,12 @@ mod gpui_tests {
 
     #[gpui::test]
     fn an_intervening_ime_commit_restarts_the_last_word_walk(cx: &mut TestAppContext) {
-        let (window, mut daemon) = harness(cx);
-        DaemonMsg::Prompt {
+        let (window, daemon) = harness(cx);
+        daemon.send(DaemonMsg::Prompt {
             active: true,
             at_prompt: true,
             last_exit: None,
-        }
-        .encode(&mut daemon)
-        .unwrap();
+        });
         wait_for_input_active(&window, cx);
         window
             .update(cx, |view, _, cx| {
@@ -13739,7 +13625,7 @@ mod gpui_tests {
 
     #[gpui::test]
     fn a_shifted_meta_chord_hands_off_the_shifted_character(cx: &mut TestAppContext) {
-        let (window, mut daemon) = harness(cx);
+        let (window, daemon) = harness(cx);
         window
             .update(cx, |view, _, cx| {
                 view.cmd.set("echo hi");
@@ -13758,8 +13644,8 @@ mod gpui_tests {
                 assert_eq!(view.cmd.text(), "");
             })
             .unwrap();
-        assert_eq!(next_input(&mut daemon), b"echo hi".to_vec());
-        assert_eq!(next_input(&mut daemon), b"\x1bU".to_vec());
+        assert_eq!(next_input(&daemon), b"echo hi".to_vec());
+        assert_eq!(next_input(&daemon), b"\x1bU".to_vec());
     }
 
     #[gpui::test]
@@ -13777,13 +13663,13 @@ mod gpui_tests {
 
     #[gpui::test]
     fn pty_write_events_reach_the_daemon_as_input(cx: &mut TestAppContext) {
-        let (window, mut daemon) = harness(cx);
+        let (window, daemon) = harness(cx);
         window
             .update(cx, |view, _, cx| {
                 view.handle_event(AlacEvent::PtyWrite("ping".into()), cx);
             })
             .unwrap();
-        assert_eq!(next_input(&mut daemon), b"ping".to_vec());
+        assert_eq!(next_input(&daemon), b"ping".to_vec());
     }
 
     fn bind_to_a_disconnected_remote_workspace(
@@ -13810,15 +13696,13 @@ mod gpui_tests {
         cx: &mut TestAppContext,
     ) {
         crate::core::config::pin_test_config_dir();
-        let (window, mut daemon) = harness(cx);
+        let (window, daemon) = harness(cx);
         cx.update(crate::ui::keymap::init);
-        DaemonMsg::Prompt {
+        daemon.send(DaemonMsg::Prompt {
             active: true,
             at_prompt: true,
             last_exit: None,
-        }
-        .encode(&mut daemon)
-        .unwrap();
+        });
         wait_for_input_active(&window, cx);
 
         window
@@ -13854,7 +13738,7 @@ mod gpui_tests {
             })
             .unwrap();
         assert_eq!(
-            next_input_until_timeout(&mut daemon),
+            next_input_until_timeout(&daemon),
             None,
             "not one byte reached the wire"
         );
@@ -13885,7 +13769,7 @@ mod gpui_tests {
 
     #[gpui::test]
     fn a_disconnected_remote_pane_swallows_every_kind_of_typing(cx: &mut TestAppContext) {
-        let (window, mut daemon) = harness(cx);
+        let (window, daemon) = harness(cx);
         window
             .update(cx, |view, window, cx| {
                 bind_to_a_disconnected_remote_workspace(view, cx);
@@ -13898,7 +13782,7 @@ mod gpui_tests {
             })
             .unwrap();
         assert_eq!(
-            next_input_until_timeout(&mut daemon),
+            next_input_until_timeout(&daemon),
             None,
             "a read-only window must not put one byte of typing on the wire"
         );
@@ -13906,10 +13790,8 @@ mod gpui_tests {
 
     #[gpui::test]
     fn a_disconnected_remote_pane_still_selects_and_copies(cx: &mut TestAppContext) {
-        let (window, mut daemon) = harness(cx);
-        DaemonMsg::Output(b"secrets".to_vec())
-            .encode(&mut daemon)
-            .unwrap();
+        let (window, daemon) = harness(cx);
+        daemon.send(DaemonMsg::Output(b"secrets".to_vec()));
         for _ in 0..400 {
             cx.run_until_parked();
             let ready = window
@@ -13958,7 +13840,7 @@ mod gpui_tests {
 
     #[gpui::test]
     fn a_disconnected_remote_pane_still_answers_terminal_queries(cx: &mut TestAppContext) {
-        let (window, mut daemon) = harness(cx);
+        let (window, daemon) = harness(cx);
         window
             .update(cx, |view, _, cx| {
                 bind_to_a_disconnected_remote_workspace(view, cx);
@@ -13966,7 +13848,7 @@ mod gpui_tests {
             })
             .unwrap();
         assert_eq!(
-            next_input(&mut daemon),
+            next_input(&daemon),
             b"\x1b[?62;c".to_vec(),
             "a query reply is the emulator's answer, not the user's typing"
         );
@@ -14039,7 +13921,7 @@ mod gpui_tests {
 
     #[gpui::test]
     fn a_local_pane_types_exactly_as_it_always_did(cx: &mut TestAppContext) {
-        let (window, mut daemon) = harness(cx);
+        let (window, daemon) = harness(cx);
         window
             .update(cx, |view, window, cx| {
                 bind_to_a_disconnected_remote_workspace(view, cx);
@@ -14048,16 +13930,16 @@ mod gpui_tests {
                 type_char(view, "z", window, cx);
             })
             .unwrap();
-        assert_eq!(next_input(&mut daemon), b"z".to_vec());
+        assert_eq!(next_input(&daemon), b"z".to_vec());
     }
 
     #[gpui::test]
     fn buffer_search_honors_case_and_regex_toggles(cx: &mut TestAppContext) {
-        let (window, mut daemon) = harness(cx);
+        let (window, daemon) = harness(cx);
 
-        DaemonMsg::Output(b"Hello World\r\nhello world\r\nWORLD wide\r\n".to_vec())
-            .encode(&mut daemon)
-            .unwrap();
+        daemon.send(DaemonMsg::Output(
+            b"Hello World\r\nhello world\r\nWORLD wide\r\n".to_vec(),
+        ));
 
         for _ in 0..200 {
             let ready = window
@@ -14128,12 +14010,12 @@ mod gpui_tests {
     fn a_column_resize_rescans_the_open_searchs_highlights(cx: &mut TestAppContext) {
         // Rooted: the open bar's input reaches for `Root` when a frame draws
         // (see `rooted_harness`).
-        let (window, view, mut daemon) = rooted_harness(cx);
+        let (window, view, daemon) = rooted_harness(cx);
 
         // 76 columns of text: one row at 80 wide, wrapped onto two at 40.
         let mut line = vec![b'a'; 70];
         line.extend_from_slice(b"needle\r\n");
-        DaemonMsg::Output(line).encode(&mut daemon).unwrap();
+        daemon.send(DaemonMsg::Output(line));
 
         for _ in 0..200 {
             let ready = cx.update(|cx| {
@@ -14203,7 +14085,7 @@ mod gpui_tests {
     ) {
         use crate::core::cli_agent::{AgentSessionState, AgentStatus, CLIAgent};
 
-        let (window, view, mut daemon) = rooted_harness(cx);
+        let (window, view, daemon) = rooted_harness(cx);
         let draw = |cx: &mut TestAppContext| {
             window.update(cx, |_, window, _| window.refresh()).unwrap();
             cx.executor()
@@ -14253,12 +14135,10 @@ mod gpui_tests {
             "a shell has nobody to compose for"
         );
 
-        DaemonMsg::Agent(Some(CLIAgent::Claude))
-            .encode(&mut daemon)
-            .unwrap();
-        DaemonMsg::Output(format!("\x1b[?2004h{input}").into_bytes())
-            .encode(&mut daemon)
-            .unwrap();
+        daemon.send(DaemonMsg::Agent(Some(CLIAgent::Claude)));
+        daemon.send(DaemonMsg::Output(
+            format!("\x1b[?2004h{input}").into_bytes(),
+        ));
         wait_for(cx, &|v| {
             v.agent() == Some(CLIAgent::Claude)
                 && screen_has(v, '❯')
@@ -14304,12 +14184,8 @@ mod gpui_tests {
             })
             .unwrap();
         draw(cx);
-        assert_eq!(next_input(&mut daemon), b"\x1b[200~one\ntwo\x1b[201~");
-        assert_eq!(
-            next_input(&mut daemon),
-            b"\r",
-            "Enter goes as its own write"
-        );
+        assert_eq!(next_input(&daemon), b"\x1b[200~one\ntwo\x1b[201~");
+        assert_eq!(next_input(&daemon), b"\r", "Enter goes as its own write");
         assert_eq!(
             cx.update(|cx| view
                 .read(cx)
@@ -14359,13 +14235,13 @@ mod gpui_tests {
             })
             .unwrap();
 
-        // A picker takes the input's place. Past the grace period the box
-        // steps aside and the keyboard goes to the TUI.
-        DaemonMsg::Output(
-            b"\x1b[2J\x1b[H Select model\r\n \xe2\x9d\xaf 1. Opus\r\n   2. Sonnet".to_vec(),
-        )
-        .encode(&mut daemon)
-        .unwrap();
+        daemon.send(
+            // A picker takes the input's place. Past the grace period the box
+            // steps aside and the keyboard goes to the TUI.
+            DaemonMsg::Output(
+                b"\x1b[2J\x1b[H Select model\r\n \xe2\x9d\xaf 1. Opus\r\n   2. Sonnet".to_vec(),
+            ),
+        );
         wait_for(cx, &|v| !screen_has(v, '─'));
         draw(cx);
         std::thread::sleep(super::super::composer::STEP_ASIDE_AFTER);
@@ -14382,10 +14258,10 @@ mod gpui_tests {
             })
             .unwrap();
 
-        // The input comes back, and so do the box and its caret.
-        DaemonMsg::Output(input.clone().into_bytes())
-            .encode(&mut daemon)
-            .unwrap();
+        daemon.send(
+            // The input comes back, and so do the box and its caret.
+            DaemonMsg::Output(input.clone().into_bytes()),
+        );
         wait_for(cx, &|v| screen_has(v, '─'));
         draw(cx);
         window
@@ -14398,15 +14274,15 @@ mod gpui_tests {
             })
             .unwrap();
 
-        // A question the hooks report steps it aside at once, and nothing in
-        // the box is sent as the answer.
-        DaemonMsg::AgentStatus(Some(AgentSessionState {
-            status: AgentStatus::Waiting,
-            rich: true,
-            ..Default::default()
-        }))
-        .encode(&mut daemon)
-        .unwrap();
+        daemon.send(
+            // A question the hooks report steps it aside at once, and nothing in
+            // the box is sent as the answer.
+            DaemonMsg::AgentStatus(Some(AgentSessionState {
+                status: AgentStatus::Waiting,
+                rich: true,
+                ..Default::default()
+            })),
+        );
         wait_for(cx, &|v| {
             v.agent_session()
                 .is_some_and(|s| s.status == AgentStatus::Waiting)
@@ -14422,7 +14298,7 @@ mod gpui_tests {
             .unwrap();
         draw(cx);
         assert_eq!(
-            next_input_until_timeout(&mut daemon),
+            next_input_until_timeout(&daemon),
             None,
             "a question in the TUI is not answered from the box"
         );
@@ -14440,7 +14316,7 @@ mod gpui_tests {
             "the held message stays in the box"
         );
 
-        DaemonMsg::Agent(None).encode(&mut daemon).unwrap();
+        daemon.send(DaemonMsg::Agent(None));
         wait_for(cx, &|v| v.agent().is_none());
         draw(cx);
         window
@@ -14461,11 +14337,11 @@ mod gpui_tests {
     /// either (#584). Only *changing* the query retires it.
     #[gpui::test]
     fn the_search_bar_opens_and_closes_around_a_grid_selection(cx: &mut TestAppContext) {
-        let (window, view, mut daemon) = rooted_harness(cx);
+        let (window, view, daemon) = rooted_harness(cx);
 
-        DaemonMsg::Output(b"some needle in the haystack\r\n".to_vec())
-            .encode(&mut daemon)
-            .unwrap();
+        daemon.send(DaemonMsg::Output(
+            b"some needle in the haystack\r\n".to_vec(),
+        ));
         for _ in 0..200 {
             let ready = cx.update(|cx| {
                 let v = view.read(cx);
@@ -14527,7 +14403,7 @@ mod gpui_tests {
 
     #[gpui::test]
     fn output_under_an_open_search_bar_is_searched_too(cx: &mut TestAppContext) {
-        let (window, view, mut daemon) = rooted_harness(cx);
+        let (window, view, daemon) = rooted_harness(cx);
 
         fn wait_for(cx: &mut TestAppContext, view: &Entity<TerminalView>, needle: char) {
             for _ in 0..200 {
@@ -14547,9 +14423,7 @@ mod gpui_tests {
             panic!("the pane never printed {needle:?}");
         }
 
-        DaemonMsg::Output(b"world 1\r\n".to_vec())
-            .encode(&mut daemon)
-            .unwrap();
+        daemon.send(DaemonMsg::Output(b"world 1\r\n".to_vec()));
         wait_for(cx, &view, '1');
 
         window
@@ -14564,12 +14438,12 @@ mod gpui_tests {
             })
             .unwrap();
 
-        // A second line arrives while the bar is up. Until it is rescanned the
-        // count still says 1, and the one highlight it does draw has slid onto
-        // whatever line took the old one's place.
-        DaemonMsg::Output(b"world 2\r\n".to_vec())
-            .encode(&mut daemon)
-            .unwrap();
+        daemon.send(
+            // A second line arrives while the bar is up. Until it is rescanned the
+            // count still says 1, and the one highlight it does draw has slid onto
+            // whatever line took the old one's place.
+            DaemonMsg::Output(b"world 2\r\n".to_vec()),
+        );
         wait_for(cx, &view, '2');
         for _ in 0..8 {
             cx.executor()
@@ -14853,7 +14727,7 @@ mod gpui_tests {
 
     #[gpui::test]
     fn text_area_size_request_replies_with_the_current_geometry(cx: &mut TestAppContext) {
-        let (window, mut daemon) = harness(cx);
+        let (window, daemon) = harness(cx);
         let want = window
             .update(cx, |view, _, cx| {
                 let size = view.terminal.size();
@@ -14864,12 +14738,12 @@ mod gpui_tests {
                 format!("{}x{}", size.cols, size.rows)
             })
             .unwrap();
-        assert_eq!(next_input(&mut daemon), want.into_bytes());
+        assert_eq!(next_input(&daemon), want.into_bytes());
     }
 
     #[gpui::test]
     fn daemon_output_reaches_the_grid_through_the_event_pump(cx: &mut TestAppContext) {
-        let (window, mut daemon) = harness(cx);
+        let (window, daemon) = harness(cx);
 
         let read_row = |cx: &mut TestAppContext, len: usize| -> String {
             window
@@ -14896,24 +14770,18 @@ mod gpui_tests {
             got
         };
 
-        DaemonMsg::Output(b"hello".to_vec())
-            .encode(&mut daemon)
-            .unwrap();
+        daemon.send(DaemonMsg::Output(b"hello".to_vec()));
         assert_eq!(wait_for(cx, "hello"), "hello");
 
-        DaemonMsg::Output(b" again".to_vec())
-            .encode(&mut daemon)
-            .unwrap();
+        daemon.send(DaemonMsg::Output(b" again".to_vec()));
         assert_eq!(wait_for(cx, "hello again"), "hello again");
     }
 
     #[gpui::test]
     fn copy_on_select_writes_the_clipboard_at_mouse_up(cx: &mut TestAppContext) {
-        let (window, mut daemon) = harness(cx);
+        let (window, daemon) = harness(cx);
 
-        DaemonMsg::Output(b"hello world".to_vec())
-            .encode(&mut daemon)
-            .unwrap();
+        daemon.send(DaemonMsg::Output(b"hello world".to_vec()));
         for _ in 0..400 {
             cx.run_until_parked();
             let row: String = window
@@ -14965,11 +14833,9 @@ mod gpui_tests {
 
     #[gpui::test]
     fn ctrl_c_copy_consumes_the_selection_so_the_next_press_is_sigint(cx: &mut TestAppContext) {
-        let (window, mut daemon) = harness(cx);
+        let (window, daemon) = harness(cx);
 
-        DaemonMsg::Output(b"hello world".to_vec())
-            .encode(&mut daemon)
-            .unwrap();
+        daemon.send(DaemonMsg::Output(b"hello world".to_vec()));
         for _ in 0..400 {
             cx.run_until_parked();
             let row: String = window
@@ -15011,9 +14877,9 @@ mod gpui_tests {
 
     #[gpui::test]
     fn cmd_v_pastes_on_the_alternate_screen(cx: &mut TestAppContext) {
-        let (window, mut daemon) = harness(cx);
+        let (window, daemon) = harness(cx);
         cx.update(|cx| cx.write_to_clipboard(ClipboardItem::new_string("echo hi".into())));
-        alt_screen_ready(&window, cx, &mut daemon);
+        alt_screen_ready(&window, cx, &daemon);
 
         window
             .update(cx, |view, window, cx| {
@@ -15024,8 +14890,8 @@ mod gpui_tests {
                 );
             })
             .unwrap();
-        assert_eq!(next_input(&mut daemon), b"echo hi".to_vec());
-        assert_eq!(next_input_until_timeout(&mut daemon), None);
+        assert_eq!(next_input(&daemon), b"echo hi".to_vec());
+        assert_eq!(next_input_until_timeout(&daemon), None);
     }
 
     /// The Ctrl+V half of the same key, through the real keymap: whether it
@@ -15035,7 +14901,7 @@ mod gpui_tests {
     #[gpui::test]
     fn ctrl_v_pastes_at_a_prompt(cx: &mut TestAppContext) {
         crate::core::config::pin_test_config_dir();
-        let (window, mut daemon) = harness(cx);
+        let (window, daemon) = harness(cx);
         cx.update(|cx| crate::ui::keymap::init(cx));
         cx.update(|cx| cx.write_to_clipboard(ClipboardItem::new_string("echo hi".into())));
         window
@@ -15049,20 +14915,17 @@ mod gpui_tests {
         let mut vcx = gpui::VisualTestContext::from_window(window.into(), cx);
         vcx.simulate_keystrokes("ctrl-v");
 
-        assert_eq!(
-            next_input_until_timeout(&mut daemon),
-            Some(b"echo hi".to_vec())
-        );
+        assert_eq!(next_input_until_timeout(&daemon), Some(b"echo hi".to_vec()));
     }
 
     #[cfg(not(target_os = "macos"))]
     #[gpui::test]
     fn ctrl_v_reaches_a_full_screen_program_as_syn(cx: &mut TestAppContext) {
         crate::core::config::pin_test_config_dir();
-        let (window, mut daemon) = harness(cx);
+        let (window, daemon) = harness(cx);
         cx.update(|cx| crate::ui::keymap::init(cx));
         cx.update(|cx| cx.write_to_clipboard(ClipboardItem::new_string("echo hi".into())));
-        alt_screen_ready(&window, cx, &mut daemon);
+        alt_screen_ready(&window, cx, &daemon);
         window
             .update(cx, |view, window, cx| {
                 window.activate_window();
@@ -15073,7 +14936,7 @@ mod gpui_tests {
         let mut vcx = gpui::VisualTestContext::from_window(window.into(), cx);
         vcx.simulate_keystrokes("ctrl-v");
 
-        assert_eq!(next_input_until_timeout(&mut daemon), Some(vec![0x16]));
+        assert_eq!(next_input_until_timeout(&daemon), Some(vec![0x16]));
     }
 
     /// The other half of that rule, which the binding's context cannot state.
@@ -15085,7 +14948,7 @@ mod gpui_tests {
     /// the clipboard never lands in a program that would run it as commands.
     #[gpui::test]
     fn alternate_paste_asks_the_grid_and_not_the_last_frame(cx: &mut TestAppContext) {
-        let (window, mut daemon) = harness(cx);
+        let (window, daemon) = harness(cx);
         cx.update(|cx| cx.write_to_clipboard(ClipboardItem::new_string("echo hi".into())));
 
         window
@@ -15094,14 +14957,14 @@ mod gpui_tests {
                 view.alternate_paste(cx);
             })
             .unwrap();
-        assert_eq!(next_input(&mut daemon), b"echo hi".to_vec());
+        assert_eq!(next_input(&daemon), b"echo hi".to_vec());
 
-        alt_screen_ready(&window, cx, &mut daemon);
+        alt_screen_ready(&window, cx, &daemon);
         window
             .update(cx, |view, _window, cx| view.alternate_paste(cx))
             .unwrap();
         assert_eq!(
-            next_input_until_timeout(&mut daemon),
+            next_input_until_timeout(&daemon),
             None,
             "the paste is withheld even when the frame that matched said otherwise"
         );
@@ -15113,7 +14976,7 @@ mod gpui_tests {
     #[gpui::test]
     fn ctrl_6_reaches_the_pty_as_rs(cx: &mut TestAppContext) {
         crate::core::config::pin_test_config_dir();
-        let (window, mut daemon) = harness(cx);
+        let (window, daemon) = harness(cx);
         cx.update(crate::ui::keymap::init);
         window
             .update(cx, |view, window, cx| {
@@ -15125,14 +14988,14 @@ mod gpui_tests {
         let mut vcx = gpui::VisualTestContext::from_window(window.into(), cx);
         vcx.simulate_keystrokes("ctrl-6");
 
-        assert_eq!(next_input_until_timeout(&mut daemon), Some(vec![0x1e]));
+        assert_eq!(next_input_until_timeout(&daemon), Some(vec![0x1e]));
     }
 
     #[cfg(target_os = "macos")]
     #[gpui::test]
     fn cmd_backspace_reaches_a_foreground_tui_as_ctrl_u(cx: &mut TestAppContext) {
         crate::core::config::pin_test_config_dir();
-        let (window, mut daemon) = harness(cx);
+        let (window, daemon) = harness(cx);
         window
             .update(cx, |view, window, cx| {
                 assert!(
@@ -15158,14 +15021,14 @@ mod gpui_tests {
             })
             .unwrap();
 
-        assert_eq!(next_input_until_timeout(&mut daemon), Some(vec![0x15]));
+        assert_eq!(next_input_until_timeout(&daemon), Some(vec![0x15]));
     }
 
     #[cfg(target_os = "macos")]
     #[gpui::test]
     fn cmd_navigation_reaches_a_foreground_tui_as_readline_controls(cx: &mut TestAppContext) {
         crate::core::config::pin_test_config_dir();
-        let (window, mut daemon) = harness(cx);
+        let (window, daemon) = harness(cx);
 
         for (key, expected) in [("left", 0x01), ("right", 0x05), ("delete", 0x0b)] {
             window
@@ -15189,7 +15052,7 @@ mod gpui_tests {
                     );
                 })
                 .unwrap();
-            assert_eq!(next_input_until_timeout(&mut daemon), Some(vec![expected]));
+            assert_eq!(next_input_until_timeout(&daemon), Some(vec![expected]));
         }
     }
 
@@ -15197,14 +15060,12 @@ mod gpui_tests {
     #[gpui::test]
     fn cmd_backspace_releases_held_input_before_ctrl_u(cx: &mut TestAppContext) {
         crate::core::config::pin_test_config_dir();
-        let (window, mut daemon) = harness(cx);
-        DaemonMsg::Prompt {
+        let (window, daemon) = harness(cx);
+        daemon.send(DaemonMsg::Prompt {
             active: true,
             at_prompt: false,
             last_exit: None,
-        }
-        .encode(&mut daemon)
-        .unwrap();
+        });
         for _ in 0..200 {
             cx.run_until_parked();
             let gap = window
@@ -15241,12 +15102,12 @@ mod gpui_tests {
             .unwrap();
 
         assert_eq!(
-            next_input_until_timeout(&mut daemon),
+            next_input_until_timeout(&daemon),
             Some(b"ls".to_vec()),
             "held text must reach the PTY before the line-kill"
         );
         assert_eq!(
-            next_input_until_timeout(&mut daemon),
+            next_input_until_timeout(&daemon),
             Some(vec![0x15]),
             "Ctrl-U must follow the text it clears"
         );
@@ -15254,7 +15115,7 @@ mod gpui_tests {
 
     #[gpui::test]
     fn paste_to_the_pty_consumes_the_selection(cx: &mut TestAppContext) {
-        let (window, mut daemon) = harness(cx);
+        let (window, daemon) = harness(cx);
         window
             .update(cx, |view, _, cx| {
                 view.select_all(cx);
@@ -15266,20 +15127,18 @@ mod gpui_tests {
                 );
             })
             .unwrap();
-        assert_eq!(next_input(&mut daemon), b"echo hi".to_vec());
+        assert_eq!(next_input(&daemon), b"echo hi".to_vec());
     }
 
     #[gpui::test]
     fn ctrl_c_copy_consumes_the_editor_selection_at_the_prompt(cx: &mut TestAppContext) {
-        let (window, mut daemon) = harness(cx);
+        let (window, daemon) = harness(cx);
 
-        DaemonMsg::Prompt {
+        daemon.send(DaemonMsg::Prompt {
             active: true,
             at_prompt: true,
             last_exit: Some(0),
-        }
-        .encode(&mut daemon)
-        .unwrap();
+        });
         for _ in 0..400 {
             cx.run_until_parked();
             let active = window.update(cx, |view, _, _| view.input_active()).unwrap();
@@ -15316,18 +15175,14 @@ mod gpui_tests {
     ) {
         use alacritty_terminal::vte::ansi::CursorShape;
 
-        let (window, mut daemon) = harness(cx);
+        let (window, daemon) = harness(cx);
 
-        DaemonMsg::Prompt {
+        daemon.send(DaemonMsg::Prompt {
             active: true,
             at_prompt: true,
             last_exit: Some(0),
-        }
-        .encode(&mut daemon)
-        .unwrap();
-        DaemonMsg::Output(b"\x1b[4;11H\x1b[?25l".to_vec())
-            .encode(&mut daemon)
-            .unwrap();
+        });
+        daemon.send(DaemonMsg::Output(b"\x1b[4;11H\x1b[?25l".to_vec()));
 
         let mut state = (false, false, None);
         for _ in 0..400 {
@@ -15439,10 +15294,8 @@ mod gpui_tests {
             painted
         };
 
-        let (window, mut daemon) = harness(cx);
-        DaemonMsg::Output(stream.clone())
-            .encode(&mut daemon)
-            .unwrap();
+        let (window, daemon) = harness(cx);
+        daemon.send(DaemonMsg::Output(stream.clone()));
         let focused = paint_until(&window, cx, true, &|p| p.is_none());
         assert_eq!(
             focused, None,
@@ -15454,9 +15307,7 @@ mod gpui_tests {
             "an unfocused pane painted its hollow caret over a TUI that reset DECTCEM"
         );
 
-        DaemonMsg::Output(b"\x1b[?25h".to_vec())
-            .encode(&mut daemon)
-            .unwrap();
+        daemon.send(DaemonMsg::Output(b"\x1b[?25h".to_vec()));
         let shown = paint_until(&window, cx, true, &|p| p.is_some());
         assert_eq!(
             shown.map(|(row, col, _)| (row, col)),
@@ -15496,17 +15347,15 @@ mod gpui_tests {
             panic!("the view never noticed the exit");
         };
 
-        let (window, mut daemon) = harness(cx);
+        let (window, daemon) = harness(cx);
         let got = subscribe(&window, cx);
-        DaemonMsg::Exited { code: Some(0) }
-            .encode(&mut daemon)
-            .unwrap();
+        daemon.send(DaemonMsg::Exited { code: Some(0) });
         wait_exited(&window, cx);
         assert!(got.get(), "a genuine child exit must emit ChildExited");
 
         let (window, daemon) = harness(cx);
         let got = subscribe(&window, cx);
-        drop(daemon);
+        daemon.close();
         wait_exited(&window, cx);
         assert!(!got.get(), "a daemon disconnect must not emit ChildExited");
     }
@@ -15515,18 +15364,14 @@ mod gpui_tests {
     fn ssh_drop_mid_tui_recovers_at_the_next_prompt(cx: &mut TestAppContext) {
         use alacritty_terminal::vte::ansi::CursorShape;
 
-        let (window, mut daemon) = harness(cx);
+        let (window, daemon) = harness(cx);
 
-        DaemonMsg::Output(b"\x1b[?1049h\x1b[?25l".to_vec())
-            .encode(&mut daemon)
-            .unwrap();
-        DaemonMsg::Prompt {
+        daemon.send(DaemonMsg::Output(b"\x1b[?1049h\x1b[?25l".to_vec()));
+        daemon.send(DaemonMsg::Prompt {
             active: true,
             at_prompt: true,
             last_exit: Some(255),
-        }
-        .encode(&mut daemon)
-        .unwrap();
+        });
 
         let mut state = (false, true, true);
         for _ in 0..400 {
@@ -15661,8 +15506,8 @@ mod gpui_tests {
         use gpui::{MouseMoveEvent, PlatformInput};
 
         crate::core::config::pin_test_config_dir();
-        let (window, mut daemon) = harness(cx);
-        prompt_ready(&window, cx, &mut daemon);
+        let (window, daemon) = harness(cx);
+        prompt_ready(&window, cx, &daemon);
         wait_for_input_active(&window, cx);
 
         window
@@ -15754,7 +15599,7 @@ mod gpui_tests {
     fn prompt_cursor_style_shapes_only_the_prompt(cx: &mut TestAppContext) {
         use crate::core::config::{CursorStyle, PromptCursorStyle};
 
-        let (window, mut daemon) = harness(cx);
+        let (window, daemon) = harness(cx);
         let shape = |cx: &mut TestAppContext| {
             cx.update(|cx| {
                 let view = window.entity(cx).unwrap();
@@ -15779,13 +15624,11 @@ mod gpui_tests {
             "no prompt reported yet: a program owns the cursor"
         );
 
-        DaemonMsg::Prompt {
+        daemon.send(DaemonMsg::Prompt {
             active: true,
             at_prompt: true,
             last_exit: None,
-        }
-        .encode(&mut daemon)
-        .unwrap();
+        });
         wait_for(cx, &|view| view.terminal.at_prompt());
         assert_eq!(shape(cx), Some(CursorStyle::Bar));
 
@@ -15793,9 +15636,9 @@ mod gpui_tests {
         assert_eq!(shape(cx), None, "follow leaves the prompt on cursor_style");
         cx.update(|cx| cx.global_mut::<Config>().prompt_cursor_style = PromptCursorStyle::Bar);
 
-        DaemonMsg::Output(b"\x1b]133;V;1\x07\x1b]133;B\x07".to_vec())
-            .encode(&mut daemon)
-            .unwrap();
+        daemon.send(DaemonMsg::Output(
+            b"\x1b]133;V;1\x07\x1b]133;B\x07".to_vec(),
+        ));
         wait_for(cx, &|view| view.terminal.shell_vi_mode());
         assert_eq!(
             shape(cx),
@@ -15803,13 +15646,11 @@ mod gpui_tests {
             "a vi-mode prompt keeps the shell's own shapes"
         );
 
-        DaemonMsg::Prompt {
+        daemon.send(DaemonMsg::Prompt {
             active: true,
             at_prompt: false,
             last_exit: None,
-        }
-        .encode(&mut daemon)
-        .unwrap();
+        });
         wait_for(cx, &|view| !view.terminal.at_prompt());
         assert_eq!(shape(cx), None, "a running command gets cursor_style back");
     }
@@ -15964,8 +15805,8 @@ mod gpui_tests {
     #[gpui::test]
     fn submitting_a_command_again_moves_it_to_the_newest_entry(cx: &mut TestAppContext) {
         crate::core::config::pin_test_config_dir();
-        let (window, mut daemon) = harness(cx);
-        prompt_ready(&window, cx, &mut daemon);
+        let (window, daemon) = harness(cx);
+        prompt_ready(&window, cx, &daemon);
 
         window
             .update(cx, |view, _, cx| {
@@ -15996,7 +15837,7 @@ mod gpui_tests {
     fn a_clipboard_image_reaches_the_system_clipboard(cx: &mut TestAppContext) {
         use gpui::ClipboardEntry;
 
-        let (_window, mut daemon) = harness(cx);
+        let (_window, daemon) = harness(cx);
         let pixel = image::RgbaImage::from_pixel(1, 1, image::Rgba([4, 5, 6, 255]));
         let mut png = Vec::new();
         image::DynamicImage::ImageRgba8(pixel)
@@ -16007,9 +15848,7 @@ mod gpui_tests {
             data: png.clone(),
             id: Some("copy-1".into()),
         };
-        DaemonMsg::ClipboardWrite(write.encode_frame())
-            .encode(&mut daemon)
-            .unwrap();
+        daemon.send(DaemonMsg::ClipboardWrite(write.encode_frame()));
 
         for _ in 0..400 {
             cx.run_until_parked();
@@ -16033,7 +15872,7 @@ mod gpui_tests {
                 .any(|entry| matches!(entry, ClipboardEntry::Image(image) if image.bytes == png))
         }));
         assert_eq!(
-            next_input(&mut daemon),
+            next_input(&daemon),
             tty7_core::core::clipboard::response(Some("copy-1"), "DONE")
         );
     }
@@ -16046,7 +15885,7 @@ mod gpui_tests {
 
         let (window, _root) = harness(cx);
         let detected = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
-        let (pane, mut daemon) = window
+        let (pane, daemon) = window
             .update(cx, |_, window, cx| super::quiet_test_pane(3, window, cx))
             .unwrap();
         let seen = detected.clone();
@@ -16057,8 +15896,8 @@ mod gpui_tests {
             .detach();
         });
 
-        let mut report = |agent: Option<CLIAgent>, at_prompt: bool, cx: &mut TestAppContext| {
-            DaemonMsg::Agent(agent).encode(&mut daemon).unwrap();
+        let report = |agent: Option<CLIAgent>, at_prompt: bool, cx: &mut TestAppContext| {
+            daemon.send(DaemonMsg::Agent(agent));
             for _ in 0..200 {
                 if pane.read_with(cx, |p, _| p.terminal.foreground_agent()) == agent {
                     break;
@@ -16083,44 +15922,36 @@ mod gpui_tests {
 mod prompt_handover_tests {
     use super::*;
     use crate::daemon::protocol::{ClientMsg, DaemonMsg};
-    use crate::terminal::remote::Stream;
+    use crate::terminal::remote::TestLink;
     use gpui::TestAppContext;
 
-    fn harness(cx: &mut TestAppContext) -> (gpui::WindowHandle<TerminalView>, Stream) {
+    fn harness(cx: &mut TestAppContext) -> (gpui::WindowHandle<TerminalView>, TestLink) {
         crate::core::config::pin_test_config_dir();
         cx.executor().allow_parking();
-        let (client_side, daemon_side) = test_stream_pair();
         cx.update(|cx| {
             gpui_component::init(cx);
             cx.set_global(Config::default());
         });
-        let window = cx.add_window(|window, cx| {
-            let terminal = RemoteTerminal::from_stream(client_side, TermSize::new(80, 24))
-                .expect("link-backed terminal");
-            TerminalView::with_terminal(terminal, 1, window, cx)
-        });
+        let (terminal, daemon_side) = RemoteTerminal::from_pipe(
+            TermSize::new(80, 24),
+            crate::terminal::remote::PtySource::for_route(&crate::terminal::PaneRoute::Local),
+        );
+        let window =
+            cx.add_window(move |window, cx| TerminalView::with_terminal(terminal, 1, window, cx));
         (window, daemon_side)
     }
 
     /// Everything the pane has written to the PTY, in order.
-    fn drain(daemon: &mut Stream) -> Vec<u8> {
-        daemon
-            .set_read_timeout(Some(std::time::Duration::from_millis(150)))
-            .unwrap();
+    fn drain(daemon: &TestLink) -> Vec<u8> {
         let mut out = Vec::new();
         loop {
-            match ClientMsg::read(daemon) {
+            match daemon.recv_client(std::time::Duration::from_millis(150)) {
                 Ok(ClientMsg::Input(bytes)) => out.extend_from_slice(&bytes),
                 Ok(_) => continue,
-                Err(e)
-                    if matches!(
-                        e.kind(),
-                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                    ) =>
-                {
-                    break;
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    panic!("pane link failed: disconnected")
                 }
-                Err(e) => panic!("pane link failed: {e}"),
             }
         }
         out
@@ -16143,8 +15974,8 @@ mod prompt_handover_tests {
     }
 
     /// Bytes from the pane's pty, the way the daemon forwards them.
-    fn output(daemon: &mut Stream, bytes: &[u8]) {
-        DaemonMsg::Output(bytes.to_vec()).encode(daemon).unwrap();
+    fn output(daemon: &TestLink, bytes: &[u8]) {
+        daemon.send(DaemonMsg::Output(bytes.to_vec()));
     }
 
     /// Waits for the tab's reading of what the pane calls itself to become
@@ -16175,10 +16006,10 @@ mod prompt_handover_tests {
     /// so the last title any program wrote in a pane outlived it forever.
     #[gpui::test]
     fn a_title_a_command_set_is_retired_when_that_command_finishes(cx: &mut TestAppContext) {
-        let (window, mut daemon) = harness(cx);
-        output(&mut daemon, b"\x1b]133;A\x07\x1b]133;B\x07");
+        let (window, daemon) = harness(cx);
+        output(&daemon, b"\x1b]133;A\x07\x1b]133;B\x07");
         output(
-            &mut daemon,
+            &daemon,
             b"\x1b]133;C;claude\x07\x1b]2;\xe2\x9c\xb3 fixing the switcher\x1b\\",
         );
         titled(cx, &window, Some("✳ fixing the switcher"));
@@ -16186,7 +16017,7 @@ mod prompt_handover_tests {
         // Claude exits and the shell reports the command finished. Nothing
         // titles the pane after it, so the tab has to fall back down the
         // label ladder — `stated_title` saying nothing is how it does that.
-        output(&mut daemon, b"\x1b]133;D;0\x07");
+        output(&daemon, b"\x1b]133;D;0\x07");
         titled(cx, &window, None);
     }
 
@@ -16195,15 +16026,15 @@ mod prompt_handover_tests {
     /// the `D` and the `A`, so it is the last word rather than a thing undone).
     #[gpui::test]
     fn a_running_program_and_a_shells_own_prompt_title_both_keep_theirs(cx: &mut TestAppContext) {
-        let (window, mut daemon) = harness(cx);
+        let (window, daemon) = harness(cx);
         output(
-            &mut daemon,
+            &daemon,
             b"\x1b]133;C;vim\x07\x1b]2;vim \xe2\x80\x94 main.rs\x1b\\",
         );
         titled(cx, &window, Some("vim — main.rs"));
 
         output(
-            &mut daemon,
+            &daemon,
             b"\x1b]133;D;0\x07\x1b]0;me@box:~/dev\x07\x1b]133;A\x07\x1b]133;B\x07",
         );
         titled(cx, &window, Some("me@box:~/dev"));
@@ -16214,11 +16045,11 @@ mod prompt_handover_tests {
         // And that prompt title is nobody's command to retire. Both marks are
         // chased by an edge the pane reports, so the assertion below cannot
         // pass on bytes that have not landed yet.
-        output(&mut daemon, b"\x1b]133;C;ls\x07");
+        output(&daemon, b"\x1b]133;C;ls\x07");
         settle(cx, &window, "a command takes the pane", |view| {
             !view.terminal.zle_reading()
         });
-        output(&mut daemon, b"\x1b]133;D;0\x07\x1b]133;B\x07");
+        output(&daemon, b"\x1b]133;D;0\x07\x1b]133;B\x07");
         settle(cx, &window, "the prompt comes back", |view| {
             view.terminal.zle_reading()
         });
@@ -16251,14 +16082,12 @@ mod prompt_handover_tests {
             .unwrap();
     }
 
-    fn prompt(daemon: &mut Stream, at_prompt: bool) {
-        DaemonMsg::Prompt {
+    fn prompt(daemon: &TestLink, at_prompt: bool) {
+        daemon.send(DaemonMsg::Prompt {
             active: true,
             at_prompt,
             last_exit: None,
-        }
-        .encode(daemon)
-        .unwrap();
+        });
     }
 
     /// Types `text` into the gap of a running command and lets the hold window
@@ -16268,21 +16097,17 @@ mod prompt_handover_tests {
     fn typed_into_the_gap_then_handed_back(
         cx: &mut TestAppContext,
         window: &gpui::WindowHandle<TerminalView>,
-        daemon: &mut Stream,
+        daemon: &TestLink,
         text: &str,
     ) {
         prompt(daemon, true);
-        DaemonMsg::Output(b"\x1b]133;B\x07".to_vec())
-            .encode(daemon)
-            .unwrap();
+        daemon.send(DaemonMsg::Output(b"\x1b]133;B\x07".to_vec()));
         settle(cx, window, "the editor takes the first prompt", |view| {
             view.input_active() && view.terminal.zle_reading()
         });
 
         prompt(daemon, false);
-        DaemonMsg::Output(b"\x1b]133;C\x07".to_vec())
-            .encode(daemon)
-            .unwrap();
+        daemon.send(DaemonMsg::Output(b"\x1b]133;C\x07".to_vec()));
         settle(cx, window, "a command takes the pane", |view| {
             !view.input_active()
         });
@@ -16312,13 +16137,13 @@ mod prompt_handover_tests {
     fn a_line_typed_into_the_gap_survives_a_prompt_that_is_not_reading_yet(
         cx: &mut TestAppContext,
     ) {
-        let (window, mut daemon) = harness(cx);
-        typed_into_the_gap_then_handed_back(cx, &window, &mut daemon, "echo hi");
+        let (window, daemon) = harness(cx);
+        typed_into_the_gap_then_handed_back(cx, &window, &daemon, "echo hi");
 
         press(&window, cx, "enter");
         cx.run_until_parked();
         assert_eq!(
-            drain(&mut daemon),
+            drain(&daemon),
             b"\x15echo hi\r".to_vec(),
             "the line the shell is holding must be erased and submitted whole, \
              not erased and replaced by an empty command"
@@ -16327,14 +16152,14 @@ mod prompt_handover_tests {
 
     #[gpui::test]
     fn a_prompt_handover_keeps_the_held_text_in_front_of_what_follows_it(cx: &mut TestAppContext) {
-        let (window, mut daemon) = harness(cx);
-        typed_into_the_gap_then_handed_back(cx, &window, &mut daemon, "echo");
+        let (window, daemon) = harness(cx);
+        typed_into_the_gap_then_handed_back(cx, &window, &daemon, "echo");
 
         // Typing carries straight on into the editor that just took the prompt.
         type_text(&window, cx, " hi");
         cx.run_until_parked();
         assert_eq!(
-            drain(&mut daemon),
+            drain(&daemon),
             Vec::<u8>::new(),
             "the editor owns these keys, so none of them reach the PTY"
         );
@@ -16342,7 +16167,7 @@ mod prompt_handover_tests {
         press(&window, cx, "enter");
         cx.run_until_parked();
         assert_eq!(
-            drain(&mut daemon),
+            drain(&daemon),
             b"\x15echo hi\r".to_vec(),
             "what the shell was holding leads the line, not the tail alone"
         );
@@ -16354,8 +16179,8 @@ mod prompt_handover_tests {
     /// reading.
     #[gpui::test]
     fn the_editor_takes_the_held_line_over_before_it_edits_it(cx: &mut TestAppContext) {
-        let (window, mut daemon) = harness(cx);
-        typed_into_the_gap_then_handed_back(cx, &window, &mut daemon, "echo");
+        let (window, daemon) = harness(cx);
+        typed_into_the_gap_then_handed_back(cx, &window, &daemon, "echo");
 
         // `home` moves the caret and nothing else: any editor key is enough.
         press(&window, cx, "home");
@@ -16370,7 +16195,7 @@ mod prompt_handover_tests {
             })
             .unwrap();
         assert_eq!(
-            drain(&mut daemon),
+            drain(&daemon),
             Vec::<u8>::new(),
             "taking the line over owes the wipe, it does not send it early"
         );
@@ -16378,7 +16203,7 @@ mod prompt_handover_tests {
         press(&window, cx, "enter");
         cx.run_until_parked();
         assert_eq!(
-            drain(&mut daemon),
+            drain(&daemon),
             b"\x15echo\r".to_vec(),
             "the owed wipe is paid on submit, still in front of the line"
         );
@@ -16390,8 +16215,8 @@ mod prompt_handover_tests {
     /// entry with the text the shell was holding glued to its front.
     #[gpui::test]
     fn recalling_history_in_the_gap_window_replaces_the_held_line(cx: &mut TestAppContext) {
-        let (window, mut daemon) = harness(cx);
-        typed_into_the_gap_then_handed_back(cx, &window, &mut daemon, "echo");
+        let (window, daemon) = harness(cx);
+        typed_into_the_gap_then_handed_back(cx, &window, &daemon, "echo");
         window
             .update(cx, |view, _, _| {
                 view.history.push("echo from history".to_string());
@@ -16413,7 +16238,7 @@ mod prompt_handover_tests {
         press(&window, cx, "enter");
         cx.run_until_parked();
         assert_eq!(
-            drain(&mut daemon),
+            drain(&daemon),
             b"\x15echo from history\r".to_vec(),
             "the recalled entry runs on its own, with the held text replaced \
              rather than prefixed to it"
@@ -16426,12 +16251,10 @@ mod prompt_handover_tests {
     /// hole `GapHold::pasted` closed for the hold's own route.
     #[gpui::test]
     fn a_paste_held_in_the_gap_is_still_a_paste_after_the_handover(cx: &mut TestAppContext) {
-        let (window, mut daemon) = harness(cx);
+        let (window, daemon) = harness(cx);
         // Bracketed paste is what a live prompt advertises; without it there is
         // no framing to lose in the first place.
-        DaemonMsg::Output(b"\x1b[?2004h".to_vec())
-            .encode(&mut daemon)
-            .unwrap();
+        daemon.send(DaemonMsg::Output(b"\x1b[?2004h".to_vec()));
         settle(cx, &window, "the shell turns bracketed paste on", |view| {
             view.terminal
                 .term
@@ -16440,17 +16263,13 @@ mod prompt_handover_tests {
                 .contains(TermMode::BRACKETED_PASTE)
         });
 
-        prompt(&mut daemon, true);
-        DaemonMsg::Output(b"\x1b]133;B\x07".to_vec())
-            .encode(&mut daemon)
-            .unwrap();
+        prompt(&daemon, true);
+        daemon.send(DaemonMsg::Output(b"\x1b]133;B\x07".to_vec()));
         settle(cx, &window, "the editor takes the first prompt", |view| {
             view.input_active() && view.terminal.zle_reading()
         });
-        prompt(&mut daemon, false);
-        DaemonMsg::Output(b"\x1b]133;C\x07".to_vec())
-            .encode(&mut daemon)
-            .unwrap();
+        prompt(&daemon, false);
+        daemon.send(DaemonMsg::Output(b"\x1b]133;C\x07".to_vec()));
         settle(cx, &window, "a command takes the pane", |view| {
             !view.input_active()
         });
@@ -16461,12 +16280,12 @@ mod prompt_handover_tests {
         cx.executor().advance_clock(HOLD_WINDOW * 2);
         cx.run_until_parked();
         assert_eq!(
-            drain(&mut daemon),
+            drain(&daemon),
             b"\x1b[200~echo hi\x1b[201~".to_vec(),
             "the hold window gives up and dumps the paste as a paste"
         );
 
-        prompt(&mut daemon, true);
+        prompt(&daemon, true);
         settle(cx, &window, "the editor takes the prompt back", |view| {
             view.input_active()
         });
@@ -16474,7 +16293,7 @@ mod prompt_handover_tests {
         press(&window, cx, "enter");
         cx.run_until_parked();
         assert_eq!(
-            drain(&mut daemon),
+            drain(&daemon),
             b"\x15\x1b[200~echo hi\x1b[201~\r".to_vec(),
             "the replayed line keeps its framing instead of being typed at the \
              shell's binding table"
@@ -16485,8 +16304,8 @@ mod prompt_handover_tests {
     /// the shell's copy of it goes too instead of coming back at submit.
     #[gpui::test]
     fn clearing_the_line_in_the_gap_window_clears_the_held_text_too(cx: &mut TestAppContext) {
-        let (window, mut daemon) = harness(cx);
-        typed_into_the_gap_then_handed_back(cx, &window, &mut daemon, "echo");
+        let (window, daemon) = harness(cx);
+        typed_into_the_gap_then_handed_back(cx, &window, &daemon, "echo");
 
         press(&window, cx, "ctrl-u");
         cx.run_until_parked();
@@ -16497,7 +16316,7 @@ mod prompt_handover_tests {
         press(&window, cx, "enter");
         cx.run_until_parked();
         assert_eq!(
-            drain(&mut daemon),
+            drain(&daemon),
             b"\x15\r".to_vec(),
             "an emptied line submits empty: the wipe is still owed, the seed is not"
         );
@@ -16511,8 +16330,8 @@ mod prompt_handover_tests {
     /// above was reported as being over the status line.
     #[gpui::test]
     fn a_wheel_report_names_the_cell_under_the_pointer_not_the_last_click(cx: &mut TestAppContext) {
-        let (window, mut daemon) = harness(cx);
-        output(&mut daemon, b"\x1b[?1002h\x1b[?1006h");
+        let (window, daemon) = harness(cx);
+        output(&daemon, b"\x1b[?1002h\x1b[?1006h");
         settle(cx, &window, "the program asked for the mouse", |view| {
             view.mouse_mode()
         });
@@ -16540,7 +16359,7 @@ mod prompt_handover_tests {
             .unwrap();
         cx.run_until_parked();
         assert_eq!(
-            String::from_utf8(drain(&mut daemon)).unwrap(),
+            String::from_utf8(drain(&daemon)).unwrap(),
             "\x1b[<0;4;24M\x1b[<0;4;24m\x1b[<64;11;6M",
             "the notch is reported at the cell the pointer is over"
         );
@@ -16611,16 +16430,20 @@ mod prompt_handover_tests {
             gpui_component::init(cx);
             cx.set_global(Config::default());
         });
-        let (a_client, mut a_pty) = test_stream_pair();
-        let (b_client, mut b_pty) = test_stream_pair();
-        let window = cx.add_window(|window, cx| {
-            let pane = |link, window: &mut Window, cx: &mut Context<Split>| {
-                let terminal = RemoteTerminal::from_stream(link, TermSize::new(80, 24))
-                    .expect("link-backed terminal");
+        let (a_terminal, a_pty) = RemoteTerminal::from_pipe(
+            TermSize::new(80, 24),
+            crate::terminal::remote::PtySource::for_route(&crate::terminal::PaneRoute::Local),
+        );
+        let (b_terminal, b_pty) = RemoteTerminal::from_pipe(
+            TermSize::new(80, 24),
+            crate::terminal::remote::PtySource::for_route(&crate::terminal::PaneRoute::Local),
+        );
+        let window = cx.add_window(move |window, cx| {
+            let pane = |terminal, window: &mut Window, cx: &mut Context<Split>| {
                 cx.new(|cx| TerminalView::with_terminal(terminal, 1, window, cx))
             };
-            let a = pane(a_client, window, cx);
-            let b = pane(b_client, window, cx);
+            let a = pane(a_terminal, window, cx);
+            let b = pane(b_terminal, window, cx);
             Split { a, b }
         });
         let (a, b) = window
@@ -16628,8 +16451,8 @@ mod prompt_handover_tests {
             .unwrap();
 
         // Both panes run tmux with `mouse on`.
-        output(&mut a_pty, b"\x1b[?1002h\x1b[?1006h");
-        output(&mut b_pty, b"\x1b[?1002h\x1b[?1006h");
+        output(&a_pty, b"\x1b[?1002h\x1b[?1006h");
+        output(&b_pty, b"\x1b[?1002h\x1b[?1006h");
         let mut vcx = gpui::VisualTestContext::from_window(window.into(), cx);
         for _ in 0..300 {
             vcx.update(|window, _| window.refresh());
@@ -16718,9 +16541,9 @@ mod prompt_handover_tests {
             });
             vcx.run_until_parked();
         };
-        let text = |pty: &mut Stream| String::from_utf8(drain(pty)).unwrap();
+        let text = |pty: &TestLink| String::from_utf8(drain(pty)).unwrap();
         // Whatever the panes said while settling is not what this is about.
-        let _ = (text(&mut a_pty), text(&mut b_pty));
+        let _ = (text(&a_pty), text(&b_pty));
 
         // 1. A drag across the sidebar, the way one would drag a window by
         //    its title bar: neither pane saw the press, so neither hears it.
@@ -16731,7 +16554,7 @@ mod prompt_handover_tests {
         drag(&mut vcx, side(180.));
         up(&mut vcx, side(180.));
         assert_eq!(
-            (text(&mut a_pty), text(&mut b_pty)),
+            (text(&a_pty), text(&b_pty)),
             (String::new(), String::new()),
             "a drag outside every pane is no pane's business"
         );
@@ -16745,12 +16568,12 @@ mod prompt_handover_tests {
         up(&mut vcx, at(gb, 1., 5.));
         let last = ga.cols; // 1-based: the column A's grid ends on.
         assert_eq!(
-            text(&mut a_pty),
+            text(&a_pty),
             format!("\x1b[<0;3;4M\x1b[<32;5;4M\x1b[<32;{last};6M\x1b[<0;{last};6m"),
             "the pane the press landed in keeps the drag, clamped to its edge"
         );
         assert_eq!(
-            text(&mut b_pty),
+            text(&b_pty),
             "",
             "the pane beside it never saw the press, so it hears nothing"
         );

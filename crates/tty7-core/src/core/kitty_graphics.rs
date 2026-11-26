@@ -47,9 +47,8 @@ const MAX_APC_PAYLOAD: usize = MAX_TRANSMISSION_BASE64;
 /// This has to stay under [`crate::daemon::protocol::MAX_FRAME`] once decoded:
 /// base64 shrinks by 3/4, and [`Image::encode_frame`] prepends [`HEADER_LEN`]
 /// bytes, so the decoded payload must leave room for the header inside the wire
-/// frame. Blowing past `MAX_FRAME` would make `write_frame` fail, which the
-/// daemon's writer loop treats as fatal — one oversized image would drop the
-/// client's whole connection instead of just that frame. 48 MiB of base64 is
+/// frame. Blowing past `MAX_FRAME` is dropped before it is queued, so one
+/// oversized image does not stall the rest of the stream. 48 MiB of base64 is
 /// ~36 MB of pixels, comfortably more than a 4K full-window RGBA frame (~33 MB)
 /// and comfortably under the 64 MiB wire ceiling.
 const MAX_TRANSMISSION_BASE64: usize = 48 << 20; // 48 MiB
@@ -1796,9 +1795,8 @@ mod tests {
     #[test]
     fn a_transmission_cap_leaves_room_for_the_wire_frame() {
         // `MAX_TRANSMISSION_BASE64` has to decode to something that still fits
-        // in a `MAX_FRAME` wire frame with the header on it — otherwise
-        // `write_frame` fails, and the daemon's writer treats that as fatal and
-        // drops the client's whole connection over one image.
+        // in a `MAX_FRAME` message with the header on it — otherwise the image
+        // is dropped instead of queued.
         let decoded_max = MAX_TRANSMISSION_BASE64 / 4 * 3;
         assert!(
             decoded_max + HEADER_LEN <= crate::daemon::protocol::MAX_FRAME,

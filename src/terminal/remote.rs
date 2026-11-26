@@ -1,6 +1,4 @@
 use std::borrow::Cow;
-#[cfg(test)]
-use std::io::Read as _;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -21,11 +19,6 @@ use crate::core::cli_agent::{AgentSessionState, CLIAgent};
 use crate::core::config::CursorStyle as ConfigCursorStyle;
 use crate::core::osc::{Note, NoteBudget, OscTokenizer, TitleEffect, TitleLifetime};
 use crate::daemon::protocol::{ClientMsg, DaemonMsg, RemoteContext, ShellSpec, WinSize};
-#[cfg(unix)]
-pub(crate) type Stream = std::os::unix::net::UnixStream;
-#[cfg(windows)]
-pub(crate) type Stream = std::net::TcpStream;
-use gpui::EntityId;
 use tty7_core::core::term_modes::{Query, TerminalModes};
 
 use super::size::TermSize;
@@ -164,7 +157,7 @@ impl PtySource {
     /// `Unroutable` is a route that could not be resolved, so it never gets a
     /// pty at all; answering as if it were local costs nothing and keeps the
     /// match total.
-    fn for_route(route: &PaneRoute) -> PtySource {
+    pub(super) fn for_route(route: &PaneRoute) -> PtySource {
         let _ = route;
         if cfg!(windows) {
             PtySource::LocalConpty
@@ -209,22 +202,6 @@ impl PaneRoute {
     }
 }
 
-/// How much unsent input a pane holds before it calls the link lost. A link
-/// that is draining never gets near this: the sender thread is parked waiting
-/// for work, so the queue holds at most the frames of one burst. Reaching it
-/// means nothing on the far side has taken a byte for as long as it takes to
-/// type — or paste — four megabytes, which is a dead link, not a slow one.
-const MAX_BACKLOG: usize = 4 << 20;
-
-/// How long a teardown lets the sender finish what is already queued before it
-/// cuts the socket out from under it. `Detach` is the last frame a pane sends
-/// and it is worth a moment: on a draining link the sender is idle, so it goes
-/// out in microseconds and this returns at once. On a link that has stopped
-/// draining it will never go out at all, and closing the pane must not wait
-/// around to discover that — the daemon reads the closed socket as a detach
-/// anyway.
-const DRAIN_GRACE: std::time::Duration = std::time::Duration::from_millis(50);
-
 /// How long a resize the daemon promised to echo is taken to still be on its
 /// way. Past this, a grid that has not reached the requested geometry is not
 /// waiting on anything: the request or its echo went missing, and the size is
@@ -241,274 +218,6 @@ fn grid_holds(term: &Term<EventProxy>, size: TermSize) -> bool {
     use alacritty_terminal::term::{MIN_COLUMNS, MIN_SCREEN_LINES};
     term.columns() == size.cols.max(MIN_COLUMNS)
         && term.screen_lines() == size.rows.max(MIN_SCREEN_LINES)
-}
-
-/// What the sender thread needs to report a link that stopped taking input.
-/// The signals the pane holds, cloned out so the failure can be raised from the
-/// thread that actually meets it.
-#[derive(Clone)]
-struct InputLoss {
-    /// Set by the first frame *this* link refused, so the loss is said once
-    /// rather than once per keystroke. One per link rather than one per pane: a
-    /// relink hands the retired sender's last, doomed write and the new
-    /// sender's first real one two different flags, so the dying link cannot
-    /// spend the new link's one chance to speak.
-    said: Arc<AtomicBool>,
-    reader_quit: Arc<AtomicBool>,
-    exited: Arc<AtomicBool>,
-    proxy: EventProxy,
-}
-
-impl InputLoss {
-    fn new(reader_quit: Arc<AtomicBool>, exited: Arc<AtomicBool>, proxy: EventProxy) -> InputLoss {
-        InputLoss {
-            said: Arc::new(AtomicBool::new(false)),
-            reader_quit,
-            exited,
-            proxy,
-        }
-    }
-
-    /// The link refused a frame. Every keystroke after the first would say the
-    /// same thing, so this side says it once; and unless the reader has been
-    /// retired for a relink or a release, the pane is marked exited the way the
-    /// reader marks it on EOF — it is the same socket, noticed from the writing
-    /// side first — so the window shows the pane as gone instead of taking
-    /// input into it that nothing will ever read. The reader still raises its
-    /// own `Exit` when it finds the same socket closed; the handler is
-    /// idempotent, so a link that is genuinely gone may be reported twice.
-    ///
-    /// This is hardening for a *closed* link, not the cure for #673: a socket
-    /// some process holds open and never reads accepts writes into its send
-    /// buffer, so they succeed and vanish until the buffer fills, and nothing
-    /// here fires until the backlog bound does. What stops that pane existing
-    /// at all is `attach_on` refusing to call a silent `Attach` attached.
-    fn note(&self, err: &std::io::Error) {
-        if self.said.swap(true, Ordering::SeqCst) {
-            return;
-        }
-        log::warn!("the daemon link stopped taking this pane's input: {err}");
-        if self.reader_quit.load(Ordering::SeqCst) {
-            return;
-        }
-        self.exited.store(true, Ordering::SeqCst);
-        self.proxy.send_event(AlacEvent::Wakeup);
-        self.proxy.send_event(AlacEvent::Exit);
-    }
-}
-
-#[derive(Default)]
-struct SendQueue {
-    frames: VecDeque<Vec<u8>>,
-    /// Bytes queued but not yet on the wire — including the batch the sender
-    /// currently holds, which is why this is not just `frames`' total. That
-    /// batch is exactly what a stalled link parks in, so leaving it out would
-    /// mean the backlog bound could never be reached.
-    bytes: usize,
-    /// How much of `bytes` belongs to frames that were over the whole bound on
-    /// their own, and so were let through on their own terms. The bound is
-    /// raised by exactly this while they are outstanding, and put back the
-    /// moment the queue empties — otherwise one big paste would leave every
-    /// keystroke behind it looking like a dead link.
-    oversize: usize,
-    /// Set by teardown, or by a sender that has given up: either way the queue
-    /// takes nothing more. Teardown's sender writes what is left first.
-    closing: bool,
-    /// Set by the sender once there is nothing left to write. Teardown waits
-    /// on this for `DRAIN_GRACE`, no longer.
-    drained: bool,
-}
-
-/// A pane's writing half, moved onto a thread of its own.
-///
-/// The socket underneath is blocking and has no write timeout, so a peer that
-/// stops reading parks `write(2)` in the kernel until it starts again. Every
-/// caller of `RemoteTerminal::write` is a gpui event handler — a keystroke, a
-/// paste, a mouse report, a focus change — and one UI thread draws every
-/// window, so a park there is every window frozen. On macOS a unix stream gives
-/// up after 8K of send buffer, which is about 1400 keystrokes: a single paste.
-///
-/// So nothing on the UI thread touches the socket. Frames are encoded, queued,
-/// and handed to a sender thread that is welcome to park for as long as the far
-/// end makes it.
-struct LinkWriter {
-    /// A second handle on the same socket, kept for `shutdown` alone.
-    /// `shutdown(2)` returns at once even while another thread is parked in
-    /// `write(2)` on that socket — which is exactly the state teardown has to
-    /// be able to break, and exactly what a handle behind the sender's own lock
-    /// could not do.
-    closer: Stream,
-    queue: Arc<(Mutex<SendQueue>, std::sync::Condvar)>,
-    loss: InputLoss,
-    thread: Option<JoinHandle<()>>,
-}
-
-impl LinkWriter {
-    fn new(stream: Stream, loss: InputLoss) -> std::io::Result<LinkWriter> {
-        let closer = stream.try_clone()?;
-        let queue = Arc::new((Mutex::new(SendQueue::default()), std::sync::Condvar::new()));
-        let sending = Arc::clone(&queue);
-        let sender_loss = loss.clone();
-        let thread = std::thread::Builder::new()
-            .name("tty7-pane-writer".into())
-            .spawn(move || send_loop(stream, sending, sender_loss))?;
-        Ok(LinkWriter {
-            closer,
-            queue,
-            loss,
-            thread: Some(thread),
-        })
-    }
-
-    /// Queues a frame. Never blocks: the socket belongs to the sender thread,
-    /// and the only thing that happens here is a push onto a `VecDeque`.
-    fn send(&self, msg: ClientMsg) {
-        let mut frame = Vec::new();
-        if let Err(e) = msg.encode(&mut frame) {
-            log::warn!("could not encode a frame for this pane's link: {e}");
-            return;
-        }
-        let (lock, wake) = &*self.queue;
-        let Ok(mut q) = lock.lock() else { return };
-        if q.closing {
-            return;
-        }
-        // A frame over the bound all by itself is not a backlog — a paste is
-        // whatever the clipboard holds, and refusing a big one would kill a
-        // perfectly healthy pane. Onto an empty queue it goes through anyway,
-        // and lifts the bound by its own size for as long as it is outstanding,
-        // so what piles up behind it is still held to the same four megabytes.
-        // Onto a queue that already has something on it, the ordinary bound
-        // applies: one such frame is a paste, a second one arriving before the
-        // first has moved is a link that is not moving.
-        let oversize = frame.len() > MAX_BACKLOG && q.bytes == 0;
-        if !oversize && q.bytes + frame.len() > MAX_BACKLOG + q.oversize {
-            // Dropped rather than queued: a backlog this deep is a link nothing
-            // is reading, and growing it only trades a frozen window for an
-            // exhausted heap. Reported in the same words, and once, as a write
-            // the link refuses outright — the pane is gone either way.
-            drop(q);
-            self.loss.note(&std::io::Error::new(
-                std::io::ErrorKind::WouldBlock,
-                format!("nothing has drained this pane's link for {MAX_BACKLOG} bytes of input"),
-            ));
-            return;
-        }
-        if oversize {
-            q.oversize = frame.len();
-        }
-        q.bytes += frame.len();
-        q.frames.push_back(frame);
-        q.drained = false;
-        drop(q);
-        wake.notify_one();
-    }
-
-    /// Retires the sender and cuts the link. Gives what is queued `DRAIN_GRACE`
-    /// to go out — see the constant — and then shuts the socket down whether it
-    /// went or not. Never joins: a sender parked on a dead link would take the
-    /// UI thread down with it, the same trap `stop_reader` documents.
-    ///
-    /// Called twice on the way out — `stop_reader` closes the link, then the
-    /// field drop closes it again — so the second call has to be free rather
-    /// than another `DRAIN_GRACE` spent waiting for a sender that is already
-    /// gone. A retired handle is one whose thread has been let go.
-    fn close(&mut self) {
-        if self.thread.is_none() {
-            return;
-        }
-        let (lock, wake) = &*self.queue;
-        if let Ok(mut q) = lock.lock() {
-            q.closing = true;
-            wake.notify_one();
-            if let Ok((waited, _)) = wake.wait_timeout_while(q, DRAIN_GRACE, |q| !q.drained) {
-                drop(waited);
-            }
-        }
-        let _ = self.closer.shutdown(std::net::Shutdown::Both);
-        drop(self.thread.take());
-    }
-}
-
-impl Drop for LinkWriter {
-    fn drop(&mut self) {
-        self.close();
-    }
-}
-
-fn send_loop(
-    mut stream: Stream,
-    queue: Arc<(Mutex<SendQueue>, std::sync::Condvar)>,
-    loss: InputLoss,
-) {
-    use std::io::Write as _;
-    let (lock, wake) = &*queue;
-
-    // Abandons whatever is still queued and reports the link settled. Wakes a
-    // teardown that is inside `DRAIN_GRACE` waiting to hear it: what is left
-    // here is never going out, and there is nothing to be gained by making the
-    // window sit out the rest of the grace period to find that out. Closes the
-    // queue on the way, too — with no thread left to drain it, anything queued
-    // after this is just a keystroke held onto until the pane drops.
-    let give_up = || {
-        if let Ok(mut q) = lock.lock() {
-            q.frames.clear();
-            q.bytes = 0;
-            q.oversize = 0;
-            q.closing = true;
-            q.drained = true;
-            wake.notify_all();
-        }
-    };
-
-    loop {
-        let batch = {
-            let Ok(mut q) = lock.lock() else { return };
-            loop {
-                if !q.frames.is_empty() {
-                    break;
-                }
-                // Nothing left to write, so the link is as flushed as this
-                // thread can make it. Said before the `closing` check, so a
-                // teardown racing a sender that has already finished hears it
-                // rather than waiting out `DRAIN_GRACE` for nothing.
-                q.drained = true;
-                wake.notify_all();
-                if q.closing {
-                    return;
-                }
-                let Ok(next) = wake.wait(q) else { return };
-                q = next;
-            }
-            std::mem::take(&mut q.frames)
-        };
-        // Counted against the backlog until it is actually out. Discounting it
-        // at the moment it left the `VecDeque` would let a sender parked on the
-        // first frame of a huge batch hold the whole thing off the books, and
-        // the bound the batch is meant to enforce would never be reached.
-        let taken: usize = batch.iter().map(Vec::len).sum();
-        // Written with the lock released: parking here is the whole point, and
-        // a sender holding the queue lock while it parked would put every
-        // `send` — every keystroke — behind the same wait it exists to absorb.
-        for frame in batch {
-            if let Err(e) = stream.write_all(&frame) {
-                loss.note(&e);
-                give_up();
-                return;
-            }
-        }
-        if let Err(e) = stream.flush() {
-            loss.note(&e);
-            give_up();
-            return;
-        }
-        if let Ok(mut q) = lock.lock() {
-            q.bytes = q.bytes.saturating_sub(taken);
-            if q.bytes == 0 {
-                q.oversize = 0;
-            }
-        }
-    }
 }
 
 struct PaneHold {
@@ -544,14 +253,16 @@ pub fn shutdown_panes() {
 }
 
 enum Downlink {
-    Frames(LinkWriter),
+    /// The pane lives in this process. Input and resize go straight to it.
     Pane(Arc<PaneHold>),
+    /// Tests: keystrokes and resizes land in a channel the fixture reads.
+    #[cfg(test)]
+    TestSink(std::sync::mpsc::Sender<ClientMsg>),
 }
 
 impl Downlink {
     fn send(&self, msg: ClientMsg) {
         match self {
-            Downlink::Frames(writer) => writer.send(msg),
             Downlink::Pane(hold) => {
                 let Some(pane) = hold.pane.lock().ok().and_then(|guard| guard.clone()) else {
                     return;
@@ -561,58 +272,24 @@ impl Downlink {
                     ClientMsg::Resize(size) => pane.resize(size),
                 }
             }
+            #[cfg(test)]
+            Downlink::TestSink(tx) => {
+                let _ = tx.send(msg);
+            }
         }
     }
 
-    fn close(&mut self) {
-        if let Downlink::Frames(writer) = self {
-            writer.close();
-        }
-    }
-
-    #[cfg(test)]
-    fn shutdown_write(&self) -> std::io::Result<()> {
+    fn pane_hold(&self) -> Option<&Arc<PaneHold>> {
         match self {
-            Downlink::Frames(writer) => writer.closer.shutdown(std::net::Shutdown::Write),
-            Downlink::Pane(_) => Ok(()),
+            Downlink::Pane(hold) => Some(hold),
+            #[cfg(test)]
+            Downlink::TestSink(_) => None,
         }
     }
 }
 
-/// The pane reader's inbox. The live terminal shares a coalescing pipe with
-/// the PTY reader; tests and a relink still speak discrete frames.
-enum Inbox {
-    /// Discrete frames. Built by the tests and a relink; the live pane uses
-    /// [`Live`](Self::Live).
-    #[cfg_attr(not(test), allow(dead_code))]
-    Mpsc(std::sync::mpsc::Receiver<DaemonMsg>),
-    Live(tty7_core::daemon::pane::OutputRx),
-}
-
-impl Inbox {
-    fn recv_timeout(
-        &self,
-        timeout: std::time::Duration,
-    ) -> Result<DaemonMsg, std::sync::mpsc::RecvTimeoutError> {
-        match self {
-            Inbox::Mpsc(rx) => rx.recv_timeout(timeout),
-            Inbox::Live(rx) => rx.recv_timeout(timeout),
-        }
-    }
-
-    fn try_recv(&self) -> Result<DaemonMsg, std::sync::mpsc::TryRecvError> {
-        match self {
-            Inbox::Mpsc(rx) => rx.try_recv(),
-            Inbox::Live(rx) => rx.try_recv(),
-        }
-    }
-
-    fn recycle(&self, buf: Vec<u8>) {
-        if let Inbox::Live(rx) = self {
-            rx.recycle(buf);
-        }
-    }
-}
+/// The pane reader's inbox: the coalescing pipe shared with the producer.
+type Inbox = tty7_core::daemon::pane::OutputRx;
 
 /// Bytes the output gate charged for this frame, including output appended into one buffer.
 fn queued_gate_len(msg: &DaemonMsg) -> usize {
@@ -624,37 +301,36 @@ fn queued_gate_len(msg: &DaemonMsg) -> usize {
     }
 }
 
+/// Bidirectional stand-in for the pane link. `send` feeds the same coalescing
+/// pipe the live reader drains; `recv_client` is what the pane would have read.
 #[cfg(test)]
-fn start_decoder(stream: Stream, buffered: Vec<u8>) -> std::sync::mpsc::Receiver<DaemonMsg> {
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::Builder::new()
-        .name("tty7-frame-decode".to_string())
-        .spawn(move || decode_frames(stream, buffered, tx))
-        .expect("spawn frame decoder");
-    rx
+pub(crate) struct TestLink {
+    tx: tty7_core::daemon::pane::OutputTx,
+    client_rx: std::sync::mpsc::Receiver<ClientMsg>,
 }
 
 #[cfg(test)]
-fn decode_frames(mut stream: Stream, mut pending: Vec<u8>, tx: std::sync::mpsc::Sender<DaemonMsg>) {
-    let mut buf = vec![0u8; 256 * 1024];
-    loop {
-        match crate::daemon::protocol::take_frame(&mut pending) {
-            Ok(Some((kind, payload))) => match DaemonMsg::from_frame(kind, payload) {
-                Ok(msg) => {
-                    if tx.send(msg).is_err() {
-                        return;
-                    }
-                }
-                Err(_) => return,
-            },
-            Ok(None) => match stream.read(&mut buf) {
-                Ok(0) => return,
-                Ok(n) => pending.extend_from_slice(&buf[..n]),
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(_) => return,
-            },
-            Err(_) => return,
-        }
+impl TestLink {
+    /// Push one daemon message. `Output` goes through the pipe's append path, so
+    /// consecutive output coalesces the way a live pane's pipe does.
+    pub(crate) fn send(&self, msg: DaemonMsg) {
+        let _ = self.tx.push(msg);
+    }
+
+    pub(crate) fn recv_client(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Result<ClientMsg, std::sync::mpsc::RecvTimeoutError> {
+        self.client_rx.recv_timeout(timeout)
+    }
+
+    pub(crate) fn try_recv_client(&self) -> Result<ClientMsg, std::sync::mpsc::TryRecvError> {
+        self.client_rx.try_recv()
+    }
+
+    /// Drop the output sender so the reader sees the pipe close.
+    pub(crate) fn close(self) {
+        drop(self.tx);
     }
 }
 
@@ -706,13 +382,10 @@ pub struct RemoteTerminal {
     #[allow(dead_code)]
     proxy: EventProxy,
     reader_thread: Option<JoinHandle<()>>,
-    /// Tells the *current* reader thread to bow out. Teardown must never wait
-    /// for the reader: on Windows, `shutdown()` does not wake a thread parked
-    /// in a blocking `read()` on the same socket, so joining it from the UI
-    /// thread hangs the whole window whenever the peer has gone silent (the
-    /// exact state a zombie SSH leg leaves behind). The reader re-checks this
-    /// flag under the term lock before every grid mutation, so once it is set
-    /// the abandoned thread can only exit, never write.
+    /// Tells the current reader thread to exit. Detach does not join it: the
+    /// reader blocks on the output pipe, and waiting on a silent pipe would
+    /// stall the UI thread. The reader checks this flag before it mutates the
+    /// grid, so once it is set the abandoned thread only exits.
     reader_quit: Arc<AtomicBool>,
     /// Whether this pane's pty is a ConPTY, for input encoding and repairing
     /// the cursor a repaint parks. Held here so a relink hands the same answer
@@ -821,13 +494,12 @@ impl RemoteTerminal {
             .unwrap_or_else(|e| e.into_inner())
             .insert(id, Arc::clone(&hold));
         let mut term = Self::assemble(
-            Inbox::Live(inbox),
+            inbox,
             Some(drain),
             size,
             PtySource::for_route(route),
-            None,
-            Some(hold),
-        )?;
+            Downlink::Pane(hold),
+        );
         term.direct = true;
         term.pane_id = Some(id);
         term.route = route.clone();
@@ -849,38 +521,14 @@ impl RemoteTerminal {
         }
     }
 
-    /// A pane on a pty of this machine's own — what the tests build, and what
-    /// `spawn_on` narrows with the route it dialled.
+    /// A terminal whose pane link is an in-memory pipe. `direct` stays false:
+    /// a test that wants resize-echo semantics sets it.
     #[cfg(test)]
-    pub(super) fn from_stream(stream: Stream, size: TermSize) -> anyhow::Result<Self> {
-        Self::from_stream_with(
-            stream,
-            size,
-            Vec::new(),
-            PtySource::for_route(&PaneRoute::Local),
-        )
-    }
-
-    #[cfg(test)]
-    pub(super) fn from_stream_with(
-        stream: Stream,
-        size: TermSize,
-        buffered: Vec<u8>,
-        pty: PtySource,
-    ) -> anyhow::Result<Self> {
-        Self::from_stream_parts(stream, size, buffered, pty)
-    }
-
-    #[cfg(test)]
-    fn from_stream_parts(
-        stream: Stream,
-        size: TermSize,
-        buffered: Vec<u8>,
-        pty: PtySource,
-    ) -> anyhow::Result<Self> {
-        let read_half = stream.try_clone()?;
-        let inbox = start_decoder(read_half, buffered);
-        Self::assemble(Inbox::Mpsc(inbox), None, size, pty, Some(stream), None)
+    pub(crate) fn from_pipe(size: TermSize, pty: PtySource) -> (Self, TestLink) {
+        let (tx, rx) = tty7_core::daemon::pane::output_pipe();
+        let (client_tx, client_rx) = std::sync::mpsc::channel();
+        let term = Self::assemble(rx, None, size, pty, Downlink::TestSink(client_tx));
+        (term, TestLink { tx, client_rx })
     }
 
     fn assemble(
@@ -888,9 +536,8 @@ impl RemoteTerminal {
         drain: Option<Arc<tty7_core::daemon::pane::OutputGate>>,
         size: TermSize,
         pty: PtySource,
-        write_half: Option<Stream>,
-        hold: Option<Arc<PaneHold>>,
-    ) -> anyhow::Result<Self> {
+        link: Downlink,
+    ) -> Self {
         let (tx, rx) = smol::channel::unbounded();
         let wakeup_pending = Arc::new(AtomicBool::new(false));
         let proxy = EventProxy {
@@ -949,18 +596,7 @@ impl RemoteTerminal {
             },
         );
 
-        let link = match (write_half, hold) {
-            (Some(stream), _) => Downlink::Frames(LinkWriter::new(
-                stream,
-                InputLoss::new(reader_quit.clone(), exited_flag.clone(), proxy.clone()),
-            )?),
-            (None, Some(hold)) => Downlink::Pane(hold),
-            (None, None) => {
-                return Err(anyhow::anyhow!("a terminal needs a pane or a frame stream"));
-            }
-        };
-
-        Ok(Self {
+        Self {
             term,
             events,
             palette: super::palette::build(),
@@ -993,7 +629,7 @@ impl RemoteTerminal {
             color_scheme_updates,
             direct: false,
             pane_id: None,
-        })
+        }
     }
 
     pub fn detach_link(&mut self) {
@@ -1002,19 +638,11 @@ impl RemoteTerminal {
     }
 
     /// Retires the current reader thread without waiting for it. Joining is
-    /// not an option here: the callers run on the UI thread, and on Windows
-    /// `shutdown()` does not wake a reader parked in a blocking `read()`, so
-    /// against a silent peer the join would hang the whole window (the reader
-    /// only unblocks when the peer eventually closes — which a zombie SSH leg
-    /// never does). Instead the reader is told to quit and abandoned; it wakes
-    /// within one read-timeout tick, sees the flag, and exits without ever
-    /// touching the grid again.
+    /// not an option here: the callers run on the UI thread, and the reader
+    /// is parked on the output pipe. It is told to quit and abandoned; the
+    /// next poll sees the flag and the thread exits without touching the grid.
     fn stop_reader(&mut self) {
         self.reader_quit.store(true, Ordering::SeqCst);
-        // The sender owns the socket now, and closing it is its job: `close`
-        // gives whatever is queued a brief moment to go out and then shuts the
-        // socket down regardless, which is also what wakes the reader.
-        self.link.close();
         drop(self.reader_thread.take());
     }
 
@@ -1515,8 +1143,8 @@ impl RemoteTerminal {
                     flush_batch!();
 
                     // The read always times out within QUIT_POLL so a reader
-                    // parked on a silent link still notices `quit` promptly —
-                    // on Windows, `shutdown()` alone would never wake it.
+                    // parked on a silent pipe still notices `quit` promptly.
+                    // Detach never joins this thread.
                     const QUIT_POLL: std::time::Duration = std::time::Duration::from_millis(500);
                     let timeout = match processor.sync_timeout().sync_timeout() {
                         Some(deadline) => {
@@ -1611,11 +1239,10 @@ impl RemoteTerminal {
         self.color_scheme_updates.load(Ordering::Relaxed)
     }
 
-    /// Queues a keystroke — or a paste, or a mouse report — for the link.
+    /// Queues a keystroke — or a paste, or a mouse report — for the pane.
     ///
     /// Callers are gpui event handlers on the UI thread, so this returns
-    /// without touching the socket. A link that has stopped draining is a
-    /// problem for the sender thread, not for the window.
+    /// without waiting on the child.
     pub fn write<B: Into<Cow<'static, [u8]>>>(&self, bytes: B) {
         let bytes = bytes.into();
         if bytes.is_empty() {
@@ -1640,8 +1267,8 @@ impl RemoteTerminal {
     /// not hang the grid on an echo nobody promised.
     fn resize_echoed(&self) -> bool {
         // The pane's child is in this process and echoes `DaemonMsg::Size`
-        // when the resize lands. A socket fixture used by tests does not,
-        // unless the test says it is playing that daemon (`direct`).
+        // when the resize lands. A test link does not, unless the test says
+        // it is playing that daemon (`direct`).
         self.direct
     }
 
@@ -1836,35 +1463,9 @@ impl RemoteTerminal {
     }
 }
 
-#[cfg(test)]
-fn daemon_not_listening(err: &anyhow::Error) -> bool {
-    err.chain().any(|cause| {
-        cause.downcast_ref::<std::io::Error>().is_some_and(|io| {
-            matches!(
-                io.kind(),
-                std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
-            )
-        })
-    })
-}
-
-#[cfg(test)]
-fn daemon_disconnected_before_spawn_reply(err: &anyhow::Error) -> bool {
-    err.chain().any(|cause| {
-        cause.downcast_ref::<std::io::Error>().is_some_and(|io| {
-            matches!(
-                io.kind(),
-                std::io::ErrorKind::UnexpectedEof
-                    | std::io::ErrorKind::ConnectionReset
-                    | std::io::ErrorKind::BrokenPipe
-            )
-        })
-    })
-}
-
 impl Drop for RemoteTerminal {
     fn drop(&mut self) {
-        if let Downlink::Pane(hold) = &self.link {
+        if let Some(hold) = self.link.pane_hold() {
             release_hold(hold);
             if let Some(id) = self.pane_id {
                 live_panes()
@@ -1900,619 +1501,6 @@ fn stale_mode_resets(mode: TermMode) -> Vec<u8> {
     // The kitty keyboard flags are not reset here: no sequence clears their
     // stacks, so the caller does it through `Term::reset_keyboard_modes`.
     seq
-}
-
-/// Show a desktop notification.
-///
-/// Naming a `pane` makes the notification clickable where the platform supports
-/// it, so activating it reveals that pane. It is an `EntityId` on purpose: the
-/// tray dispatch identifies leaves by their gpui entity id, and taking a bare
-/// `u64` here is what lets a caller hand over a `pane_id` — a different number,
-/// assigned by the daemon — and get a notification that reveals nothing.
-///
-/// macOS always goes through `macos_notify`, clickable or not. Elsewhere, every
-/// other case (no pane, unsupported platform, Windows toast queue full) falls
-/// back to the plain `notify-rust` path below, which is why
-/// `try_clickable_notification` reports whether it took the job.
-pub(crate) fn notify_desktop_for_pane(title: Option<&str>, body: &str, pane: Option<EntityId>) {
-    let summary = sanitize_notification_text(title.unwrap_or("ntty7"), NOTIFY_TITLE_MAX);
-    let body = sanitize_notification_text(body, NOTIFY_BODY_MAX);
-
-    #[cfg(target_os = "macos")]
-    {
-        macos_notify::deliver(summary, body, pane.map(|p| p.as_u64()));
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        if let Some(pane) = pane
-            && try_clickable_notification(&summary, &body, pane.as_u64())
-        {
-            return;
-        }
-
-        std::thread::spawn(move || {
-            let mut notif = notify_rust::Notification::new();
-            notif.summary(&summary).body(&body);
-            // Without our own AUMID, the Windows backend falls back to
-            // PowerShell's — icon and name included. Only set ours once the
-            // shell has indexed a shortcut carrying it: for an AUMID it does
-            // not know, `show()` reports success and drops the toast, so the
-            // ugly fallback beats the branded one every time we are not sure.
-            #[cfg(target_os = "windows")]
-            if let Some(app_id) = crate::core::aumid::toast_app_id() {
-                notif.app_id(app_id);
-            }
-            let _ = notif.show();
-        });
-    }
-}
-
-/// Longest title / body we hand to a notification backend.
-///
-/// The text comes straight off the terminal (OSC 9/777 payloads, window
-/// titles, an agent's own status line), so it is attacker-shaped: arbitrarily
-/// long, and free to contain control bytes. Every backend truncates in its own
-/// ugly way, and on Windows a stray `ESC` makes the toast XML fail to parse and
-/// the whole notification disappear — so clamp both here, once, for all paths.
-const NOTIFY_TITLE_MAX: usize = 96;
-const NOTIFY_BODY_MAX: usize = 512;
-
-fn sanitize_notification_text(s: &str, max_chars: usize) -> String {
-    let mut out = String::new();
-    let mut taken = 0usize;
-    for ch in s.chars() {
-        // XML 1.0 allows exactly tab / LF / CR out of the control range.
-        if ch.is_control() && !matches!(ch, '\t' | '\n' | '\r') {
-            continue;
-        }
-        if taken == max_chars {
-            out.push('…');
-            break;
-        }
-        out.push(ch);
-        taken += 1;
-    }
-    out
-}
-
-/// What a click on a notification has to carry back: the pane to reveal.
-///
-/// On macOS it rides in the notification's `identifier`, which is the one
-/// field the center hands back verbatim on activation without a dictionary
-/// round trip. On Windows it is the toast's `launch` attribute, which comes
-/// back as the `invokedArgs` of a COM activation (`core::toast_activator`).
-/// Shape: `tty7-pane-<pid>-<leaf>-<seq>`.
-///
-/// The pid is what makes a stale identifier fail closed. Notifications outlive
-/// the process that sent them, and the center hands a click on one of those to
-/// whatever process now owns the bundle id — a relaunched tty7, or a second
-/// instance running alongside. A leaf id is a gpui entity id, which a fresh
-/// process hands out again in the same order, so without the pid that click
-/// would reveal an unrelated pane. On Windows that is the *only* kind of click
-/// a process COM launched for the purpose can receive. The sequence number
-/// keeps two notifications for the same pane apart — the center treats a
-/// repeated identifier as "replace the earlier one".
-#[cfg(any(target_os = "macos", target_os = "windows", test))]
-const NOTIFICATION_ID_PREFIX: &str = "tty7-pane-";
-
-#[cfg(any(target_os = "macos", target_os = "windows", test))]
-fn notification_identifier(leaf_id: u64) -> String {
-    use std::sync::atomic::AtomicU64;
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-    let pid = std::process::id();
-    format!("{NOTIFICATION_ID_PREFIX}{pid}-{leaf_id}-{seq}")
-}
-
-#[cfg(any(target_os = "macos", target_os = "windows", test))]
-fn leaf_id_in_identifier(identifier: &str) -> Option<u64> {
-    let rest = identifier.strip_prefix(NOTIFICATION_ID_PREFIX)?;
-    let (pid, rest) = rest.split_once('-')?;
-    if pid.parse::<u32>().ok()? != std::process::id() {
-        return None;
-    }
-    let (leaf_id, _seq) = rest.split_once('-')?;
-    leaf_id.parse().ok()
-}
-
-/// macOS notifications, straight to `NSUserNotificationCenter`.
-///
-/// This used to go through `mac-notification-sys` with `wait_for_click`, so a
-/// click could reveal the pane. The way that crate notices a click is to park
-/// the sending thread and, for every notification outstanding, add a repeating
-/// 0.5 s timer to the *main* run loop that calls `deliveredNotifications` — a
-/// synchronous XPC round trip — to see whether the banner is still there. A
-/// banner nobody clicks stays in Notification Center, so its timer never goes
-/// away. Sampled with nine outstanding: a fifth of the UI thread inside that
-/// XPC, every window juddering, and each agent turn adding one more timer.
-///
-/// Here the click arrives through the center's delegate, which is what the
-/// API is for: no parked thread, no timer, nothing on the main thread until
-/// the user actually clicks. The pane rides in the notification's identifier.
-///
-/// Nothing else may touch the center on this platform. `mac-notification-sys`
-/// installs a delegate of its own the first time it sends, the last
-/// `setDelegate:` wins, and `notify-rust` is that crate on macOS — so its
-/// `show` is never called here, only its `set_application`, which does not
-/// install one (that is what names a bare `cargo run` binary to the center).
-#[cfg(target_os = "macos")]
-#[allow(
-    deprecated,
-    reason = "UNUserNotificationCenter needs a signed, entitled bundle; NSUserNotification is what a bare binary can use"
-)]
-mod macos_notify {
-    use objc2::rc::{Retained, autoreleasepool};
-    use objc2::runtime::ProtocolObject;
-    use objc2::{AnyThread, define_class, msg_send};
-    use objc2_foundation::{
-        NSObject, NSObjectProtocol, NSString, NSUserNotification, NSUserNotificationCenter,
-        NSUserNotificationCenterDelegate,
-    };
-
-    define_class!(
-        // SAFETY: NSObject has no subclassing requirements; `Delegate` has no
-        // ivars and no `Drop`.
-        #[unsafe(super = NSObject)]
-        #[name = "Tty7NotificationDelegate"]
-        struct Delegate;
-
-        // SAFETY: `NSObjectProtocol` has no safety requirements.
-        unsafe impl NSObjectProtocol for Delegate {}
-
-        // SAFETY: `NSUserNotificationCenterDelegate` has no safety requirements.
-        unsafe impl NSUserNotificationCenterDelegate for Delegate {
-            /// Runs on the main thread, when the user clicks the banner or the
-            /// entry in Notification Center. A channel push, then the clicked
-            /// entry is dropped from the center — a one-way message, unlike the
-            /// `deliveredNotifications` round trip this module exists to avoid.
-            #[unsafe(method(userNotificationCenter:didActivateNotification:))]
-            fn did_activate(
-                &self,
-                center: &NSUserNotificationCenter,
-                notification: &NSUserNotification,
-            ) {
-                if let Some(leaf_id) = notification
-                    .identifier()
-                    .and_then(|id| super::leaf_id_in_identifier(&id.to_string()))
-                {
-                    super::reveal_pane(leaf_id);
-                }
-                center.removeDeliveredNotification(notification);
-            }
-        }
-    );
-
-    fn install_delegate() {
-        static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| {
-            // Name the delivering application to the center before it is first
-            // touched: the center drops requests from a process with no bundle
-            // identity, which is what a bare `cargo run` binary is. This
-            // swizzles `-[NSBundle bundleIdentifier]` for the main bundle to
-            // `com.github.ntty7` when LaunchServices knows that id (a bundled
-            // ntty7.app). It is not tty7's id: a machine that also has
-            // tty7.app installed must not have this process's notifications
-            // claimed by that bundle. When LaunchServices does not know the
-            // id, the swizzle's own default, `com.apple.Terminal`, is what the
-            // center sees. It can only be called once per process, so there is
-            // no second chance to pass a different name.
-            let _ = notify_rust::set_application("com.github.ntty7");
-            // SAFETY: `NSObject`'s `init` takes nothing and returns the object.
-            let delegate: Retained<Delegate> = unsafe { msg_send![Delegate::alloc(), init] };
-            let center = NSUserNotificationCenter::defaultUserNotificationCenter();
-            // SAFETY: `delegate` is a `Delegate`, which conforms to the protocol.
-            unsafe { center.setDelegate(Some(ProtocolObject::from_ref(&*delegate))) };
-            // The center holds its delegate unretained. Ours lives as long as
-            // the process, so it is simply never released.
-            std::mem::forget(delegate);
-        });
-    }
-
-    /// Hands the notification to the center and returns. `deliverNotification:`
-    /// is an XPC message, so it goes out on a short-lived thread rather than
-    /// from wherever the OSC sequence was parsed — never the UI thread.
-    pub(super) fn deliver(title: String, body: String, leaf_id: Option<u64>) {
-        std::thread::spawn(move || {
-            autoreleasepool(|_| {
-                install_delegate();
-                let notification = NSUserNotification::new();
-                notification.setTitle(Some(&NSString::from_str(&title)));
-                notification.setInformativeText(Some(&NSString::from_str(&body)));
-                if let Some(leaf_id) = leaf_id {
-                    let id = super::notification_identifier(leaf_id);
-                    notification.setIdentifier(Some(&NSString::from_str(&id)));
-                }
-                NSUserNotificationCenter::defaultUserNotificationCenter()
-                    .deliverNotification(&notification);
-            });
-        });
-    }
-}
-
-#[cfg(all(target_os = "windows", not(test)))]
-fn try_clickable_notification(title: &str, body: &str, leaf_id: u64) -> bool {
-    // An AUMID the shell has not indexed makes `Show` report success and drops
-    // the toast on the floor, so without one the notify-rust path — which
-    // deliberately keeps PowerShell's identity rather than lose the toast — is
-    // the only one that shows anything at all.
-    if crate::core::aumid::toast_app_id().is_none() {
-        return false;
-    }
-    let Some(tx) = toast_thread() else {
-        return false;
-    };
-    tx.try_send((
-        title.to_string(),
-        body.to_string(),
-        notification_identifier(leaf_id),
-    ))
-    .is_ok()
-}
-
-/// Title, body, and the `launch` identifier a click hands back.
-#[cfg(all(target_os = "windows", not(test)))]
-type ToastRequest = (String, String, String);
-
-/// Toasts are built, shown and kept on one dedicated thread.
-///
-/// A click reaches us two ways. The one that always works is COM activation
-/// (`core::toast_activator`): the shell calls our registered class with the
-/// toast's `launch` string, whether the click lands on the popup or on the
-/// toast in notification history, and whether or not this process is still
-/// the one that sent it. The other is the toast object's own `Activated`
-/// event, which fires only for the popup and only while the object is alive
-/// here — it is kept as the fallback for a shortcut that predates the toast
-/// activator (an all-users install from an older installer, which we cannot
-/// rewrite unelevated). Keeping the objects on a single thread also means the
-/// WinRT objects never cross a thread boundary.
-#[cfg(all(target_os = "windows", not(test)))]
-fn toast_thread() -> Option<&'static std::sync::mpsc::SyncSender<ToastRequest>> {
-    use std::sync::OnceLock;
-    use std::sync::mpsc::sync_channel;
-
-    static TX: OnceLock<Option<std::sync::mpsc::SyncSender<ToastRequest>>> = OnceLock::new();
-    TX.get_or_init(|| {
-        let (tx, rx) = sync_channel::<ToastRequest>(32);
-        std::thread::Builder::new()
-            .name("tty7-toasts".into())
-            .spawn(move || toast_loop(rx))
-            .map_err(|e| log::warn!("failed to start the toast thread: {e}"))
-            .ok()
-            .map(|_| tx)
-    })
-    .as_ref()
-}
-
-#[cfg(all(target_os = "windows", not(test)))]
-fn toast_loop(rx: std::sync::mpsc::Receiver<ToastRequest>) {
-    use std::collections::VecDeque;
-    use windows::UI::Notifications::ToastNotification;
-    use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx};
-
-    // MTA lets the Activated callback run on a thread-pool thread without a
-    // message loop of our own.
-    unsafe {
-        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
-    }
-
-    // How many recent popups keep their `Activated` fallback. Dropping the
-    // oldest is what bounds the memory here; the popup is long gone by then,
-    // and the COM path does not depend on these objects at all.
-    const MAX_LIVE_TOASTS: usize = 32;
-    let mut live: VecDeque<ToastNotification> = VecDeque::new();
-
-    while let Ok((title, body, launch)) = rx.recv() {
-        if let Some(toast) = show_windows_toast(&title, &body, launch) {
-            if live.len() == MAX_LIVE_TOASTS {
-                live.pop_front();
-            }
-            live.push_back(toast);
-        }
-    }
-}
-
-/// The toast's XML. `launch` is what Windows hands back on a click — as the
-/// `invokedArgs` of a COM activation, and as the `Arguments` of the in-process
-/// `Activated` event.
-#[cfg(any(target_os = "windows", test))]
-fn toast_xml(title: &str, body: &str, launch: &str) -> String {
-    format!(
-        r#"<toast launch="{}" activationType="foreground">
-  <visual>
-    <binding template="ToastText02">
-      <text id="1">{}</text>
-      <text id="2">{}</text>
-    </binding>
-  </visual>
-</toast>"#,
-        xml_escape(launch),
-        xml_escape(title),
-        xml_escape(body)
-    )
-}
-
-#[cfg(all(target_os = "windows", not(test)))]
-fn show_windows_toast(
-    title: &str,
-    body: &str,
-    launch: String,
-) -> Option<windows::UI::Notifications::ToastNotification> {
-    use windows::Data::Xml::Dom::XmlDocument;
-    use windows::Foundation::TypedEventHandler;
-    use windows::UI::Notifications::{ToastNotification, ToastNotificationManager};
-    use windows::core::IInspectable;
-
-    let app_id = crate::core::aumid::toast_app_id()?;
-
-    let xml = toast_xml(title, body, &launch);
-
-    let doc = match XmlDocument::new() {
-        Ok(d) => {
-            if let Err(e) = d.LoadXml(&xml.into()) {
-                log::warn!("failed to load toast xml: {e}");
-                return None;
-            }
-            d
-        }
-        Err(e) => {
-            log::warn!("failed to create toast xml document: {e}");
-            return None;
-        }
-    };
-
-    let toast = match ToastNotification::CreateToastNotification(&doc) {
-        Ok(t) => t,
-        Err(e) => {
-            log::warn!("failed to create toast notification: {e}");
-            return None;
-        }
-    };
-
-    if let Err(e) = toast.Activated(&TypedEventHandler::new(
-        move |_sender: &Option<ToastNotification>, _args: &Option<IInspectable>| {
-            toast_activated(&launch);
-            Ok(())
-        },
-    )) {
-        log::warn!("failed to register toast activated handler: {e}");
-    }
-
-    let notifier = match ToastNotificationManager::CreateToastNotifierWithId(&app_id.into()) {
-        Ok(n) => n,
-        Err(e) => {
-            log::warn!("failed to create toast notifier: {e}");
-            return None;
-        }
-    };
-
-    if let Err(e) = notifier.Show(&toast) {
-        log::warn!("failed to show toast: {e}");
-        return None;
-    }
-
-    Some(toast)
-}
-
-/// What a click on a Windows toast asks for. A pane this process notified
-/// about is revealed; anything else — a toast from an earlier tty7, one
-/// without a pane, a launch string we do not recognize — still brings tty7
-/// forward, which is what the user clicked a tty7 toast for.
-/// What a toast click used to ask the tray to do. The tray is gone, so a
-/// click is recorded and otherwise ignored; the variants stay so the launch
-/// string is still parsed.
-#[cfg(any(target_os = "windows", test))]
-#[derive(Debug, PartialEq, Eq)]
-enum ToastClick {
-    RevealPane { leaf_id: u64 },
-    ShowWindow,
-}
-
-#[cfg(any(target_os = "windows", test))]
-fn toast_click_action(launch: &str) -> ToastClick {
-    match leaf_id_in_identifier(launch) {
-        Some(leaf_id) => ToastClick::RevealPane { leaf_id },
-        None => ToastClick::ShowWindow,
-    }
-}
-
-/// The last few `launch` strings acted on. A click on the popup can arrive
-/// twice — through COM and through the toast object's `Activated` event — and
-/// must reveal once. Identifiers are unique per toast, so a repeat is that
-/// same click; an empty one (a toast without a pane) is never deduplicated.
-#[cfg(any(target_os = "windows", test))]
-#[derive(Default)]
-struct RecentActivations(std::collections::VecDeque<String>);
-
-#[cfg(any(target_os = "windows", test))]
-impl RecentActivations {
-    const KEEP: usize = 8;
-
-    fn first_time(&mut self, launch: &str) -> bool {
-        if launch.is_empty() {
-            return true;
-        }
-        if self.0.iter().any(|seen| seen == launch) {
-            return false;
-        }
-        if self.0.len() == Self::KEEP {
-            self.0.pop_front();
-        }
-        self.0.push_back(launch.to_string());
-        true
-    }
-}
-
-/// A click on a tty7 toast, from whichever path delivered it. Runs on a COM or
-/// WinRT callback thread, so it only touches the tray channel — queued there
-/// when this process has no dispatch loop yet (a launch COM made to deliver
-/// the click).
-#[cfg(target_os = "windows")]
-#[cfg_attr(test, allow(dead_code))]
-pub(crate) fn toast_activated(launch: &str) {
-    static RECENT: std::sync::Mutex<RecentActivations> =
-        std::sync::Mutex::new(RecentActivations(std::collections::VecDeque::new()));
-    let first = RECENT
-        .lock()
-        .map(|mut recent| recent.first_time(launch))
-        .unwrap_or(true);
-    if first {
-        let _ = toast_click_action(launch);
-    }
-}
-
-/// Ask the tray dispatch loop to bring `leaf_id` to the front. Runs on whatever
-/// thread the platform hands the activation to, so it only touches the channel.
-#[cfg(target_os = "macos")]
-fn reveal_pane(leaf_id: u64) {
-    // Click-to-reveal went with the tray. The banner still dismisses.
-    let _ = leaf_id;
-}
-
-#[cfg(not(any(target_os = "macos", all(target_os = "windows", not(test)))))]
-fn try_clickable_notification(_title: &str, _body: &str, _leaf_id: u64) -> bool {
-    // Linux notifications go through notify-rust; click-to-reveal would need a
-    // D-Bus action listener of its own.
-    false
-}
-
-#[cfg(any(target_os = "windows", test))]
-fn xml_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&apos;")
-}
-
-#[cfg(test)]
-mod notification_tests {
-    use super::*;
-
-    #[test]
-    fn a_notification_identifier_carries_its_pane_back_out() {
-        let id = notification_identifier(42);
-        assert_eq!(leaf_id_in_identifier(&id), Some(42));
-    }
-
-    #[test]
-    fn two_notifications_for_one_pane_do_not_replace_each_other() {
-        // The center replaces a delivered notification whose identifier repeats.
-        assert_ne!(notification_identifier(7), notification_identifier(7));
-    }
-
-    #[test]
-    fn a_foreign_identifier_reveals_nothing() {
-        let pid = std::process::id();
-        for id in [
-            String::new(),
-            "tty7-pane-".into(),
-            "tty7-pane-x-1".into(),
-            "tty7-pane-42".into(),
-            "other-42-1".into(),
-            format!("tty7-pane-{pid}"),
-            format!("tty7-pane-{pid}-42"),
-            format!("tty7-pane-{pid}-x-1"),
-        ] {
-            assert_eq!(leaf_id_in_identifier(&id), None, "{id:?}");
-        }
-    }
-
-    #[test]
-    fn a_notification_from_another_process_reveals_nothing() {
-        // Notifications outlive the process that sent them, and gpui hands out
-        // the same entity ids again in a fresh process. A stale click must not
-        // land on whatever pane holds that id now.
-        let other_pid = std::process::id().wrapping_add(1);
-        let stale = format!("{NOTIFICATION_ID_PREFIX}{other_pid}-42-0");
-        assert_eq!(leaf_id_in_identifier(&stale), None);
-    }
-
-    #[test]
-    fn sanitizing_drops_control_bytes_but_keeps_line_breaks() {
-        let raw = "build \x1b[31mfailed\x07\nsee log\ttail";
-        assert_eq!(
-            sanitize_notification_text(raw, NOTIFY_BODY_MAX),
-            "build [31mfailed\nsee log\ttail"
-        );
-    }
-
-    #[test]
-    fn sanitizing_clamps_by_chars_not_bytes() {
-        let out = sanitize_notification_text(&"账".repeat(200), 8);
-        assert_eq!(out, format!("{}…", "账".repeat(8)));
-        assert_eq!(sanitize_notification_text("short", 8), "short");
-    }
-
-    /// Pulls the `launch` attribute back out the way the shell would see it.
-    fn launch_attribute(xml: &str) -> String {
-        let start = xml
-            .find(r#"launch=""#)
-            .expect("toast has a launch attribute")
-            + 8;
-        let len = xml[start..].find('"').expect("closed attribute");
-        xml[start..start + len].to_string()
-    }
-
-    /// #1179: a toast clicked from notification history is only reported over
-    /// COM, as the toast's `launch` string. Without one the pane is lost.
-    #[test]
-    fn a_toast_carries_its_pane_in_the_launch_attribute() {
-        let xml = toast_xml("title", "body", &notification_identifier(42));
-        assert_eq!(
-            toast_click_action(&launch_attribute(&xml)),
-            ToastClick::RevealPane { leaf_id: 42 }
-        );
-    }
-
-    #[test]
-    fn a_toast_from_another_process_only_shows_the_window() {
-        let other_pid = std::process::id().wrapping_add(1);
-        let stale = format!("{NOTIFICATION_ID_PREFIX}{other_pid}-42-0");
-        let xml = toast_xml("title", "body", &stale);
-        assert_eq!(
-            toast_click_action(&launch_attribute(&xml)),
-            ToastClick::ShowWindow
-        );
-        assert_eq!(toast_click_action(""), ToastClick::ShowWindow);
-    }
-
-    #[test]
-    fn one_click_delivered_twice_reveals_once() {
-        let mut recent = RecentActivations::default();
-        let a = notification_identifier(1);
-        let b = notification_identifier(1);
-        assert!(recent.first_time(&a));
-        assert!(!recent.first_time(&a));
-        assert!(recent.first_time(&b));
-        // Toasts without a pane all share the empty launch string.
-        assert!(recent.first_time(""));
-        assert!(recent.first_time(""));
-    }
-
-    /// The real WinRT XML parser must accept the document and hand the launch
-    /// string back verbatim. Parses only; shows nothing.
-    #[cfg(target_os = "windows")]
-    #[test]
-    fn windows_parses_the_toast_and_keeps_its_launch_string() {
-        use windows::Data::Xml::Dom::XmlDocument;
-        let id = notification_identifier(7);
-        let doc = XmlDocument::new().expect("XmlDocument");
-        doc.LoadXml(&toast_xml("a & <b>", "\"c\" 'd'", &id).into())
-            .expect("toast xml parses");
-        let launch = doc
-            .DocumentElement()
-            .and_then(|root| root.GetAttribute(&"launch".into()))
-            .expect("launch attribute");
-        assert_eq!(launch.to_string(), id);
-    }
-
-    #[test]
-    fn xml_escaping_covers_every_entity_once() {
-        assert_eq!(
-            xml_escape(r#"a & b < c > "d" 'e'"#),
-            "a &amp; b &lt; c &gt; &quot;d&quot; &apos;e&apos;"
-        );
-    }
 }
 
 type OscNotes = Arc<Mutex<VecDeque<Note>>>;
@@ -2916,21 +1904,6 @@ mod replay_tests {
     use super::*;
     use crate::daemon::protocol::DaemonMsg;
 
-    pub(super) fn socket_pair() -> (Stream, Stream) {
-        #[cfg(unix)]
-        {
-            std::os::unix::net::UnixStream::pair().unwrap()
-        }
-        #[cfg(windows)]
-        {
-            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            let addr = listener.local_addr().unwrap();
-            let client_side = std::net::TcpStream::connect(addr).unwrap();
-            let (daemon_side, _) = listener.accept().unwrap();
-            (client_side, daemon_side)
-        }
-    }
-
     /// Everything the grid holds, scrollback included, one row per line.
     fn all_text(term: &RemoteTerminal) -> String {
         use alacritty_terminal::grid::Dimensions as _;
@@ -2993,14 +1966,14 @@ mod replay_tests {
     fn escape_after(frames: Vec<DaemonMsg>, barrier: &str) -> (Vec<u8>, Option<String>) {
         use crate::terminal::input::{KeyFlags, keystroke_to_bytes};
         crate::core::config::pin_test_config_dir();
-        let (client_side, mut daemon) = socket_pair();
-        let term = RemoteTerminal::from_stream(client_side, TermSize::new(80, 24)).unwrap();
+        let (term, daemon) = RemoteTerminal::from_pipe(
+            TermSize::new(80, 24),
+            crate::terminal::remote::PtySource::for_route(&crate::terminal::PaneRoute::Local),
+        );
         for frame in frames {
-            frame.encode(&mut daemon).unwrap();
+            daemon.send(frame);
         }
-        DaemonMsg::Output(format!("{barrier}\x1b[?u").into_bytes())
-            .encode(&mut daemon)
-            .unwrap();
+        daemon.send(DaemonMsg::Output(format!("{barrier}\x1b[?u").into_bytes()));
         let text = settled(&term, &[barrier]);
         assert!(text.contains(barrier), "the barrier never arrived:\n{text}");
         let mut reply = None;
@@ -3018,7 +1991,7 @@ mod replay_tests {
         let mode = *term.term.lock().mode();
         let flags = KeyFlags::from_mode_with_local_conpty(&mode, true);
         let escape = keystroke_to_bytes(&gpui::Keystroke::parse("escape").unwrap(), flags);
-        drop(daemon);
+        daemon.close();
         (escape.unwrap_or_default(), reply)
     }
 
@@ -3187,26 +2160,21 @@ mod replay_tests {
     }
 }
 
-#[cfg(all(test, windows))]
-mod windows_tests {
+#[cfg(test)]
+mod detach_tests {
     use super::*;
 
-    use super::replay_tests::socket_pair as tcp_pair;
-
-    /// On Windows, `shutdown()` does not wake a thread parked in a blocking
-    /// `read` on the same socket (it does on unix). `detach_link`,
-    /// `adopt_relink`, and `Drop` all shut the writer down and then `join()`
-    /// the reader thread, counting on that wake-up — so when the peer stays
-    /// silent (a routed pane whose SSH leg went zombie: nothing arrives, no
-    /// FIN ever comes), the join blocks its caller, which in production is
-    /// the UI thread. This is the whole-window "not responding" hang right
-    /// after a remote workspace reconnects.
+    /// Detach must return without joining the reader. The reader is parked on
+    /// the output pipe, and the fixture keeps that pipe open, so a join would
+    /// sit here until the link is dropped.
     #[test]
     fn detach_link_returns_promptly_when_the_peer_stays_silent() {
         crate::core::config::pin_test_config_dir();
-        let (client_side, daemon_side) = tcp_pair();
-        let mut term = RemoteTerminal::from_stream(client_side, TermSize::new(80, 24)).unwrap();
-        // Let the reader thread park in read() before tearing down.
+        let (mut term, daemon_side) = RemoteTerminal::from_pipe(
+            TermSize::new(80, 24),
+            PtySource::for_route(&PaneRoute::Local),
+        );
+        // Let the reader thread park on the pipe before tearing down.
         std::thread::sleep(std::time::Duration::from_millis(200));
 
         let (tx, rx) = std::sync::mpsc::channel();
@@ -3215,11 +2183,10 @@ mod windows_tests {
             let _ = tx.send(());
         });
         let outcome = rx.recv_timeout(std::time::Duration::from_secs(3));
-        drop(daemon_side);
+        daemon_side.close();
         assert!(
             outcome.is_ok(),
-            "detach_link blocked for over 3s against a silent peer: shutdown() \
-             did not unblock the reader, so join() hangs the calling thread"
+            "detach_link blocked for over 3s while the pipe stayed open"
         );
     }
 }
@@ -3228,21 +2195,17 @@ mod windows_tests {
 ///
 /// Whether the reader puts back a parked cursor is a property of the pty this
 /// pane is attached to, not of the platform the client was compiled for — so
-/// these drive both answers on every platform, over a real socket pair. Before
+/// these drive both answers on every platform, over an in-memory pane link. Before
 /// #774 the decision was `cfg!(windows)`, which meant a Windows client talking
 /// to a Linux host repaired a cursor no conhost had parked, and the `wq` typed
 /// after vim's `:` landed on the row being edited.
 #[cfg(test)]
 mod parked_cursor_tests {
-    use super::replay_tests::socket_pair;
     use super::*;
-    use std::io::Write as _;
 
-    fn terminal_on(pty: PtySource, size: TermSize) -> (RemoteTerminal, Stream) {
+    fn terminal_on(pty: PtySource, size: TermSize) -> (RemoteTerminal, TestLink) {
         crate::core::config::pin_test_config_dir();
-        let (client_side, daemon_side) = socket_pair();
-        let term = RemoteTerminal::from_stream_with(client_side, size, Vec::new(), pty)
-            .expect("a terminal over a socket pair");
+        let (term, daemon_side) = RemoteTerminal::from_pipe(size, pty);
         assert_eq!(term.is_local_conpty(), pty == PtySource::LocalConpty);
         (term, daemon_side)
     }
@@ -3250,16 +2213,13 @@ mod parked_cursor_tests {
     /// Feeds one conhost-shaped repaint and reports the cell the cursor ends on,
     /// waiting for the `X` the frame paints so the reader is known to be done.
     fn cursor_after_conpty_frame(pty: PtySource, frame: &[u8]) -> (i32, usize) {
-        let (term, mut daemon_side) = terminal_on(pty, TermSize::new(80, 24));
+        let (term, daemon_side) = terminal_on(pty, TermSize::new(80, 24));
 
-        // Where the TUI put the cursor before conhost repainted over it.
-        DaemonMsg::Output(b"\x1b[6;4H".to_vec())
-            .encode(&mut daemon_side)
-            .unwrap();
-        DaemonMsg::Output(frame.to_vec())
-            .encode(&mut daemon_side)
-            .unwrap();
-        daemon_side.flush().unwrap();
+        daemon_side.send(
+            // Where the TUI put the cursor before conhost repainted over it.
+            DaemonMsg::Output(b"\x1b[6;4H".to_vec()),
+        );
+        daemon_side.send(DaemonMsg::Output(frame.to_vec()));
 
         for _ in 0..600 {
             {
@@ -3335,7 +2295,7 @@ mod parked_cursor_tests {
     /// row vim was editing. Bytes below are a capture of vim 9 on a 20x11 pty.
     #[test]
     fn a_raw_pty_repaint_keeps_the_cursor_the_frame_left_so_the_echo_lands_on_it() {
-        let (term, mut daemon_side) = terminal_on(PtySource::Raw, TermSize::new(20, 11));
+        let (term, daemon_side) = terminal_on(PtySource::Raw, TermSize::new(20, 11));
 
         let mut stream: Vec<u8> = Vec::new();
         // `vim test.md`: the alternate screen, the file, cursor home.
@@ -3349,8 +2309,7 @@ mod parked_cursor_tests {
         );
         // `w`, `q`, `!`: vim echoes them with no positioning of their own.
         stream.extend_from_slice(b"wq!");
-        DaemonMsg::Output(stream).encode(&mut daemon_side).unwrap();
-        daemon_side.flush().unwrap();
+        daemon_side.send(DaemonMsg::Output(stream));
 
         let row = |t: &Term<EventProxy>, line: i32| -> String {
             (0..20)
@@ -3476,11 +2435,9 @@ mod replayed_mode_tests {
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
-    use std::os::unix::net::UnixStream;
 
     #[test]
     fn a_local_pane_prefixes_nothing() {
@@ -3512,13 +2469,12 @@ mod tests {
         let config = terminal_config_from_user(&crate::core::config::Config::default());
         assert!(config.kitty_keyboard);
 
-        let (client_side, mut daemon_side) = UnixStream::pair().unwrap();
-        let term = RemoteTerminal::from_stream(client_side, TermSize::new(80, 24)).unwrap();
+        let (term, daemon_side) = RemoteTerminal::from_pipe(
+            TermSize::new(80, 24),
+            crate::terminal::remote::PtySource::for_route(&crate::terminal::PaneRoute::Local),
+        );
 
-        DaemonMsg::Output(b"\x1b[>7u\x1b[?u".to_vec())
-            .encode(&mut daemon_side)
-            .unwrap();
-        daemon_side.flush().unwrap();
+        daemon_side.send(DaemonMsg::Output(b"\x1b[>7u\x1b[?u".to_vec()));
 
         let mut reply = None;
         for _ in 0..200 {
@@ -3544,13 +2500,14 @@ mod tests {
 
     #[test]
     fn deep_keyboard_mode_pushes_leave_the_reader_alive() {
-        let (client_side, mut daemon_side) = UnixStream::pair().unwrap();
-        let term = RemoteTerminal::from_stream(client_side, TermSize::new(80, 24)).unwrap();
+        let (term, daemon_side) = RemoteTerminal::from_pipe(
+            TermSize::new(80, 24),
+            crate::terminal::remote::PtySource::for_route(&crate::terminal::PaneRoute::Local),
+        );
 
         let mut payload = b"\x1b[>1u".repeat(4097);
         payload.extend_from_slice(b"\x1b[?u");
-        DaemonMsg::Output(payload).encode(&mut daemon_side).unwrap();
-        daemon_side.flush().unwrap();
+        daemon_side.send(DaemonMsg::Output(payload));
 
         let mut reply = None;
         for _ in 0..200 {
@@ -3574,13 +2531,12 @@ mod tests {
 
     #[test]
     fn emoji_presentation_sequences_reserve_two_columns() {
-        let (client_side, mut daemon_side) = UnixStream::pair().unwrap();
-        let term = RemoteTerminal::from_stream(client_side, TermSize::new(80, 24)).unwrap();
+        let (term, daemon_side) = RemoteTerminal::from_pipe(
+            TermSize::new(80, 24),
+            crate::terminal::remote::PtySource::for_route(&crate::terminal::PaneRoute::Local),
+        );
 
-        DaemonMsg::Output("\u{2764}\u{FE0F}x".as_bytes().to_vec())
-            .encode(&mut daemon_side)
-            .unwrap();
-        daemon_side.flush().unwrap();
+        daemon_side.send(DaemonMsg::Output("\u{2764}\u{FE0F}x".as_bytes().to_vec()));
 
         let mut row = String::new();
         for _ in 0..200 {
@@ -3609,49 +2565,15 @@ mod tests {
     }
 
     #[test]
-    fn spawn_retry_only_for_daemon_disconnects() {
-        let eof: anyhow::Error =
-            std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "closed").into();
-        assert!(daemon_disconnected_before_spawn_reply(&eof));
-
-        let refused = anyhow::anyhow!("daemon refused Spawn: configured shell missing");
-        assert!(!daemon_disconnected_before_spawn_reply(&refused));
-    }
-
-    #[test]
-    fn only_a_dead_daemon_is_worth_starting_one_for() {
-        let connect_failed = |kind| -> anyhow::Error {
-            anyhow::Error::new(std::io::Error::new(kind, "no listener"))
-                .context("connect to daemon at /tmp/tty7.sock")
-        };
-        assert!(daemon_not_listening(&connect_failed(
-            std::io::ErrorKind::ConnectionRefused
-        )));
-        assert!(daemon_not_listening(&connect_failed(
-            std::io::ErrorKind::NotFound
-        )));
-
-        let refused = anyhow::anyhow!("daemon refused Spawn: configured shell missing");
-        assert!(!daemon_not_listening(&refused));
-        let eof: anyhow::Error =
-            std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "closed").into();
-        assert!(!daemon_not_listening(&eof));
-    }
-
-    #[test]
     fn reader_feeds_local_grid() {
-        let (client_side, mut daemon_side) = UnixStream::pair().unwrap();
-
         let size = TermSize::new(80, 24);
-        let term = RemoteTerminal::from_stream(client_side, size).unwrap();
+        let (term, daemon_side) = RemoteTerminal::from_pipe(
+            size,
+            crate::terminal::remote::PtySource::for_route(&crate::terminal::PaneRoute::Local),
+        );
 
-        DaemonMsg::Output(b"hello".to_vec())
-            .encode(&mut daemon_side)
-            .unwrap();
-        DaemonMsg::Cwd(PathBuf::from("/tmp/work"))
-            .encode(&mut daemon_side)
-            .unwrap();
-        daemon_side.flush().unwrap();
+        daemon_side.send(DaemonMsg::Output(b"hello".to_vec()));
+        daemon_side.send(DaemonMsg::Cwd(PathBuf::from("/tmp/work")));
 
         let mut got = String::new();
         for _ in 0..200 {
@@ -3682,7 +2604,7 @@ mod tests {
         }
         assert_eq!(cwd, Some(PathBuf::from("/tmp/work")));
 
-        drop(daemon_side);
+        daemon_side.close();
         for _ in 0..200 {
             if term.exited_flag.load(Ordering::SeqCst) {
                 break;
@@ -3697,8 +2619,10 @@ mod tests {
         use alacritty_terminal::vte::ansi::CursorShape;
 
         crate::core::config::pin_test_config_dir();
-        let (client_side, mut daemon_side) = UnixStream::pair().unwrap();
-        let term = RemoteTerminal::from_stream(client_side, TermSize::new(80, 24)).unwrap();
+        let (term, daemon_side) = RemoteTerminal::from_pipe(
+            TermSize::new(80, 24),
+            crate::terminal::remote::PtySource::for_route(&crate::terminal::PaneRoute::Local),
+        );
         let user_config = crate::core::config::Config(crate::core::config::CoreConfig {
             cursor_style: ConfigCursorStyle::Underline,
             ..crate::core::config::CoreConfig::default()
@@ -3708,10 +2632,7 @@ mod tests {
         let mut shape = term.term.lock().cursor_style().shape;
         assert_eq!(shape, CursorShape::Underline);
 
-        DaemonMsg::Output(b"\x1b[6 q".to_vec())
-            .encode(&mut daemon_side)
-            .unwrap();
-        daemon_side.flush().unwrap();
+        daemon_side.send(DaemonMsg::Output(b"\x1b[6 q".to_vec()));
         for _ in 0..200 {
             shape = term.term.lock().cursor_style().shape;
             if shape == CursorShape::Beam {
@@ -3721,10 +2642,7 @@ mod tests {
         }
         assert_eq!(shape, CursorShape::Beam);
 
-        DaemonMsg::Output(b"\x1b[0 q".to_vec())
-            .encode(&mut daemon_side)
-            .unwrap();
-        daemon_side.flush().unwrap();
+        daemon_side.send(DaemonMsg::Output(b"\x1b[0 q".to_vec()));
         for _ in 0..200 {
             shape = term.term.lock().cursor_style().shape;
             if shape == CursorShape::Underline {
@@ -3746,8 +2664,10 @@ mod tests {
         // The pane reads config.json when it is built; keep that off the
         // user's real one.
         crate::core::config::pin_test_config_dir();
-        let (client_side, mut daemon_side) = UnixStream::pair().unwrap();
-        let term = RemoteTerminal::from_stream(client_side, TermSize::new(80, 24)).unwrap();
+        let (term, daemon_side) = RemoteTerminal::from_pipe(
+            TermSize::new(80, 24),
+            crate::terminal::remote::PtySource::for_route(&crate::terminal::PaneRoute::Local),
+        );
         let user_config = crate::core::config::Config(crate::core::config::CoreConfig {
             cursor_style: configured,
             ..crate::core::config::CoreConfig::default()
@@ -3755,17 +2675,14 @@ mod tests {
         term.apply_user_config(&user_config);
 
         for chunk in output {
-            DaemonMsg::Output(chunk.to_vec())
-                .encode(&mut daemon_side)
-                .unwrap();
+            daemon_side.send(DaemonMsg::Output(chunk.to_vec()));
         }
-        // A sentinel painted after everything else: once it is on the grid,
-        // every chunk before it has been parsed, so the shape read below is
-        // the final one and not a transient match.
-        DaemonMsg::Output(b"\x1b[24;1H#".to_vec())
-            .encode(&mut daemon_side)
-            .unwrap();
-        daemon_side.flush().unwrap();
+        daemon_side.send(
+            // A sentinel painted after everything else: once it is on the grid,
+            // every chunk before it has been parsed, so the shape read below is
+            // the final one and not a transient match.
+            DaemonMsg::Output(b"\x1b[24;1H#".to_vec()),
+        );
         for _ in 0..400 {
             if term.term.lock().grid()[Line(23)][Column(0)].c == '#' {
                 break;
@@ -3838,11 +2755,11 @@ mod tests {
 
     #[test]
     fn child_exit_is_distinguished_from_daemon_disconnect() {
-        let (client_side, mut daemon_side) = UnixStream::pair().unwrap();
-        let term = RemoteTerminal::from_stream(client_side, TermSize::new(80, 24)).unwrap();
-        DaemonMsg::Exited { code: Some(0) }
-            .encode(&mut daemon_side)
-            .unwrap();
+        let (term, daemon_side) = RemoteTerminal::from_pipe(
+            TermSize::new(80, 24),
+            crate::terminal::remote::PtySource::for_route(&crate::terminal::PaneRoute::Local),
+        );
+        daemon_side.send(DaemonMsg::Exited { code: Some(0) });
         for _ in 0..200 {
             if term.exited_flag.load(Ordering::SeqCst) {
                 break;
@@ -3855,9 +2772,11 @@ mod tests {
             "an Exited frame is a genuine child exit"
         );
 
-        let (client_side, daemon_side) = UnixStream::pair().unwrap();
-        let term = RemoteTerminal::from_stream(client_side, TermSize::new(80, 24)).unwrap();
-        drop(daemon_side);
+        let (term, daemon_side) = RemoteTerminal::from_pipe(
+            TermSize::new(80, 24),
+            crate::terminal::remote::PtySource::for_route(&crate::terminal::PaneRoute::Local),
+        );
+        daemon_side.close();
         for _ in 0..200 {
             if term.exited_flag.load(Ordering::SeqCst) {
                 break;
@@ -3898,20 +2817,19 @@ mod tests {
     #[test]
     fn prompt_report_scrubs_stale_tui_modes() {
         crate::core::config::pin_test_config_dir();
-        let (client_side, mut daemon_side) = UnixStream::pair().unwrap();
-        let term = RemoteTerminal::from_stream(client_side, TermSize::new(80, 24)).unwrap();
+        let (term, daemon_side) = RemoteTerminal::from_pipe(
+            TermSize::new(80, 24),
+            crate::terminal::remote::PtySource::for_route(&crate::terminal::PaneRoute::Local),
+        );
 
-        DaemonMsg::Output(b"\x1b[?1049h\x1b[?25l\x1b[?1002h\x1b[?1006h".to_vec())
-            .encode(&mut daemon_side)
-            .unwrap();
-        DaemonMsg::Prompt {
+        daemon_side.send(DaemonMsg::Output(
+            b"\x1b[?1049h\x1b[?25l\x1b[?1002h\x1b[?1006h".to_vec(),
+        ));
+        daemon_side.send(DaemonMsg::Prompt {
             active: true,
             at_prompt: true,
             last_exit: Some(255),
-        }
-        .encode(&mut daemon_side)
-        .unwrap();
-        daemon_side.flush().unwrap();
+        });
 
         let mut mode = TermMode::NONE;
         for _ in 0..200 {
@@ -3942,13 +2860,12 @@ mod tests {
     #[test]
     fn decrqm_probe_reports_sync_update_supported() {
         crate::core::config::pin_test_config_dir();
-        let (client_side, mut daemon_side) = UnixStream::pair().unwrap();
-        let term = RemoteTerminal::from_stream(client_side, TermSize::new(80, 24)).unwrap();
+        let (term, daemon_side) = RemoteTerminal::from_pipe(
+            TermSize::new(80, 24),
+            crate::terminal::remote::PtySource::for_route(&crate::terminal::PaneRoute::Local),
+        );
 
-        DaemonMsg::Output(b"\x1b[?2026$p".to_vec())
-            .encode(&mut daemon_side)
-            .unwrap();
-        daemon_side.flush().unwrap();
+        daemon_side.send(DaemonMsg::Output(b"\x1b[?2026$p".to_vec()));
 
         let mut reply = None;
         for _ in 0..200 {
@@ -3972,13 +2889,12 @@ mod tests {
     #[test]
     fn an_unrecognized_2031_reply_is_not_queued() {
         crate::core::config::pin_test_config_dir();
-        let (client_side, mut daemon_side) = UnixStream::pair().unwrap();
-        let term = RemoteTerminal::from_stream(client_side, TermSize::new(80, 24)).unwrap();
+        let (term, daemon_side) = RemoteTerminal::from_pipe(
+            TermSize::new(80, 24),
+            crate::terminal::remote::PtySource::for_route(&crate::terminal::PaneRoute::Local),
+        );
 
-        DaemonMsg::Output(b"\x1b[?2031$p".to_vec())
-            .encode(&mut daemon_side)
-            .unwrap();
-        daemon_side.flush().unwrap();
+        daemon_side.send(DaemonMsg::Output(b"\x1b[?2031$p".to_vec()));
 
         let mut writes = Vec::new();
         for _ in 0..200 {
@@ -4015,188 +2931,68 @@ mod tests {
 
     #[test]
     fn write_sends_input_frames() {
-        let (client_side, mut daemon_side) = UnixStream::pair().unwrap();
-        let term = RemoteTerminal::from_stream(client_side, TermSize::new(80, 24)).unwrap();
+        let (term, daemon_side) = RemoteTerminal::from_pipe(
+            TermSize::new(80, 24),
+            crate::terminal::remote::PtySource::for_route(&crate::terminal::PaneRoute::Local),
+        );
 
         term.write(Vec::<u8>::new());
+        assert!(
+            daemon_side.try_recv_client().is_err(),
+            "an empty write queues nothing"
+        );
         term.write(b"echo hi\r".to_vec());
 
-        match ClientMsg::read(&mut daemon_side).unwrap() {
+        match daemon_side
+            .recv_client(std::time::Duration::from_secs(5))
+            .unwrap()
+        {
             ClientMsg::Input(bytes) => assert_eq!(bytes, b"echo hi\r"),
             other => panic!("expected Input, got {other:?}"),
         }
     }
 
-    /// A peer that holds the link open and stops reading is what the router
-    /// looks like from here when the far end is congested: `copy_bidirectional`
-    /// stops draining our half and the send buffer fills. The socket is
-    /// blocking and has no write timeout, so `write(2)` parks — and it used to
-    /// park on the UI thread, which draws every window. macOS gives a unix
-    /// stream 8K, so it took about 1400 keystrokes, or one paste.
-    ///
-    /// Typing into such a pane must now cost the window nothing at all.
-    #[test]
-    fn a_link_that_stopped_reading_does_not_park_the_writing_thread() {
-        crate::core::config::pin_test_config_dir();
-        let (client_side, daemon_side) = UnixStream::pair().unwrap();
-        let term = RemoteTerminal::from_stream(client_side, TermSize::new(80, 24)).unwrap();
-
-        // Far past the 8K that used to be fatal, one keystroke at a time, on
-        // this very thread: a park anywhere in here is a frozen window.
-        let started = std::time::Instant::now();
-        for _ in 0..64 * 1024 {
-            term.write(vec![b'x']);
-        }
-        let spent = started.elapsed();
-
-        drop(daemon_side);
-        assert!(
-            spent < std::time::Duration::from_secs(1),
-            "64K keystrokes into a link nobody is draining took {spent:?} — \
-             the caller is a gpui event handler, so this is the UI thread"
-        );
-    }
-
-    /// The backlog is bounded, and reaching the bound is not a slow link but a
-    /// dead one: nothing has taken a byte for four megabytes of typing. Saying
-    /// so is what stops the pane quietly swallowing input forever, and it is
-    /// said in the same words — and once — as an outright refused write.
-    #[test]
-    fn a_backlog_nothing_drains_is_reported_as_a_lost_link() {
-        crate::core::config::pin_test_config_dir();
-        let (client_side, daemon_side) = UnixStream::pair().unwrap();
-        let term = RemoteTerminal::from_stream(client_side, TermSize::new(80, 24)).unwrap();
-
-        // 8K a shot rather than a byte, so this is a few hundred frames and not
-        // a few million: the bound is on bytes queued, not on frames.
-        //
-        // Twice the bound rather than a frame or two past it. The sender does
-        // get some of this onto the wire before it parks — as much as the send
-        // buffer holds, which is 8K on macOS but a couple hundred K on Linux —
-        // and that much is discounted from the backlog. A margin narrower than
-        // the widest of those buffers is a test that passes on one platform and
-        // not the other.
-        let chunk = vec![b'x'; 8 << 10];
-        for _ in 0..2 * MAX_BACKLOG / chunk.len() {
-            term.write(chunk.clone());
-        }
-
-        assert!(
-            term.exited_flag.load(Ordering::SeqCst),
-            "a link that has taken nothing for {MAX_BACKLOG} bytes is gone, and the pane must say so"
-        );
-        let mut exits = 0;
-        while let Ok(ev) = term.events.try_recv() {
-            exits += usize::from(matches!(ev, AlacEvent::Exit));
-        }
-        assert_eq!(exits, 1, "said once, not once per keystroke");
-        drop(daemon_side);
-    }
-
-    /// One frame can be larger than the whole backlog bound: a paste is
-    /// whatever the clipboard holds. That is not a link nothing is draining,
-    /// and a pane must not die of being pasted into — nor may the keystrokes
-    /// that follow read as a backlog merely because the paste is still going.
-    #[test]
-    fn a_paste_larger_than_the_backlog_bound_is_not_a_dead_link() {
-        crate::core::config::pin_test_config_dir();
-        let (client_side, mut daemon_side) = UnixStream::pair().unwrap();
-        let term = RemoteTerminal::from_stream(client_side, TermSize::new(80, 24)).unwrap();
-
-        // A peer that keeps reading: the link is healthy, just carrying a lot.
-        let draining = std::thread::spawn(move || {
-            let _ = std::io::copy(&mut daemon_side, &mut std::io::sink());
-        });
-
-        term.write(vec![b'x'; MAX_BACKLOG + (1 << 20)]);
-        for _ in 0..1024 {
-            term.write(vec![b'y']);
-        }
-
-        assert!(
-            !term.exited_flag.load(Ordering::SeqCst),
-            "a five megabyte paste is a paste, not a link that has stopped taking input"
-        );
-        drop(term);
-        draining.join().unwrap();
-    }
-
-    /// Input the link refuses used to vanish: `write` threw the error away, so a
-    /// pane whose daemon had stopped reading kept taking keystrokes into
-    /// nothing. The refusal now marks the pane exited by the reader's own signal
-    /// — only our sending half is shut here, so the reader is still parked on
-    /// an open receiving half and the writing side is the one that finds out.
-    /// (Shutting the peer's receiving half instead is not portable: Linux
-    /// answers the next write with EPIPE, macOS buffers it.)
-    ///
-    /// The refusal is met on the sender thread now, so the pane learns of it a
-    /// moment after the keystroke rather than during it. That is the trade the
-    /// queue buys: the window never waits on the socket to find out.
-    #[test]
-    fn a_write_the_link_refuses_marks_the_pane_gone_once() {
-        crate::core::config::pin_test_config_dir();
-        let (client_side, _daemon_side) = UnixStream::pair().unwrap();
-        let term = RemoteTerminal::from_stream(client_side, TermSize::new(80, 24)).unwrap();
-        term.link.shutdown_write().unwrap();
-
-        term.write(b"echo hi\r".to_vec());
-        let noticed = std::time::Instant::now() + std::time::Duration::from_secs(3);
-        while !term.exited_flag.load(Ordering::SeqCst) && std::time::Instant::now() < noticed {
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        assert!(
-            term.exited_flag.load(Ordering::SeqCst),
-            "a refused Input is the link gone, and the pane has to say so"
-        );
-        let mut exits = 0;
-        while let Ok(ev) = term.events.try_recv() {
-            exits += usize::from(matches!(ev, AlacEvent::Exit));
-        }
-        assert_eq!(
-            exits, 1,
-            "reported through the same event the reader raises on EOF"
-        );
-
-        term.write(b"echo again\r".to_vec());
-        while let Ok(ev) = term.events.try_recv() {
-            exits += usize::from(matches!(ev, AlacEvent::Exit));
-        }
-        assert_eq!(exits, 1, "said once, not once per keystroke");
-    }
-
-    /// A link retired for a relink takes no more input — `stop_reader` closes
-    /// the queue and shuts the socket down — and that must not read as the pane
-    /// dying under the swap, for the same reason the retired reader exits
-    /// silently. The frame is now turned away at the queue rather than by the
-    /// socket, but the pane has to stay alive either way.
+    /// Stopping the reader retires it. A keystroke after that must not be
+    /// reported as the pane exiting: the quit flag makes the reader leave
+    /// without marking the link dead.
     #[test]
     fn a_write_on_a_retired_link_does_not_mark_the_pane_gone() {
         crate::core::config::pin_test_config_dir();
-        let (client_side, _daemon_side) = UnixStream::pair().unwrap();
-        let mut term = RemoteTerminal::from_stream(client_side, TermSize::new(80, 24)).unwrap();
+        let (mut term, _daemon_side) = RemoteTerminal::from_pipe(
+            TermSize::new(80, 24),
+            crate::terminal::remote::PtySource::for_route(&crate::terminal::PaneRoute::Local),
+        );
         term.stop_reader();
 
         term.write(b"echo hi\r".to_vec());
         assert!(
             !term.exited_flag.load(Ordering::SeqCst),
-            "the pane is being relinked or released, not dying"
+            "stopping the reader is not the pane exiting"
         );
     }
 
     #[test]
     fn first_resize_always_syncs_then_dedups() {
-        let (client_side, mut daemon_side) = UnixStream::pair().unwrap();
-        let mut term = RemoteTerminal::from_stream(client_side, TermSize::new(80, 24)).unwrap();
+        let (mut term, daemon_side) = RemoteTerminal::from_pipe(
+            TermSize::new(80, 24),
+            crate::terminal::remote::PtySource::for_route(&crate::terminal::PaneRoute::Local),
+        );
 
         term.resize(TermSize::new(80, 24), 8, 17);
-        match ClientMsg::read(&mut daemon_side).unwrap() {
+        match daemon_side
+            .recv_client(std::time::Duration::from_secs(5))
+            .unwrap()
+        {
             ClientMsg::Resize(ws) => assert_eq!((ws.cols, ws.rows), (80, 24)),
             other => panic!("expected the first Resize to be sent, got {other:?}"),
         }
 
         term.resize(TermSize::new(80, 24), 8, 17);
         term.write(b"marker".to_vec());
-        match ClientMsg::read(&mut daemon_side).unwrap() {
+        match daemon_side
+            .recv_client(std::time::Duration::from_secs(5))
+            .unwrap()
+        {
             ClientMsg::Input(bytes) => assert_eq!(bytes, b"marker"),
             other => panic!("expected Input (dup resize sends nothing), got {other:?}"),
         }
@@ -4204,13 +3000,12 @@ mod tests {
 
     #[test]
     fn sync_update_without_esu_flushes_after_the_deadline() {
-        let (client_side, mut daemon_side) = UnixStream::pair().unwrap();
-        let term = RemoteTerminal::from_stream(client_side, TermSize::new(80, 24)).unwrap();
+        let (term, daemon_side) = RemoteTerminal::from_pipe(
+            TermSize::new(80, 24),
+            crate::terminal::remote::PtySource::for_route(&crate::terminal::PaneRoute::Local),
+        );
 
-        DaemonMsg::Output(b"\x1b[?2026habc".to_vec())
-            .encode(&mut daemon_side)
-            .unwrap();
-        daemon_side.flush().unwrap();
+        daemon_side.send(DaemonMsg::Output(b"\x1b[?2026habc".to_vec()));
 
         let mut got = String::new();
         for _ in 0..600 {
@@ -4236,12 +3031,17 @@ mod tests {
 
     #[test]
     fn resize_updates_size_and_notifies_daemon() {
-        let (client_side, mut daemon_side) = UnixStream::pair().unwrap();
-        let mut term = RemoteTerminal::from_stream(client_side, TermSize::new(80, 24)).unwrap();
+        let (mut term, daemon_side) = RemoteTerminal::from_pipe(
+            TermSize::new(80, 24),
+            crate::terminal::remote::PtySource::for_route(&crate::terminal::PaneRoute::Local),
+        );
 
         term.resize(TermSize::new(100, 40), 9, 18);
         assert_eq!(term.size(), TermSize::new(100, 40));
-        match ClientMsg::read(&mut daemon_side).unwrap() {
+        match daemon_side
+            .recv_client(std::time::Duration::from_secs(5))
+            .unwrap()
+        {
             ClientMsg::Resize(ws) => {
                 assert_eq!((ws.cols, ws.rows, ws.cell_w, ws.cell_h), (100, 40, 9, 18));
             }
@@ -4254,8 +3054,10 @@ mod tests {
         use alacritty_terminal::grid::Dimensions as _;
         use alacritty_terminal::index::{Column, Line};
 
-        let (client_side, mut daemon_side) = UnixStream::pair().unwrap();
-        let mut term = RemoteTerminal::from_stream(client_side, TermSize::new(80, 24)).unwrap();
+        let (mut term, daemon_side) = RemoteTerminal::from_pipe(
+            TermSize::new(80, 24),
+            crate::terminal::remote::PtySource::for_route(&crate::terminal::PaneRoute::Local),
+        );
         // A remote route whose host advertised the echo. The local daemon's
         // answer rides the same gate through `local_daemon_supports`, so this
         // covers the deferral for both.
@@ -4263,7 +3065,7 @@ mod tests {
 
         term.resize(TermSize::new(120, 30), 8, 17);
         assert!(matches!(
-            ClientMsg::read(&mut daemon_side).unwrap(),
+            daemon_side.recv_client(std::time::Duration::from_secs(5)).unwrap(),
             ClientMsg::Resize(ws) if ws.cols == 120 && ws.rows == 30
         ));
         assert_eq!(
@@ -4272,24 +3074,19 @@ mod tests {
             "the grid keeps the old geometry until the daemon's echo arrives"
         );
 
-        // Old-width bytes still in flight ahead of the echo: a CUP to column
-        // 100 must clamp on the 80-col grid. The same addressing after the
-        // echo reaches the real column on the 120-col grid.
-        DaemonMsg::Output(b"\x1b[1;100HA".to_vec())
-            .encode(&mut daemon_side)
-            .unwrap();
-        DaemonMsg::Size(WinSize {
+        daemon_side.send(
+            // Old-width bytes still in flight ahead of the echo: a CUP to column
+            // 100 must clamp on the 80-col grid. The same addressing after the
+            // echo reaches the real column on the 120-col grid.
+            DaemonMsg::Output(b"\x1b[1;100HA".to_vec()),
+        );
+        daemon_side.send(DaemonMsg::Size(WinSize {
             cols: 120,
             rows: 30,
             cell_w: 8,
             cell_h: 17,
-        })
-        .encode(&mut daemon_side)
-        .unwrap();
-        DaemonMsg::Output(b"\x1b[2;100HB".to_vec())
-            .encode(&mut daemon_side)
-            .unwrap();
-        daemon_side.flush().unwrap();
+        }));
+        daemon_side.send(DaemonMsg::Output(b"\x1b[2;100HB".to_vec()));
 
         for _ in 0..400 {
             {
@@ -4314,22 +3111,20 @@ mod tests {
         );
     }
 
-    /// A route whose daemon promised to echo every resize, over a socket pair
-    /// the test plays the daemon on. The switch tests build the same route
-    /// against a real pane.
-    fn echoing_pair() -> (RemoteTerminal, UnixStream) {
-        let (client_side, daemon_side) = UnixStream::pair().unwrap();
-        let mut term = RemoteTerminal::from_stream(client_side, TermSize::new(80, 24)).unwrap();
+    /// A pane that echoes every resize. The test plays the daemon on the
+    /// in-memory link. The switch tests build the same route against a real pane.
+    fn echoing_pair() -> (RemoteTerminal, TestLink) {
+        let (mut term, daemon_side) = RemoteTerminal::from_pipe(
+            TermSize::new(80, 24),
+            PtySource::for_route(&PaneRoute::Local),
+        );
         term.direct = true;
-        daemon_side
-            .set_read_timeout(Some(std::time::Duration::from_millis(150)))
-            .unwrap();
         (term, daemon_side)
     }
 
-    /// The geometry of the next frame the pane sent, if it sent one at all.
-    fn next_resize(daemon_side: &mut UnixStream) -> Option<(u16, u16)> {
-        match ClientMsg::read(daemon_side) {
+    /// The geometry of the next resize the pane sent, if it sent one at all.
+    fn next_resize(daemon_side: &TestLink) -> Option<(u16, u16)> {
+        match daemon_side.recv_client(std::time::Duration::from_millis(150)) {
             Ok(ClientMsg::Resize(ws)) => Some((ws.cols, ws.rows)),
             Ok(other) => panic!("expected a Resize, got {other:?}"),
             Err(_) => None,
@@ -4364,15 +3159,15 @@ mod tests {
     fn an_echoed_resize_whose_echo_never_came_is_asked_for_again() {
         use alacritty_terminal::grid::Dimensions as _;
 
-        let (mut term, mut daemon_side) = echoing_pair();
+        let (mut term, daemon_side) = echoing_pair();
         term.resize(TermSize::new(120, 30), 8, 17);
-        assert_eq!(next_resize(&mut daemon_side), Some((120, 30)));
+        assert_eq!(next_resize(&daemon_side), Some((120, 30)));
 
         // Every frame asks again. While the echo can still be on its way that
         // is not a reason to resend.
         term.resize(TermSize::new(120, 30), 8, 17);
         assert_eq!(
-            next_resize(&mut daemon_side),
+            next_resize(&daemon_side),
             None,
             "an echo still in flight must not be chased with duplicates"
         );
@@ -4382,7 +3177,7 @@ mod tests {
         outlive_the_echo_grace(&mut term);
         term.resize(TermSize::new(120, 30), 8, 17);
         assert_eq!(
-            next_resize(&mut daemon_side),
+            next_resize(&daemon_side),
             Some((120, 30)),
             "a resize whose echo never arrived was never retried, so the grid \
              stays at the old size until the layout asks for a different one"
@@ -4393,22 +3188,21 @@ mod tests {
             "the retry still waits for the echo rather than reflowing early"
         );
 
-        // Once the echo lands the size is settled, however old the request.
-        DaemonMsg::Size(WinSize {
-            cols: 120,
-            rows: 30,
-            cell_w: 8,
-            cell_h: 17,
-        })
-        .encode(&mut daemon_side)
-        .unwrap();
-        daemon_side.flush().unwrap();
+        daemon_side.send(
+            // Once the echo lands the size is settled, however old the request.
+            DaemonMsg::Size(WinSize {
+                cols: 120,
+                rows: 30,
+                cell_w: 8,
+                cell_h: 17,
+            }),
+        );
         wait_for_columns(&term, 120);
         assert_eq!(term.term.lock().screen_lines(), 30);
         outlive_the_echo_grace(&mut term);
         term.resize(TermSize::new(120, 30), 8, 17);
         assert_eq!(
-            next_resize(&mut daemon_side),
+            next_resize(&daemon_side),
             None,
             "a grid that reached the requested size must not be resized again"
         );
@@ -4421,26 +3215,23 @@ mod tests {
     /// echoing one skipped it, since the request itself had not changed.
     #[test]
     fn an_echoed_resize_reasserts_geometry_after_a_late_size_frame() {
-        let (mut term, mut daemon_side) = echoing_pair();
+        let (mut term, daemon_side) = echoing_pair();
         term.resize(TermSize::new(120, 30), 8, 17);
-        assert_eq!(next_resize(&mut daemon_side), Some((120, 30)));
+        assert_eq!(next_resize(&daemon_side), Some((120, 30)));
         for (cols, rows) in [(120, 30), (100, 12)] {
-            DaemonMsg::Size(WinSize {
+            daemon_side.send(DaemonMsg::Size(WinSize {
                 cols,
                 rows,
                 cell_w: 8,
                 cell_h: 17,
-            })
-            .encode(&mut daemon_side)
-            .unwrap();
+            }));
         }
-        daemon_side.flush().unwrap();
         wait_for_columns(&term, 100);
 
         outlive_the_echo_grace(&mut term);
         term.resize(TermSize::new(120, 30), 8, 17);
         assert_eq!(
-            next_resize(&mut daemon_side),
+            next_resize(&daemon_side),
             Some((120, 30)),
             "a grid knocked off the requested size was left there"
         );
@@ -4448,21 +3239,18 @@ mod tests {
 
     #[test]
     fn at_prompt_stays_false_while_shell_integration_is_inactive() {
-        let (client_side, mut daemon_side) = UnixStream::pair().unwrap();
-        let term = RemoteTerminal::from_stream(client_side, TermSize::new(80, 24)).unwrap();
+        let (term, daemon_side) = RemoteTerminal::from_pipe(
+            TermSize::new(80, 24),
+            crate::terminal::remote::PtySource::for_route(&crate::terminal::PaneRoute::Local),
+        );
         assert!(!term.shell_active(), "no report yet → integration inactive");
 
-        DaemonMsg::Prompt {
+        daemon_side.send(DaemonMsg::Prompt {
             active: false,
             at_prompt: true,
             last_exit: None,
-        }
-        .encode(&mut daemon_side)
-        .unwrap();
-        DaemonMsg::Output(b"m".to_vec())
-            .encode(&mut daemon_side)
-            .unwrap();
-        daemon_side.flush().unwrap();
+        });
+        daemon_side.send(DaemonMsg::Output(b"m".to_vec()));
 
         let mut synced = false;
         for _ in 0..200 {
@@ -4482,19 +3270,18 @@ mod tests {
 
     #[test]
     fn at_prompt_follows_daemon_prompt_reports() {
-        let (client_side, mut daemon_side) = UnixStream::pair().unwrap();
-        let term = RemoteTerminal::from_stream(client_side, TermSize::new(80, 24)).unwrap();
+        let (term, daemon_side) = RemoteTerminal::from_pipe(
+            TermSize::new(80, 24),
+            crate::terminal::remote::PtySource::for_route(&crate::terminal::PaneRoute::Local),
+        );
 
         assert!(!term.at_prompt());
 
-        DaemonMsg::Prompt {
+        daemon_side.send(DaemonMsg::Prompt {
             active: true,
             at_prompt: true,
             last_exit: Some(0),
-        }
-        .encode(&mut daemon_side)
-        .unwrap();
-        daemon_side.flush().unwrap();
+        });
 
         let mut at = false;
         for _ in 0..200 {
@@ -4519,8 +3306,10 @@ mod tests {
         use alacritty_terminal::index::{Column, Line};
 
         crate::core::config::pin_test_config_dir();
-        let (client_side, mut daemon_side) = UnixStream::pair().unwrap();
-        let term = RemoteTerminal::from_stream(client_side, TermSize::new(98, 12)).unwrap();
+        let (term, daemon_side) = RemoteTerminal::from_pipe(
+            TermSize::new(98, 12),
+            crate::terminal::remote::PtySource::Raw,
+        );
         // zsh 5.9's redraw for `PROMPT='[~] '` and an `RPROMPT` clock.
         let redraw = |cols: u16, clock: &str| {
             format!(
@@ -4530,31 +3319,22 @@ mod tests {
             )
             .into_bytes()
         };
-        DaemonMsg::Prompt {
+        daemon_side.send(DaemonMsg::Prompt {
             active: true,
             at_prompt: true,
             last_exit: Some(0),
-        }
-        .encode(&mut daemon_side)
-        .unwrap();
-        DaemonMsg::Output(redraw(98, "16:46:20"))
-            .encode(&mut daemon_side)
-            .unwrap();
+        });
+        daemon_side.send(DaemonMsg::Output(redraw(98, "16:46:20")));
         for cols in [92, 86, 92, 98] {
-            DaemonMsg::Size(WinSize {
+            daemon_side.send(DaemonMsg::Size(WinSize {
                 cols,
                 rows: 12,
                 cell_w: 8,
                 cell_h: 17,
-            })
-            .encode(&mut daemon_side)
-            .unwrap();
+            }));
             let clock = if cols == 98 { "16:46:33" } else { "16:46:2x" };
-            DaemonMsg::Output(redraw(cols, clock))
-                .encode(&mut daemon_side)
-                .unwrap();
+            daemon_side.send(DaemonMsg::Output(redraw(cols, clock)));
         }
-        daemon_side.flush().unwrap();
 
         let text = || {
             let t = term.term.lock();
@@ -4592,8 +3372,10 @@ mod tests {
 
     #[test]
     fn foreground_agent_follows_daemon_agent_reports() {
-        let (client_side, mut daemon_side) = UnixStream::pair().unwrap();
-        let term = RemoteTerminal::from_stream(client_side, TermSize::new(80, 24)).unwrap();
+        let (term, daemon_side) = RemoteTerminal::from_pipe(
+            TermSize::new(80, 24),
+            crate::terminal::remote::PtySource::for_route(&crate::terminal::PaneRoute::Local),
+        );
 
         assert_eq!(term.foreground_agent(), None, "none before any report");
 
@@ -4607,14 +3389,10 @@ mod tests {
             false
         };
 
-        DaemonMsg::Agent(Some(CLIAgent::Claude))
-            .encode(&mut daemon_side)
-            .unwrap();
-        daemon_side.flush().unwrap();
+        daemon_side.send(DaemonMsg::Agent(Some(CLIAgent::Claude)));
         assert!(poll(Some(CLIAgent::Claude)), "agent report should surface");
 
-        DaemonMsg::Agent(None).encode(&mut daemon_side).unwrap();
-        daemon_side.flush().unwrap();
+        daemon_side.send(DaemonMsg::Agent(None));
         assert!(poll(None), "agent exit should clear it");
     }
 
@@ -4622,8 +3400,10 @@ mod tests {
     fn agent_session_follows_daemon_status_reports() {
         use crate::core::cli_agent::{AgentSessionState, AgentStatus};
 
-        let (client_side, mut daemon_side) = UnixStream::pair().unwrap();
-        let term = RemoteTerminal::from_stream(client_side, TermSize::new(80, 24)).unwrap();
+        let (term, daemon_side) = RemoteTerminal::from_pipe(
+            TermSize::new(80, 24),
+            crate::terminal::remote::PtySource::for_route(&crate::terminal::PaneRoute::Local),
+        );
         assert_eq!(term.agent_session(), None, "none before any report");
 
         let poll = |want: &dyn Fn(Option<AgentSessionState>) -> bool| {
@@ -4636,7 +3416,7 @@ mod tests {
             false
         };
 
-        DaemonMsg::AgentStatus(Some(AgentSessionState {
+        daemon_side.send(DaemonMsg::AgentStatus(Some(AgentSessionState {
             status: AgentStatus::Waiting,
             message: Some("Claude needs your permission".into()),
             session_id: Some("sid-1".into()),
@@ -4648,10 +3428,7 @@ mod tests {
             inferred: false,
             readout: Default::default(),
             since_ms: None,
-        }))
-        .encode(&mut daemon_side)
-        .unwrap();
-        daemon_side.flush().unwrap();
+        })));
         assert!(
             poll(&|s| s.is_some_and(|s| s.status == AgentStatus::Waiting
                 && s.session_id.as_deref() == Some("sid-1")
@@ -4659,18 +3436,17 @@ mod tests {
             "status report should surface with message + session id"
         );
 
-        DaemonMsg::AgentStatus(None)
-            .encode(&mut daemon_side)
-            .unwrap();
-        daemon_side.flush().unwrap();
+        daemon_side.send(DaemonMsg::AgentStatus(None));
         assert!(poll(&|s| s.is_none()), "a None report clears the session");
     }
 
     #[test]
     fn the_spawn_directory_answers_until_the_shell_reports_its_own() {
         crate::core::config::pin_test_config_dir();
-        let (client_side, mut daemon_side) = UnixStream::pair().unwrap();
-        let term = RemoteTerminal::from_stream(client_side, TermSize::new(80, 24)).unwrap();
+        let (term, daemon_side) = RemoteTerminal::from_pipe(
+            TermSize::new(80, 24),
+            crate::terminal::remote::PtySource::for_route(&crate::terminal::PaneRoute::Local),
+        );
         let poll = |want: Option<&str>| {
             let want = want.map(PathBuf::from);
             for _ in 0..200 {
@@ -4690,10 +3466,7 @@ mod tests {
             "the sidebar can group this pane without waiting for the shell"
         );
 
-        DaemonMsg::Cwd(PathBuf::from("/repo/tty7/crates"))
-            .encode(&mut daemon_side)
-            .unwrap();
-        daemon_side.flush().unwrap();
+        daemon_side.send(DaemonMsg::Cwd(PathBuf::from("/repo/tty7/crates")));
         assert!(
             poll(Some("/repo/tty7/crates")),
             "the shell's own report replaces the seed"
@@ -4703,13 +3476,12 @@ mod tests {
     #[test]
     fn a_shell_report_that_beat_the_seed_wins() {
         crate::core::config::pin_test_config_dir();
-        let (client_side, mut daemon_side) = UnixStream::pair().unwrap();
-        let term = RemoteTerminal::from_stream(client_side, TermSize::new(80, 24)).unwrap();
+        let (term, daemon_side) = RemoteTerminal::from_pipe(
+            TermSize::new(80, 24),
+            crate::terminal::remote::PtySource::for_route(&crate::terminal::PaneRoute::Local),
+        );
 
-        DaemonMsg::Cwd(PathBuf::from("/somewhere/else"))
-            .encode(&mut daemon_side)
-            .unwrap();
-        daemon_side.flush().unwrap();
+        daemon_side.send(DaemonMsg::Cwd(PathBuf::from("/somewhere/else")));
         for _ in 0..200 {
             if term.foreground_cwd().is_some() {
                 break;
@@ -4728,8 +3500,10 @@ mod tests {
     #[test]
     fn the_running_command_is_the_line_the_shell_marked_and_ends_with_it() {
         crate::core::config::pin_test_config_dir();
-        let (client_side, mut daemon_side) = UnixStream::pair().unwrap();
-        let term = RemoteTerminal::from_stream(client_side, TermSize::new(80, 24)).unwrap();
+        let (term, daemon_side) = RemoteTerminal::from_pipe(
+            TermSize::new(80, 24),
+            crate::terminal::remote::PtySource::for_route(&crate::terminal::PaneRoute::Local),
+        );
         let poll = |want: &str| {
             for _ in 0..200 {
                 if term.running_command() == want {
@@ -4743,42 +3517,38 @@ mod tests {
 
         // The escaping is the integration's; this side stores it verbatim and
         // the reader of the field undoes it.
-        DaemonMsg::Output(b"\x1b]133;C;printf '100%25'\x07".to_vec())
-            .encode(&mut daemon_side)
-            .unwrap();
-        daemon_side.flush().unwrap();
+        daemon_side.send(DaemonMsg::Output(
+            b"\x1b]133;C;printf '100%25'\x07".to_vec(),
+        ));
         assert!(
             poll("printf '100%25'"),
             "C should record the line it carried, got {:?}",
             term.running_command()
         );
 
-        // Back at a prompt the command is over — holding the name would make
-        // the next close question ask about something that already finished.
-        DaemonMsg::Output(b"\x1b]133;B\x07".to_vec())
-            .encode(&mut daemon_side)
-            .unwrap();
-        daemon_side.flush().unwrap();
+        daemon_side.send(
+            // Back at a prompt the command is over — holding the name would make
+            // the next close question ask about something that already finished.
+            DaemonMsg::Output(b"\x1b]133;B\x07".to_vec()),
+        );
         assert!(poll(""), "a new prompt clears the running command");
 
-        // A bare `C` starts a command without naming it (the PowerShell path).
-        // It must not leave the previous name standing.
-        DaemonMsg::Output(b"\x1b]133;C;cargo build\x07".to_vec())
-            .encode(&mut daemon_side)
-            .unwrap();
-        daemon_side.flush().unwrap();
+        daemon_side.send(
+            // A bare `C` starts a command without naming it (the PowerShell path).
+            // It must not leave the previous name standing.
+            DaemonMsg::Output(b"\x1b]133;C;cargo build\x07".to_vec()),
+        );
         assert!(poll("cargo build"));
-        DaemonMsg::Output(b"\x1b]133;C\x07".to_vec())
-            .encode(&mut daemon_side)
-            .unwrap();
-        daemon_side.flush().unwrap();
+        daemon_side.send(DaemonMsg::Output(b"\x1b]133;C\x07".to_vec()));
         assert!(poll(""), "an unnamed command start does not inherit a name");
     }
 
     #[test]
     fn shell_vi_mode_follows_live_prompt_mode_marks_without_disarming_zle() {
-        let (client_side, mut daemon_side) = UnixStream::pair().unwrap();
-        let term = RemoteTerminal::from_stream(client_side, TermSize::new(80, 24)).unwrap();
+        let (term, daemon_side) = RemoteTerminal::from_pipe(
+            TermSize::new(80, 24),
+            crate::terminal::remote::PtySource::for_route(&crate::terminal::PaneRoute::Local),
+        );
         let poll = |vi: bool, zle: bool| {
             for _ in 0..200 {
                 if term.shell_vi_mode() == vi && term.zle_reading() == zle {
@@ -4792,34 +3562,22 @@ mod tests {
         assert!(!term.shell_vi_mode(), "conservative false before any mark");
         assert!(!term.zle_reading(), "zle also starts false");
 
-        DaemonMsg::Output(b"\x1b]133;B\x07".to_vec())
-            .encode(&mut daemon_side)
-            .unwrap();
-        daemon_side.flush().unwrap();
+        daemon_side.send(DaemonMsg::Output(b"\x1b]133;B\x07".to_vec()));
         assert!(poll(false, true), "B should arm zle only");
 
-        DaemonMsg::Output(b"\x1b]133;V;1\x07".to_vec())
-            .encode(&mut daemon_side)
-            .unwrap();
-        daemon_side.flush().unwrap();
+        daemon_side.send(DaemonMsg::Output(b"\x1b]133;V;1\x07".to_vec()));
         assert!(
             poll(true, true),
             "V;1 should set shell vi-mode without disarming zle"
         );
 
-        DaemonMsg::Output(b"\x1b]133;V;0\x07".to_vec())
-            .encode(&mut daemon_side)
-            .unwrap();
-        daemon_side.flush().unwrap();
+        daemon_side.send(DaemonMsg::Output(b"\x1b]133;V;0\x07".to_vec()));
         assert!(
             poll(false, true),
             "V;0 should clear shell vi-mode without disarming zle"
         );
 
-        DaemonMsg::Output(b"\x1b]133;C\x07".to_vec())
-            .encode(&mut daemon_side)
-            .unwrap();
-        daemon_side.flush().unwrap();
+        daemon_side.send(DaemonMsg::Output(b"\x1b]133;C\x07".to_vec()));
         assert!(poll(false, false), "C still disarms zle");
     }
 }
@@ -4844,12 +3602,14 @@ mod osc_tests {
         use crate::terminal::size::TermSize;
 
         crate::core::config::pin_test_config_dir();
-        let (client, mut daemon) = crate::terminal::view::test_stream_pair();
-        let term = super::RemoteTerminal::from_stream(client, TermSize::new(80, 24)).unwrap();
+        let (term, daemon) = super::RemoteTerminal::from_pipe(
+            TermSize::new(80, 24),
+            crate::terminal::remote::PtySource::for_route(&crate::terminal::PaneRoute::Local),
+        );
         let burst: Vec<u8> = (0..40)
             .flat_map(|n| format!("\x1b]9;note {n}\x07").into_bytes())
             .collect();
-        DaemonMsg::Output(burst).encode(&mut daemon).unwrap();
+        daemon.send(DaemonMsg::Output(burst));
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let taken = loop {

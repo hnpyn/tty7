@@ -71,7 +71,7 @@ alacritty_terminal.workspace = true
 
 # Desktop notifications driven by OSC 9 / OSC 777 escape sequences, on Linux and
 # Windows. On macOS only its `set_application` is used — never `show`; see
-# `terminal::remote::macos_notify` for why.
+# `terminal::notify::macos_notify` for why.
 notify-rust = "4"
 
 # Filesystem watcher for live config reload: watches `config.json` and reloads
@@ -147,7 +147,7 @@ objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSResponder", "
 # NSData feeds the runtime Dock icon for bare (non-bundled) binaries — see
 # `set_dock_icon_for_bare_binary` in main.rs.
 # NSUserNotification is the click-to-reveal notification path — see
-# `terminal::remote::macos_notify` for why it is driven directly.
+# `terminal::notify::macos_notify` for why it is driven directly.
 # NSUserDefaults (with NSDictionary for the domain it returns) is how a test
 # checks that `font_thicken: false` leaves `AppleFontSmoothing` alone — see
 # `apply_font_thicken` in main.rs.

@@ -1546,10 +1546,9 @@ enum GraphicsFrame {
 }
 
 /// Queue an encoded image frame for the subscriber, dropping any frame larger
-/// than [`MAX_FRAME`]. The writer's `write_frame` rejects an oversize payload
-/// with an error the writer loop treats as *fatal* — it would tear the client
-/// off an otherwise-healthy pane. A single image that won't fit is not worth
-/// that: drop it here so the rest of the stream keeps flowing. The inline
+/// than [`MAX_FRAME`]. An oversize image must not enter the subscriber queue:
+/// one frame that will not fit is not worth stalling the rest of the stream.
+/// Drop it here so output keeps flowing. The inline
 /// `t=d` path is bounded by `MAX_TRANSMISSION_BASE64` but that still admits
 /// ~72 MiB of raw pixels, and the local shm/file path has no cap of its own,
 /// so both can land here over the limit.
@@ -5803,8 +5802,7 @@ mod tests {
         let mut frames = Vec::new();
         // At the limit: queued.
         push_image_frame(&mut frames, vec![0u8; MAX_FRAME]);
-        // Over the limit: dropped, so the writer's fatal `write_frame` error
-        // (which would disconnect the client) is never reached.
+        // Over the limit: dropped, so it never enters the subscriber queue.
         push_image_frame(&mut frames, vec![0u8; MAX_FRAME + 1]);
         assert_eq!(frames.len(), 1, "only the in-budget frame is queued");
         assert!(matches!(&frames[0], GraphicsFrame::Image(f) if f.len() == MAX_FRAME));

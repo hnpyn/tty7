@@ -16,6 +16,7 @@ pub(crate) mod images;
 pub mod input;
 mod link_probe;
 mod loopback;
+mod notify;
 pub mod palette;
 pub(crate) mod parked_cursor;
 pub(crate) mod prompt_reflow;
@@ -29,7 +30,7 @@ mod smart_select;
 mod typeahead;
 pub mod view;
 
-pub use remote::{PaneRoute, PaneWorkspace, shutdown_panes};
 #[cfg(target_os = "windows")]
-pub(crate) use remote::{notify_desktop_for_pane, toast_activated};
+pub(crate) use notify::{notify_desktop_for_pane, toast_activated};
+pub use remote::{PaneRoute, PaneWorkspace, shutdown_panes};
 pub use size::TermSize;
