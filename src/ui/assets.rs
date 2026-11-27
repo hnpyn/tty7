@@ -11,7 +11,7 @@ impl AssetSource for Assets {
         if let Some(downstream) = path.strip_prefix(STOCK_PREFIX) {
             return gpui_component_assets::Assets.load(downstream);
         }
-        if let Some(bytes) = agent_icon(path) {
+        if let Some(bytes) = bundled_icon(path) {
             return Ok(Some(Cow::Borrowed(bytes)));
         }
         gpui_component_assets::Assets.load(path)
@@ -22,67 +22,19 @@ impl AssetSource for Assets {
     }
 }
 
-fn agent_icon(path: &str) -> Option<&'static [u8]> {
+/// Art this window draws itself, in place of gpui-component's stock glyph.
+///
+/// `IconName::{Plus, Folder, File, Github}` and the composer paths
+/// `icons/file.svg` / `icons/image.svg` load through here. `image.svg` is not
+/// in the stock set, so dropping it would make that path resolve to nothing.
+/// Every other name falls through to stock.
+fn bundled_icon(path: &str) -> Option<&'static [u8]> {
     let bytes: &'static [u8] = match path {
-        "icons/terminal.svg" => include_bytes!("../../assets/icons/terminal.svg"),
-        "icons/git-branch.svg" => include_bytes!("../../assets/icons/git-branch.svg"),
-        "icons/pin.svg" => include_bytes!("../../assets/icons/pin.svg"),
-        // Deliberately not `refresh.svg`: the panel header already carries a
-        // refresh tile, and the same glyph meaning two different things one row
-        // apart reads as a bug.
-        "icons/git-sync.svg" => include_bytes!("../../assets/icons/git-sync.svg"),
-        "icons/git-commit.svg" => include_bytes!("../../assets/icons/git-commit.svg"),
-        "icons/panel-left.svg" => include_bytes!("../../assets/icons/panel-left.svg"),
-        "icons/panel-right.svg" => include_bytes!("../../assets/icons/panel-right.svg"),
-        "icons/panel-left-collapsed.svg" => {
-            include_bytes!("../../assets/icons/panel-left-collapsed.svg")
-        }
-        "icons/panel-right-collapsed.svg" => {
-            include_bytes!("../../assets/icons/panel-right-collapsed.svg")
-        }
         "icons/plus.svg" => include_bytes!("../../assets/icons/plus.svg"),
-        "icons/ellipsis.svg" => include_bytes!("../../assets/icons/ellipsis.svg"),
-        "icons/folder-closed.svg" => include_bytes!("../../assets/icons/folder-closed.svg"),
-        "icons/folder-open.svg" => include_bytes!("../../assets/icons/folder-open.svg"),
-        "icons/info.svg" => include_bytes!("../../assets/icons/info.svg"),
-        "icons/eye.svg" => include_bytes!("../../assets/icons/eye.svg"),
-        "icons/search.svg" => include_bytes!("../../assets/icons/search.svg"),
-        "icons/github.svg" => include_bytes!("../../assets/icons/github.svg"),
-        "icons/copy.svg" => include_bytes!("../../assets/icons/copy.svg"),
         "icons/folder.svg" => include_bytes!("../../assets/icons/folder.svg"),
         "icons/file.svg" => include_bytes!("../../assets/icons/file.svg"),
         "icons/image.svg" => include_bytes!("../../assets/icons/image.svg"),
-        "icons/circle-info.svg" => include_bytes!("../../assets/icons/circle-info.svg"),
-        "icons/machine-local.svg" => include_bytes!("../../assets/icons/machine-local.svg"),
-        "icons/machine-remote.svg" => include_bytes!("../../assets/icons/machine-remote.svg"),
-        "icons/refresh.svg" => include_bytes!("../../assets/icons/refresh.svg"),
-        "icons/power.svg" => include_bytes!("../../assets/icons/power.svg"),
-        "icons/list-tree.svg" => include_bytes!("../../assets/icons/list-tree.svg"),
-        "icons/list-flat.svg" => include_bytes!("../../assets/icons/list-flat.svg"),
-        "icons/agents/claude.svg" => include_bytes!("../../assets/icons/agents/claude.svg"),
-        "icons/agents/codex.svg" => include_bytes!("../../assets/icons/agents/codex.svg"),
-        "icons/agents/traecli.svg" => include_bytes!("../../assets/icons/agents/traecli.svg"),
-        "icons/agents/gemini.svg" => include_bytes!("../../assets/icons/agents/gemini.svg"),
-        "icons/agents/amp.svg" => include_bytes!("../../assets/icons/agents/amp.svg"),
-        "icons/agents/opencode.svg" => include_bytes!("../../assets/icons/agents/opencode.svg"),
-        "icons/agents/copilot.svg" => include_bytes!("../../assets/icons/agents/copilot.svg"),
-        "icons/agents/cursor.svg" => include_bytes!("../../assets/icons/agents/cursor.svg"),
-        "icons/agents/goose.svg" => include_bytes!("../../assets/icons/agents/goose.svg"),
-        "icons/agents/droid.svg" => include_bytes!("../../assets/icons/agents/droid.svg"),
-        "icons/agents/grok.svg" => include_bytes!("../../assets/icons/agents/grok.svg"),
-        "icons/agents/pi.svg" => include_bytes!("../../assets/icons/agents/pi.svg"),
-        "icons/agents/omp.svg" => include_bytes!("../../assets/icons/agents/omp.svg"),
-        "icons/agents/qwen.svg" => include_bytes!("../../assets/icons/agents/qwen.svg"),
-        "icons/agents/kimi.svg" => include_bytes!("../../assets/icons/agents/kimi.svg"),
-        "icons/agents/qodercli.svg" => include_bytes!("../../assets/icons/agents/qodercli.svg"),
-        // The China build ships the same mark.
-        "icons/agents/qoderclicn.svg" => {
-            include_bytes!("../../assets/icons/agents/qoderclicn.svg")
-        }
-        "icons/agents/crush.svg" => include_bytes!("../../assets/icons/agents/crush.svg"),
-        "icons/agents/codebuddy.svg" => {
-            include_bytes!("../../assets/icons/agents/codebuddy.svg")
-        }
+        "icons/github.svg" => include_bytes!("../../assets/icons/github.svg"),
         _ => return None,
     };
     Some(bytes)
@@ -94,7 +46,7 @@ mod tests {
 
     #[test]
     fn stock_prefix_bypasses_the_overrides() {
-        for name in ["search", "ellipsis"] {
+        for name in ["plus", "folder"] {
             let overridden = Assets
                 .load(&format!("icons/{name}.svg"))
                 .unwrap()
@@ -106,36 +58,6 @@ mod tests {
             assert_ne!(
                 overridden, stock,
                 "`{name}` should resolve to different art with and without `{STOCK_PREFIX}`"
-            );
-        }
-    }
-
-    #[test]
-    fn every_agent_icon_resolves() {
-        for agent in crate::core::cli_agent::CLIAgent::ALL {
-            let path = agent.icon_path();
-            assert!(
-                Assets.load(path).unwrap().is_some(),
-                "{} points at {path}, which nothing serves",
-                agent.display_name()
-            );
-        }
-    }
-
-    #[test]
-    fn every_git_icon_resolves() {
-        // An SVG on disk that nobody added to the match above silently renders
-        // as nothing, which is exactly the kind of miss no one notices.
-        for path in [
-            "icons/git-branch.svg",
-            "icons/git-sync.svg",
-            "icons/git-commit.svg",
-            "icons/list-tree.svg",
-            "icons/list-flat.svg",
-        ] {
-            assert!(
-                Assets.load(path).unwrap().is_some(),
-                "{path} is not registered in `agent_icon`"
             );
         }
     }
@@ -234,7 +156,7 @@ mod tests {
         // land at the same optical density; SF Symbols compensates `plus`
         // against `sidebar.left` the same way.
         const OPEN_FORM: f32 = 7. / 6.;
-        let family: f32 = attr(&glyph("panel-left"), "stroke-width").parse().unwrap();
+        let family: f32 = attr(&glyph("folder"), "stroke-width").parse().unwrap();
         let want = family * OPEN_FORM;
         assert!(
             (stroke - want).abs() < 0.01,

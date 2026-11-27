@@ -29,8 +29,8 @@ mkdir -p "$STAGE"
 
 cp "target/${TARGET}/release/ntty7" "$STAGE/ntty7"
 chmod +x "$STAGE/ntty7"
-# Release builds keep symbols (thin LTO, no profile strip); drop them here so
-# the archive isn't ~100 MB of debug info.
+# `[profile.release]` already sets `strip = "symbols"`. Strip again so a
+# binary built outside that profile does not ship a ~100 MB unstripped archive.
 strip "$STAGE/ntty7" || echo "⚠️  strip unavailable — shipping unstripped binary"
 mkdir -p "$STAGE/completions"
 cp assets/completions/*.json "$STAGE/completions/"

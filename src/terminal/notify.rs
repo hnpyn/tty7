@@ -83,24 +83,32 @@ fn sanitize_notification_text(s: &str, max_chars: usize) -> String {
 /// API is for: no parked thread, no timer, nothing on the main thread until
 /// the user actually clicks. The click dismisses the banner.
 ///
-/// Nothing else may touch the center on this platform. `mac-notification-sys`
-/// installs a delegate of its own the first time it sends, the last
-/// `setDelegate:` wins, and `notify-rust` is that crate on macOS — so its
-/// `show` is never called here, only its `set_application`, which does not
-/// install one (that is what names a bare `cargo run` binary to the center).
+/// Nothing else may touch the center on this platform. A second sender would
+/// install its own delegate, and the last `setDelegate:` wins. A bare
+/// `cargo run` binary has no bundle identifier, which the center refuses;
+/// that case is named below, and a bundled `.app` is left alone.
 #[cfg(target_os = "macos")]
 #[allow(
     deprecated,
     reason = "UNUserNotificationCenter needs a signed, entitled bundle; NSUserNotification is what a bare binary can use"
 )]
 mod macos_notify {
+    use std::sync::atomic::{AtomicPtr, Ordering};
+
     use objc2::rc::{Retained, autoreleasepool};
-    use objc2::runtime::ProtocolObject;
-    use objc2::{AnyThread, define_class, msg_send};
+    use objc2::runtime::{AnyClass, AnyObject, Imp, ProtocolObject, Sel};
+    use objc2::{AnyThread, define_class, msg_send, sel};
+    use objc2_app_kit::NSWorkspace;
     use objc2_foundation::{
-        NSObject, NSObjectProtocol, NSString, NSUserNotification, NSUserNotificationCenter,
-        NSUserNotificationCenterDelegate,
+        NSBundle, NSObject, NSObjectProtocol, NSString, NSUserNotification,
+        NSUserNotificationCenter, NSUserNotificationCenterDelegate, ns_string,
     };
+
+    /// The id a bare binary answers for `-[NSBundle bundleIdentifier]`.
+    /// A `&'static NSString` from `ns_string!`, so the pointer is +0 and immortal.
+    static BUNDLE_ID: AtomicPtr<AnyObject> = AtomicPtr::new(std::ptr::null_mut());
+    /// `+[NSBundle mainBundle]`, cached so the swizzle does not message it again.
+    static MAIN_BUNDLE: AtomicPtr<AnyObject> = AtomicPtr::new(std::ptr::null_mut());
 
     define_class!(
         // SAFETY: NSObject has no subclassing requirements; `Delegate` has no
@@ -132,18 +140,11 @@ mod macos_notify {
     fn install_delegate() {
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| {
-            // Name the delivering application to the center before it is first
-            // touched: the center drops requests from a process with no bundle
-            // identity, which is what a bare `cargo run` binary is. This
-            // swizzles `-[NSBundle bundleIdentifier]` for the main bundle to
-            // `com.github.ntty7` when LaunchServices knows that id (a bundled
-            // ntty7.app). It is not tty7's id: a machine that also has
-            // tty7.app installed must not have this process's notifications
-            // claimed by that bundle. When LaunchServices does not know the
-            // id, the swizzle's own default, `com.apple.Terminal`, is what the
-            // center sees. It can only be called once per process, so there is
-            // no second chance to pass a different name.
-            let _ = notify_rust::set_application("com.github.ntty7");
+            // Name a bare binary before the center is first touched. The
+            // center drops requests from a process whose bundle identifier is
+            // nil, which is what `cargo run` is. A bundled `.app` already has
+            // `CFBundleIdentifier` and must keep it.
+            ensure_bundle_identifier();
             // SAFETY: `NSObject`'s `init` takes nothing and returns the object.
             let delegate: Retained<Delegate> = unsafe { msg_send![Delegate::alloc(), init] };
             let center = NSUserNotificationCenter::defaultUserNotificationCenter();
@@ -153,6 +154,106 @@ mod macos_notify {
             // the process, so it is simply never released.
             std::mem::forget(delegate);
         });
+    }
+
+    pub(super) fn ensure_bundle_identifier() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            // A bundled `.app` already has `CFBundleIdentifier`. Swizzling
+            // would replace that id.
+            if NSBundle::mainBundle().bundleIdentifier().is_some() {
+                return;
+            }
+            // Launch Services knows `com.github.ntty7` only when ntty7.app is
+            // installed. Otherwise the center accepts `com.apple.Terminal`,
+            // which is what `mac-notification-sys` fell back to.
+            let ident: &'static NSString = if NSWorkspace::sharedWorkspace()
+                .URLForApplicationWithBundleIdentifier(ns_string!("com.github.ntty7"))
+                .is_some()
+            {
+                ns_string!("com.github.ntty7")
+            } else {
+                ns_string!("com.apple.Terminal")
+            };
+            BUNDLE_ID.store(
+                std::ptr::from_ref(ident).cast_mut().cast(),
+                Ordering::Release,
+            );
+            // The returned object is the process main bundle. Dropping this
+            // retain leaves the runtime's own reference, so the pointer stays
+            // valid for the process.
+            let main = NSBundle::mainBundle();
+            MAIN_BUNDLE.store(Retained::as_ptr(&main).cast_mut().cast(), Ordering::Release);
+            // SAFETY: the main bundle's identifier is nil, and this runs once,
+            // after the pointer and the id above are published.
+            unsafe { install_bare_bundle_identifier() }
+        });
+    }
+
+    /// `-[NSBundle bundleIdentifier]` after the swizzle. The main bundle
+    /// returns the id chosen in [`ensure_bundle_identifier`] as a +0 pointer
+    /// into a static `NSString`. Every other bundle calls the original.
+    unsafe extern "C-unwind" fn bare_bundle_identifier(
+        this: &AnyObject,
+        _cmd: Sel,
+    ) -> *mut AnyObject {
+        let main = MAIN_BUNDLE.load(Ordering::Acquire);
+        if !main.is_null() && std::ptr::eq(std::ptr::from_ref(this), main.cast_const()) {
+            return BUNDLE_ID.load(Ordering::Acquire);
+        }
+        unsafe { msg_send![this, tty7_bundleIdentifier] }
+    }
+
+    /// SAFETY: call only when `-[NSBundle bundleIdentifier]` of the main
+    /// bundle is nil, and only once. Installs [`bare_bundle_identifier`].
+    unsafe fn install_bare_bundle_identifier() {
+        use objc2::ffi::{
+            class_addMethod, class_getInstanceMethod, class_replaceMethod,
+            method_exchangeImplementations, method_getImplementation, method_getTypeEncoding,
+        };
+
+        let Some(cls) = AnyClass::get(c"NSBundle") else {
+            return;
+        };
+        let original = unsafe { class_getInstanceMethod(cls, sel!(bundleIdentifier)) };
+        if original.is_null() {
+            return;
+        }
+        let enc = unsafe { method_getTypeEncoding(original) };
+        if enc.is_null() {
+            return;
+        }
+        let Some(original_imp) = (unsafe { method_getImplementation(original) }) else {
+            return;
+        };
+        // SAFETY: `bare_bundle_identifier` is an ObjC method IMP whose
+        // arguments match `enc`, the original method's type encoding.
+        let imp = unsafe {
+            std::mem::transmute::<unsafe extern "C-unwind" fn(&AnyObject, Sel) -> *mut AnyObject, Imp>(
+                bare_bundle_identifier,
+            )
+        };
+        let cls = std::ptr::from_ref(cls).cast_mut();
+        // `class_addMethod` fails when this class already implements the
+        // selector, and succeeds when it is inherited. That is how we tell
+        // the two swizzle shapes apart.
+        let inherited = unsafe { class_addMethod(cls, sel!(bundleIdentifier), imp, enc) };
+        if inherited.as_bool() {
+            // Our IMP now answers `bundleIdentifier` on this class. The
+            // call-through selector has to be the implementation we found on
+            // the superclass, or a non-main bundle would recurse.
+            unsafe { class_replaceMethod(cls, sel!(tty7_bundleIdentifier), original_imp, enc) };
+            return;
+        }
+        let added = unsafe { class_addMethod(cls, sel!(tty7_bundleIdentifier), imp, enc) };
+        if !added.as_bool() {
+            return;
+        }
+        let swapped = unsafe { class_getInstanceMethod(cls, sel!(tty7_bundleIdentifier)) };
+        if swapped.is_null() {
+            return;
+        }
+        unsafe { method_exchangeImplementations(original.cast_mut(), swapped.cast_mut()) }
     }
 
     /// Hands the notification to the center and returns. `deliverNotification:`
@@ -329,6 +430,43 @@ mod notification_tests {
         let out = sanitize_notification_text(&"账".repeat(200), 8);
         assert_eq!(out, format!("{}…", "账".repeat(8)));
         assert_eq!(sanitize_notification_text("short", 8), "short");
+    }
+
+    /// A bare test binary has no `CFBundleIdentifier`. The swizzle names it,
+    /// a second call does not recurse, and Foundation's own bundle is left
+    /// on its real id.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_bare_binary_bundle_identifier_is_stable_and_leaves_other_bundles() {
+        use objc2::ClassType;
+        use objc2_foundation::{NSBundle, NSString};
+
+        super::macos_notify::ensure_bundle_identifier();
+        super::macos_notify::ensure_bundle_identifier();
+
+        let id = NSBundle::mainBundle()
+            .bundleIdentifier()
+            .expect("the swizzle names a bare binary")
+            .to_string();
+        assert!(
+            id == "com.github.ntty7" || id == "com.apple.Terminal",
+            "{id}"
+        );
+        let again = NSBundle::mainBundle()
+            .bundleIdentifier()
+            .expect("a second read does not recurse")
+            .to_string();
+        assert_eq!(id, again);
+
+        // SAFETY: `NSString` is a registered Foundation class.
+        let foundation = unsafe { NSBundle::bundleForClass(NSString::class()) };
+        assert_eq!(
+            foundation
+                .bundleIdentifier()
+                .expect("Foundation has a bundle id")
+                .to_string(),
+            "com.apple.Foundation"
+        );
     }
 
     /// The real WinRT XML parser must accept the document, including escaped

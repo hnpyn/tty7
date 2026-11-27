@@ -67,11 +67,6 @@ image = "0.25"
 # The VT parser and grid the live terminal mirror renders.
 alacritty_terminal.workspace = true
 
-# Desktop notifications driven by OSC 9 / OSC 777 escape sequences, on Linux and
-# Windows. On macOS only its `set_application` is used — never `show`; see
-# `terminal::notify::macos_notify` for why.
-notify-rust = "4"
-
 # Filesystem watcher for live config reload: watches `config.json` and reloads
 # `Config` + re-applies the theme without a restart.
 notify = "8"
@@ -141,7 +136,9 @@ winresource = "0.1"
 # and it makes jieba unnecessary here — see the non-macos section below.
 core-foundation = "0.10"
 objc2 = "0.6"
-objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSResponder", "NSAppearance", "NSGraphics", "NSImage"] }
+# NSWorkspace asks Launch Services whether `com.github.ntty7` is installed
+# before a bare binary borrows that id — see `terminal::notify`.
+objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSResponder", "NSAppearance", "NSGraphics", "NSImage", "NSWorkspace"] }
 # NSData feeds the runtime Dock icon for bare (non-bundled) binaries — see
 # `set_dock_icon_for_bare_binary` in main.rs.
 # NSUserNotification is the click-to-reveal notification path — see
@@ -149,7 +146,9 @@ objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSResponder", "
 # NSUserDefaults (with NSDictionary for the domain it returns) is how a test
 # checks that `font_thicken: false` leaves `AppleFontSmoothing` alone — see
 # `apply_font_thicken` in main.rs.
-objc2-foundation = { version = "0.3", features = ["NSData", "NSDictionary", "NSString", "NSUserDefaults", "NSUserNotification"] }
+# NSBundle is the bare-binary identifier swizzle, and NSURL is the value
+# `NSWorkspace` returns for the Launch Services lookup above.
+objc2-foundation = { version = "0.3", features = ["NSBundle", "NSData", "NSDictionary", "NSString", "NSUserDefaults", "NSUserNotification", "NSURL"] }
 
 # Dictionary-based Chinese word segmentation for double-click selection
 # (`terminal::smart_select`), as a *fallback* where the OS has no tokenizer of
@@ -160,6 +159,11 @@ objc2-foundation = { version = "0.3", features = ["NSData", "NSDictionary", "NSS
 # linked into the build that can't use it.
 [target.'cfg(not(target_os = "macos"))'.dependencies]
 jieba-rs = "0.10"
+# Desktop notifications for OSC 9 / OSC 777 on Linux, and the Windows fallback
+# when a branded toast cannot be shown. macOS talks to
+# `NSUserNotificationCenter` directly and names a bare binary itself; see
+# `terminal::notify::macos_notify`.
+notify-rust = "4"
 
 # x11/wayland are the Linux windowing backends; only pull them on Linux. The
 # Windows backend (`gpui_windows`) and macOS backend are selected by gpui_platform
@@ -289,6 +293,13 @@ alacritty_terminal = { opt-level = 3 }
 [profile.release]
 lto = "thin"
 codegen-units = 1
+# `strip = "symbols"` drops the release binary's local symbol table. `crash.log`
+# still records `PanicHookInfo::location()` (file and line); the backtrace's
+# own frames are addresses. `panic = "abort"` stays off: `core::crash` writes
+# its log from the panic hook and the test catches that panic with
+# `catch_unwind`, and an abort would also change how a panic that crosses an
+# `objc2` frame is reported.
+strip = "symbols"
 
 # ---- gpui fork ------------------------------------------------------------
 # Our `tty7` branch (cut from the pinned upstream rev) carries:
