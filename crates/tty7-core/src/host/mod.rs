@@ -1,8 +1,6 @@
 pub mod local;
 
-use std::io;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::thread::ThreadId;
 
@@ -67,29 +65,6 @@ pub struct SearchHit {
     pub ignored: bool,
 }
 
-pub trait Host: Send + Sync + 'static {
-    fn id(&self) -> HostId;
-
-    fn join(&self, dir: &Path, name: &str) -> PathBuf;
-
-    fn read_dir(&self, dir: &Path, root: Option<&Path>) -> io::Result<Vec<Entry>>;
-
-    fn canonicalize(&self, p: &Path) -> io::Result<PathBuf>;
-
-    fn search(
-        &self,
-        roots: &[PathBuf],
-        query: &str,
-        limit: usize,
-        max_dirs: usize,
-        show_hidden: bool,
-    ) -> io::Result<Vec<SearchHit>>;
-
-    fn repo_root(&self, p: &Path) -> io::Result<Option<PathBuf>>;
-}
-
-pub type SharedHost = Arc<dyn Host>;
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -122,12 +97,5 @@ mod tests {
     #[test]
     fn the_ui_guard_is_inert_without_registration() {
         guard_off_ui();
-    }
-
-    #[test]
-    fn host_is_object_safe() {
-        fn takes_dyn(_h: &dyn Host) {}
-        let h: SharedHost = local::LocalHost::new();
-        takes_dyn(&*h);
     }
 }

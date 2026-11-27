@@ -7,7 +7,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::ui::host_ops::Host;
+use tty7_core::host::local::LocalHost;
 
 pub(crate) const INDEX_LIMIT: usize = 50_000;
 pub(crate) const INDEX_MAX_DIRS: usize = 20_000;
@@ -149,7 +149,7 @@ pub(crate) fn rank<'a>(
     hits
 }
 
-pub(crate) fn walk(h: &dyn Host, cwds: &[PathBuf], home: Option<&Path>) -> FileList {
+pub(crate) fn walk(h: &LocalHost, cwds: &[PathBuf], home: Option<&Path>) -> FileList {
     let resolved = cwds
         .iter()
         .map(|cwd| {

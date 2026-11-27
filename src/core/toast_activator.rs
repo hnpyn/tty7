@@ -1,19 +1,18 @@
 //! The COM class Windows activates when a tty7 toast is clicked.
 //!
-//! An unpackaged app has two ways to hear about a click. The `Activated` event
-//! on a `ToastNotification` only fires while that very object is alive in the
-//! process that showed it, and in practice only for the on-screen popup. A
-//! toast clicked later from notification history (Action Center) goes the
-//! other way: the shell looks up the `ToastActivatorCLSID` on the shortcut
-//! that carries our AUMID and calls `INotificationActivationCallback::Activate`
-//! on that class — in the running tty7 if it has registered a class object,
-//! otherwise by launching the `LocalServer32` command `core::aumid` registers.
-//! Without this class, such a click did nothing at all (#1179).
+//! A toast clicked from notification history (Action Center) reaches an
+//! unpackaged app only this way: the shell looks up the `ToastActivatorCLSID`
+//! on the shortcut that carries our AUMID and calls
+//! `INotificationActivationCallback::Activate` on that class — in the running
+//! tty7 if it has registered a class object, otherwise by launching the
+//! `LocalServer32` command `core::aumid` registers. Without this class, such a
+//! click did nothing at all (#1179).
 //!
-//! The toast's `launch` attribute arrives as `invokedArgs`. It is the same
-//! pid-checked identifier macOS uses, so a click on a toast from an earlier
-//! process — the only kind a launch made by COM can receive — brings tty7
-//! forward without guessing at a pane.
+//! `Activate` returns success and does not route the click to a pane. It also
+//! does not raise an already-running window. The class has to be registered
+//! so a click from notification history can reach this process (#1179);
+//! `activationType="foreground"` is the toast attribute the shell expects
+//! alongside that class.
 
 use windows::Win32::Foundation::{BOOL, CLASS_E_NOAGGREGATION, E_POINTER};
 use windows::Win32::System::Com::{
@@ -100,18 +99,12 @@ impl INotificationActivationCallback_Impl for Activator_Impl {
     fn Activate(
         &self,
         _app_user_model_id: &PCWSTR,
-        invoked_args: &PCWSTR,
+        _invoked_args: &PCWSTR,
         _data: *const NOTIFICATION_USER_INPUT_DATA,
         _count: u32,
     ) -> windows::core::Result<()> {
-        let launch = if invoked_args.is_null() {
-            String::new()
-        } else {
-            // SAFETY: a non-null PCWSTR from COM is NUL-terminated and lives
-            // for the duration of the call.
-            unsafe { invoked_args.to_string() }.unwrap_or_default()
-        };
-        crate::terminal::toast_activated(&launch);
+        // Acknowledge the click. The launch string is not routed to a pane,
+        // and this callback does not raise an already-running window.
         Ok(())
     }
 }

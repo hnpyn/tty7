@@ -1,8 +1,11 @@
+use std::sync::Arc;
+
 use gpui::Context;
 
 use gpui_component::notification::Notification;
+use tty7_core::host::local::LocalHost;
 
-pub use tty7_core::host::{Host, HostId, SharedHost};
+pub use tty7_core::host::HostId;
 
 mod blocking {
     use std::collections::VecDeque;
@@ -191,16 +194,16 @@ where
 pub struct HostOps;
 
 impl HostOps {
-    pub fn run<T, E, F, L>(host: SharedHost, cx: &mut Context<E>, f: F, land: L)
+    pub fn run<T, E, F, L>(host: Arc<LocalHost>, cx: &mut Context<E>, f: F, land: L)
     where
         E: 'static,
         T: Send + 'static,
-        F: FnOnce(&dyn Host) -> T + Send + 'static,
+        F: FnOnce(&LocalHost) -> T + Send + 'static,
         L: FnOnce(&mut E, T, &mut Context<E>) + 'static,
     {
         tty7_core::host::register_ui_thread();
         cx.spawn(async move |this, cx| {
-            let Some(out) = off_thread(move || f(&*host)).await else {
+            let Some(out) = off_thread(move || f(&host)).await else {
                 return;
             };
             let _ = this.update(cx, |view, cx| land(view, out, cx));

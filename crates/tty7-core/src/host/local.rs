@@ -5,78 +5,32 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::core::gitignore::GitignoreChain;
-use crate::host::{Entry, Host, HostId, SearchHit, SharedHost, guard_off_ui};
+use crate::host::{Entry, HostId, SearchHit, guard_off_ui};
 
+#[derive(Default)]
 pub struct LocalHost {
     gitignore: Arc<Mutex<GitignoreChain>>,
 }
 
 impl LocalHost {
-    #[allow(clippy::new_ret_no_self)]
-    pub fn new() -> SharedHost {
-        Arc::new(LocalHost {
-            gitignore: Arc::new(Mutex::new(GitignoreChain::default())),
-        })
+    pub fn new() -> Self {
+        Self::default()
     }
 
-    pub fn shared() -> SharedHost {
-        static LOCAL: OnceLock<SharedHost> = OnceLock::new();
-        LOCAL.get_or_init(LocalHost::new).clone()
+    pub fn shared() -> Arc<Self> {
+        static LOCAL: OnceLock<Arc<LocalHost>> = OnceLock::new();
+        LOCAL.get_or_init(|| Arc::new(LocalHost::new())).clone()
     }
 
-    fn list(&self, dir: &Path, root: Option<&Path>) -> io::Result<Vec<(Entry, PathBuf)>> {
-        let mut out: Vec<(Entry, PathBuf)> = Vec::new();
-        for e in fs::read_dir(dir)?.flatten() {
-            let path = e.path();
-            let name = e.file_name().to_string_lossy().into_owned();
-            let ft = e.file_type().ok();
-            let is_symlink = ft.is_some_and(|t| t.is_symlink());
-            let is_dir = if is_symlink {
-                fs::metadata(&path).map(|m| m.is_dir()).unwrap_or(false)
-            } else {
-                ft.is_some_and(|t| t.is_dir())
-            };
-            out.push((
-                Entry {
-                    name,
-                    is_dir,
-                    is_symlink,
-                    ignored: false,
-                },
-                path,
-            ));
-        }
-
-        let mut chain = self.gitignore.lock().unwrap_or_else(|e| e.into_inner());
-        for (entry, path) in &mut out {
-            entry.ignored = entry.name == ".git"
-                || root.is_some_and(|root| chain.is_ignored(path, entry.is_dir, root));
-        }
-        drop(chain);
-
-        sort_entries(&mut out);
-        Ok(out)
-    }
-}
-
-fn sort_entries(entries: &mut [(Entry, PathBuf)]) {
-    entries.sort_by(|(a, _), (b, _)| {
-        b.is_dir
-            .cmp(&a.is_dir)
-            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-    });
-}
-
-impl Host for LocalHost {
-    fn id(&self) -> HostId {
+    pub fn id(&self) -> HostId {
         HostId::LOCAL
     }
 
-    fn join(&self, dir: &Path, name: &str) -> PathBuf {
+    pub fn join(&self, dir: &Path, name: &str) -> PathBuf {
         dir.join(name)
     }
 
-    fn read_dir(&self, dir: &Path, root: Option<&Path>) -> io::Result<Vec<Entry>> {
+    pub fn read_dir(&self, dir: &Path, root: Option<&Path>) -> io::Result<Vec<Entry>> {
         guard_off_ui();
         Ok(self.list(dir, root)?.into_iter().map(|(e, _)| e).collect())
     }
@@ -92,14 +46,14 @@ impl Host for LocalHost {
     /// produces it. What the call is actually *for* — resolving a junction, a
     /// `subst` drive, an 8.3 short name or a symlink — is untouched. See
     /// [`crate::core::path_spelling`].
-    fn canonicalize(&self, p: &Path) -> io::Result<PathBuf> {
+    pub fn canonicalize(&self, p: &Path) -> io::Result<PathBuf> {
         guard_off_ui();
         Ok(crate::core::path_spelling::local_spelling_buf(
             fs::canonicalize(p)?,
         ))
     }
 
-    fn search(
+    pub fn search(
         &self,
         roots: &[PathBuf],
         query: &str,
@@ -145,19 +99,61 @@ impl Host for LocalHost {
         Ok(out)
     }
 
-    fn repo_root(&self, p: &Path) -> io::Result<Option<PathBuf>> {
+    pub fn repo_root(&self, p: &Path) -> io::Result<Option<PathBuf>> {
         guard_off_ui();
         Ok(p.ancestors()
             .find(|a| a.join(".git").exists())
             .map(Path::to_path_buf))
     }
+
+    fn list(&self, dir: &Path, root: Option<&Path>) -> io::Result<Vec<(Entry, PathBuf)>> {
+        let mut out: Vec<(Entry, PathBuf)> = Vec::new();
+        for e in fs::read_dir(dir)?.flatten() {
+            let path = e.path();
+            let name = e.file_name().to_string_lossy().into_owned();
+            let ft = e.file_type().ok();
+            let is_symlink = ft.is_some_and(|t| t.is_symlink());
+            let is_dir = if is_symlink {
+                fs::metadata(&path).map(|m| m.is_dir()).unwrap_or(false)
+            } else {
+                ft.is_some_and(|t| t.is_dir())
+            };
+            out.push((
+                Entry {
+                    name,
+                    is_dir,
+                    is_symlink,
+                    ignored: false,
+                },
+                path,
+            ));
+        }
+
+        let mut chain = self.gitignore.lock().unwrap_or_else(|e| e.into_inner());
+        for (entry, path) in &mut out {
+            entry.ignored = entry.name == ".git"
+                || root.is_some_and(|root| chain.is_ignored(path, entry.is_dir, root));
+        }
+        drop(chain);
+
+        sort_entries(&mut out);
+        Ok(out)
+    }
+}
+
+fn sort_entries(entries: &mut [(Entry, PathBuf)]) {
+    entries.sort_by(|(a, _), (b, _)| {
+        b.is_dir
+            .cmp(&a.is_dir)
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn sandbox() -> (SharedHost, tempfile::TempDir) {
+    fn sandbox() -> (LocalHost, tempfile::TempDir) {
         (LocalHost::new(), tempfile::tempdir().expect("temp dir"))
     }
 

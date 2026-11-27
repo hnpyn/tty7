@@ -108,7 +108,7 @@ const BACKSLASH: u16 = b'\\' as u16;
 /// - **touch the disk.** This is a re-spelling, not a resolution: a junction,
 ///   a `subst` drive or an 8.3 short name is left exactly as it arrived.
 ///   `git` has already resolved its own answer, and a caller that wants the
-///   real path calls `Host::canonicalize`, which now lands here on its way
+///   real path calls `LocalHost::canonicalize`, which now lands here on its way
 ///   out.
 /// - **rewrite anything but a drive or UNC verbatim path.** `\\?\pipe\…` and
 ///   the other device namespaces have no plain form to fall back to.

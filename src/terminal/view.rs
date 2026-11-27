@@ -578,13 +578,10 @@ impl TerminalView {
         self.notify_pane(Some(agent.display_name()), &body, cx);
     }
 
-    /// Notify about this pane, with a title describing where it lives and a
-    /// click that reveals it. The id has to be the pane's *gpui entity id*:
-    /// that is what `TrayAction::RevealPane` matches leaves on, and it is a
-    /// different number from `pane_id`, which the daemon assigns.
+    /// Notify about this pane, with a title describing where it lives.
     fn notify_pane(&self, lead: Option<&str>, body: &str, cx: &mut Context<Self>) {
         let title = self.notification_title(lead, cx);
-        super::notify::notify_desktop_for_pane(Some(&title), body, Some(cx.entity_id()));
+        super::notify::notify_desktop_for_pane(Some(&title), body);
     }
 
     /// Desktop notifications the program wrote (OSC 9, 99, 777), such as
@@ -630,11 +627,9 @@ impl TerminalView {
         }
         for (title, body) in notes {
             match title {
-                Some(title) => super::notify::notify_desktop_for_pane(
-                    Some(&title),
-                    &body,
-                    Some(cx.entity_id()),
-                ),
+                Some(title) => {
+                    super::notify::notify_desktop_for_pane(Some(&title), &body);
+                }
                 None => self.notify_pane(agent, &body, cx),
             }
         }
@@ -976,7 +971,6 @@ impl TerminalView {
         use_config_shell: bool,
     ) -> anyhow::Result<ShellParts> {
         let (terminal, pane_id) = RemoteTerminal::spawn_on(
-            &crate::terminal::PaneRoute::Local,
             TermSize::new(80, 24),
             8,
             17,
@@ -1255,17 +1249,13 @@ impl TerminalView {
         cell_width: Pixels,
         line_height: Pixels,
         scale: f32,
-        cx: &mut Context<Self>,
+        _cx: &mut Context<Self>,
     ) {
-        // A column change reflows every wrapped line, and a match point is an
-        // absolute (line, column) against the width it was scanned at — so
-        // the highlights keep washing the *old* positions until something
-        // rescans. Output rescans them (`Wakeup` → refresh), but a quiet
-        // local pane has no output coming: without this the drift outlasts
-        // the resize indefinitely (#586). Rescan with the output path's
-        // discipline — it keeps the selection and never scrolls. Rows alone
-        // reflow nothing, so a height-only drag stays cheap.
-        let cols_changed = cols != self.terminal.size().cols;
+        // A column change reflows every wrapped line when the daemon echoes
+        // `Size`. That echo wakes the view, and the debounced search rescan
+        // (`Wakeup` → `note_output_under_search`) moves highlights onto the
+        // new geometry (#586). Scanning here would still see the pre-reflow
+        // grid. Rows alone reflow nothing.
         if (cols, rows) != (self.terminal.size().cols, self.terminal.size().rows) {
             self.last_hover_cell = None;
             self.hovered_link = None;
@@ -1290,9 +1280,6 @@ impl TerminalView {
             (cell_width.as_f32() * scale).round().max(1.) as u16,
             (line_height.as_f32() * scale).round().max(1.) as u16,
         );
-        if cols_changed && self.search.is_some() {
-            self.refresh_matches_after_output(cx);
-        }
     }
 
     pub fn cwd(&self) -> Option<std::path::PathBuf> {
@@ -1328,8 +1315,10 @@ impl TerminalView {
         self.remote_context().is_none() && self.host_id.is_local()
     }
 
-    pub fn host(&self, cx: &gpui::App) -> Option<crate::ui::host_ops::SharedHost> {
-        crate::ui::host_registry::HostRegistry::lookup(cx, self.host_id)
+    pub fn host(&self) -> Option<std::sync::Arc<tty7_core::host::local::LocalHost>> {
+        self.host_id
+            .is_local()
+            .then(tty7_core::host::local::LocalHost::shared)
     }
 
     pub fn host_id(&self) -> crate::ui::host_ops::HostId {
@@ -1413,8 +1402,8 @@ impl TerminalView {
         self.git_status_cwd.clone().or_else(|| self.cwd())
     }
 
-    /// [`Self::effective_cwd`], restricted to paths the pane's host can act
-    /// on — for callers that will hand the result to a `Host` call.
+    /// [`Self::effective_cwd`], restricted to paths this machine can act on.
+    /// Callers hand the result to [`tty7_core::host::local::LocalHost`].
     pub fn effective_host_cwd(&self) -> Option<std::path::PathBuf> {
         self.git_status_cwd.clone().or_else(|| self.host_cwd())
     }
@@ -3825,7 +3814,7 @@ impl TerminalView {
             let fg = cx
                 .background_executor()
                 .spawn(async move {
-                    RemoteTerminal::list_panes_on(&crate::terminal::PaneRoute::Local)
+                    RemoteTerminal::list_panes_on()
                         .into_iter()
                         .find(|p| p.pane_id == pane_id)
                         .map(|p| p.title)
@@ -5159,7 +5148,7 @@ impl TerminalView {
         {
             return;
         }
-        let Some(host) = self.host(cx) else {
+        let Some(host) = self.host() else {
             return;
         };
         self.link_repo_root_pending = true;
@@ -8526,7 +8515,7 @@ mod tests {
 #[cfg(test)]
 mod gpui_tests {
     use super::*;
-    use crate::daemon::protocol::{ClientMsg, DaemonMsg};
+    use crate::daemon::protocol::{ClientMsg, DaemonMsg, WinSize};
     use crate::terminal::remote::PtySource;
     use crate::terminal::remote::TestLink;
     use gpui::{Entity, TestAppContext, point};
@@ -8579,10 +8568,8 @@ mod gpui_tests {
             gpui_component::init(cx);
             cx.set_global(Config::default());
         });
-        let (terminal, daemon_side) = RemoteTerminal::from_pipe(
-            TermSize::new(80, 24),
-            PtySource::for_route(&crate::terminal::PaneRoute::Local),
-        );
+        let (terminal, daemon_side) =
+            RemoteTerminal::from_pipe(TermSize::new(80, 24), PtySource::local());
         let built: std::rc::Rc<std::cell::RefCell<Option<Entity<TerminalView>>>> =
             std::rc::Rc::new(std::cell::RefCell::new(None));
         let out = built.clone();
@@ -9193,11 +9180,44 @@ mod gpui_tests {
 
     #[gpui::test]
     fn a_stale_hover_row_does_not_index_the_shrunken_grid(cx: &mut TestAppContext) {
-        let (window, _daemon) = harness(cx);
+        let (window, daemon) = harness(cx);
         window
             .update(cx, |view, _, cx| {
                 view.hover_link_at(0, 23, true, cx);
                 view.terminal.resize(TermSize::new(80, 8), 8, 17);
+            })
+            .unwrap();
+        daemon.send(DaemonMsg::Size(WinSize {
+            cols: 80,
+            rows: 8,
+            cell_w: 8,
+            cell_h: 17,
+        }));
+        for _ in 0..200 {
+            let ready = window
+                .update(cx, |view, _, _| {
+                    view.terminal.term.lock().screen_lines() == 8
+                })
+                .unwrap();
+            if ready {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            window
+                .update(cx, |view, _, _| {
+                    view.terminal.term.lock().screen_lines() == 8
+                })
+                .unwrap(),
+            "the size echo never shrank the grid"
+        );
+        window
+            .update(cx, |view, _, cx| {
+                // The first hover cached (0, 23) while the grid was 24 rows.
+                // Flip the modifier so refresh reads the cell again, now that
+                // row 23 is outside the 8-row grid.
+                view.link_modifier_down = false;
                 view.last_hover_cell = Some((0, 23));
                 assert!(
                     !view.refresh_link_hover(true, cx),
@@ -9246,6 +9266,29 @@ mod gpui_tests {
                 view.set_grid_size(20, 6, px(8.), px(17.), 1., cx);
             })
             .unwrap();
+        // The grid keeps its old width until the daemon echoes `Size`. The
+        // path has to be parsed at 20 columns or it never wraps.
+        daemon.send(DaemonMsg::Size(WinSize {
+            cols: 20,
+            rows: 6,
+            cell_w: 8,
+            cell_h: 17,
+        }));
+        for _ in 0..200 {
+            let ready = window
+                .update(cx, |view, _, _| view.terminal.term.lock().columns() == 20)
+                .unwrap();
+            if ready {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            window
+                .update(cx, |view, _, _| view.terminal.term.lock().columns() == 20)
+                .unwrap(),
+            "the size echo never reflowed the grid"
+        );
         daemon.send(DaemonMsg::Cwd(dir.clone()));
         daemon.send(DaemonMsg::Output(
             b"see a/bb/ccc/dddd/notes.md here\r\n".to_vec(),
@@ -9253,8 +9296,9 @@ mod gpui_tests {
         for _ in 0..200 {
             let seen = window
                 .update(cx, |view, _, _| {
+                    // 20 columns: row 0 is `see a/bb/ccc/dddd/no`, row 1 starts at `t`.
                     view.cwd().is_some()
-                        && view.terminal.term.lock().grid()[Line(1)][Column(0)].c == 'e'
+                        && view.terminal.term.lock().grid()[Line(1)][Column(0)].c == 't'
                 })
                 .unwrap();
             if seen {
@@ -9265,7 +9309,7 @@ mod gpui_tests {
 
         window
             .update(cx, |view, _, cx| {
-                // Row 0 holds `see a/bb/ccc/dddd/n`, row 1 the rest.
+                // Row 0 holds `see a/bb/ccc/dddd/no`, row 1 the rest.
                 for (col, row, where_) in [(6, 0, "before the seam"), (2, 1, "after it")] {
                     assert!(
                         view.hover_link_at(col, row, true, cx),
@@ -12202,12 +12246,42 @@ mod gpui_tests {
                         "one unwrapped row at 80 columns"
                     );
 
-                    // No output, no debounce: the resize alone has to move the
-                    // highlight to where the reflow put the text. Where exactly
-                    // the wrapped half lands (next row, or the first half pushed
-                    // into scrollback) is the grid's business — what matters is
-                    // that the highlight sits on the needle, not its old row.
+                    // The grid does not move until the daemon echoes `Size`.
+                    // That echo wakes the view, and the debounced rescan is
+                    // what puts the highlight on the reflowed needle. Where
+                    // exactly the wrapped half lands is the grid's business —
+                    // what matters is that the highlight leaves column 70.
                     v.set_grid_size(40, 24, px(8.), px(17.), 1., cx);
+                });
+            })
+            .unwrap();
+        daemon.send(DaemonMsg::Size(WinSize {
+            cols: 40,
+            rows: 24,
+            cell_w: 8,
+            cell_h: 17,
+        }));
+        for _ in 0..200 {
+            let ready = cx.update(|cx| view.read(cx).terminal.term.lock().columns() == 40);
+            if ready {
+                break;
+            }
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            cx.update(|cx| view.read(cx).terminal.term.lock().columns() == 40),
+            "the size echo never reflowed the grid"
+        );
+        for _ in 0..8 {
+            cx.executor()
+                .advance_clock(super::super::search::SCAN_DEBOUNCE * 2);
+            cx.run_until_parked();
+        }
+
+        let after = window
+            .update(cx, |_, _, cx| {
+                view.update(cx, |v, cx| {
                     let after = *v.search.as_ref().unwrap().matches[0].start();
                     assert_ne!(
                         (after.line.0, after.column.0),
@@ -12219,13 +12293,42 @@ mod gpui_tests {
                     drop(term);
                     assert_eq!(cell, 'n', "the highlight follows the reflowed text");
 
-                    // A rows-only change reflows nothing; the scan must not move.
+                    // A rows-only change reflows nothing. The echo still wakes
+                    // a rescan; the highlight has to stay where the column
+                    // change put it.
                     v.set_grid_size(40, 12, px(8.), px(17.), 1., cx);
+                    (after.line.0, after.column.0)
+                })
+            })
+            .unwrap();
+        daemon.send(DaemonMsg::Size(WinSize {
+            cols: 40,
+            rows: 12,
+            cell_w: 8,
+            cell_h: 17,
+        }));
+        for _ in 0..200 {
+            let ready = cx.update(|cx| view.read(cx).terminal.term.lock().screen_lines() == 12);
+            if ready {
+                break;
+            }
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            cx.update(|cx| view.read(cx).terminal.term.lock().screen_lines() == 12),
+            "the size echo never reflowed the grid"
+        );
+        for _ in 0..8 {
+            cx.executor()
+                .advance_clock(super::super::search::SCAN_DEBOUNCE * 2);
+            cx.run_until_parked();
+        }
+        window
+            .update(cx, |_, _, cx| {
+                view.update(cx, |v, _| {
                     let still = *v.search.as_ref().unwrap().matches[0].start();
-                    assert_eq!(
-                        (still.line.0, still.column.0),
-                        (after.line.0, after.column.0)
-                    );
+                    assert_eq!((still.line.0, still.column.0), after);
                 });
             })
             .unwrap();
@@ -14000,7 +14103,7 @@ mod prompt_handover_tests {
         });
         let (terminal, daemon_side) = RemoteTerminal::from_pipe(
             TermSize::new(80, 24),
-            crate::terminal::remote::PtySource::for_route(&crate::terminal::PaneRoute::Local),
+            crate::terminal::remote::PtySource::local(),
         );
         let window =
             cx.add_window(move |window, cx| TerminalView::with_terminal(terminal, 1, window, cx));
@@ -14498,11 +14601,11 @@ mod prompt_handover_tests {
         });
         let (a_terminal, a_pty) = RemoteTerminal::from_pipe(
             TermSize::new(80, 24),
-            crate::terminal::remote::PtySource::for_route(&crate::terminal::PaneRoute::Local),
+            crate::terminal::remote::PtySource::local(),
         );
         let (b_terminal, b_pty) = RemoteTerminal::from_pipe(
             TermSize::new(80, 24),
-            crate::terminal::remote::PtySource::for_route(&crate::terminal::PaneRoute::Local),
+            crate::terminal::remote::PtySource::local(),
         );
         let window = cx.add_window(move |window, cx| {
             let pane = |terminal, window: &mut Window, cx: &mut Context<Split>| {

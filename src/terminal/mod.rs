@@ -29,6 +29,6 @@ mod typeahead;
 pub mod view;
 
 #[cfg(target_os = "windows")]
-pub(crate) use notify::{notify_desktop_for_pane, toast_activated};
-pub use remote::{PaneRoute, shutdown_panes};
+pub(crate) use notify::notify_desktop_for_pane;
+pub use remote::shutdown_panes;
 pub use size::TermSize;

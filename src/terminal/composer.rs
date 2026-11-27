@@ -45,8 +45,9 @@ use super::view::{GRID_PAD_X, GRID_PAD_Y, TerminalView, pasted_paths_text, types
 use crate::core::cli_agent::{AgentStatus, CLIAgent};
 use crate::core::shell_quote::{Quoting, quoting_for};
 use crate::terminal::files::{FileIndex, FileList, IndexedFile, rank, walk};
-use crate::ui::host_ops::{Host, HostId, HostOps};
+use crate::ui::host_ops::{HostId, HostOps};
 use crate::ui::i18n::{L10nKey, t, t_fmt};
+use tty7_core::host::local::LocalHost;
 
 /// How tall the text may grow, in lines, before it scrolls instead.
 const MAX_ROWS: usize = 8;
@@ -1852,7 +1853,7 @@ fn builtin_commands(agent: CLIAgent) -> &'static [(&'static str, &'static str)] 
 /// project's under `cwd`, the user's under `home`. A file's name is its
 /// command; subdirectories only namespace the description.
 fn custom_commands(
-    host: &dyn Host,
+    host: &LocalHost,
     cwd: Option<&Path>,
     home: Option<&Path>,
 ) -> Vec<(String, String)> {
@@ -2743,13 +2744,11 @@ impl TerminalView {
                 {
                     return;
                 }
-                let host = local
-                    .then(|| crate::ui::host_registry::HostRegistry::lookup(cx, host_id))
-                    .flatten();
+                let host = local.then(LocalHost::shared);
                 let custom = match (host, agent) {
                     (Some(host), Some(CLIAgent::Claude)) => {
                         let home = std::env::var_os("HOME").map(PathBuf::from);
-                        custom_commands(&*host, cwd.as_deref(), home.as_deref())
+                        custom_commands(&host, cwd.as_deref(), home.as_deref())
                     }
                     _ => Vec::new(),
                 };
@@ -2764,7 +2763,7 @@ impl TerminalView {
                 let Some(cwd) = cwd.filter(|_| stale) else {
                     return;
                 };
-                let Some(host) = crate::ui::host_registry::HostRegistry::lookup(cx, host_id) else {
+                let Some(host) = host_id.is_local().then(LocalHost::shared) else {
                     return;
                 };
                 if !matches!(c.files, Files::Ready(..)) {
@@ -5839,7 +5838,7 @@ mod tests {
         #[cfg(unix)]
         std::os::unix::fs::symlink("..", project.join(".claude/commands/team/up")).unwrap();
         let host = tty7_core::host::local::LocalHost::new();
-        let names: Vec<String> = custom_commands(&*host, Some(&project), Some(&home))
+        let names: Vec<String> = custom_commands(&host, Some(&project), Some(&home))
             .into_iter()
             .map(|(n, _)| n)
             .collect();

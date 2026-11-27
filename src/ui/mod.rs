@@ -1,7 +1,6 @@
 pub mod assets;
 pub mod dialog;
 pub mod host_ops;
-pub mod host_registry;
 pub mod i18n;
 pub mod keymap;
 pub mod prefill;

@@ -68,9 +68,6 @@ pub enum DaemonMsg {
     Image(Vec<u8>),
     /// A kitty graphics delete (`a=d`) lifted out of the PTY stream.
     DeleteImage(Vec<u8>),
-    /// A completed OSC 5522 clipboard write. The GUI decides whether it may
-    /// touch the clipboard.
-    ClipboardWrite(Vec<u8>),
     Cwd(PathBuf),
     Prompt {
         active: bool,

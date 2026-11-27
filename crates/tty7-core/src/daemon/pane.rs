@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
@@ -10,8 +10,7 @@ use std::time::Duration;
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 
 use crate::core::clipboard::{
-    ClipboardSniffer, Event as ClipboardEvent, Segment as ClipboardSegment,
-    Sniffed as ClipboardSniffed,
+    ClipboardSniffer, Segment as ClipboardSegment, Sniffed as ClipboardSniffed,
 };
 use crate::core::kitty_graphics::{GraphicsSniffer, Segment, Sniffed};
 use crate::core::osc::OscTokenizer;
@@ -945,26 +944,6 @@ impl OutputRx {
     }
 }
 
-/// Where a pane's subscriber messages go. Consecutive `Output` frames share
-/// one buffer; every other message stays its own frame.
-pub struct PaneLink {
-    tx: OutputTx,
-}
-
-impl PaneLink {
-    pub fn coalesced(tx: OutputTx) -> Self {
-        Self { tx }
-    }
-
-    fn send(&self, msg: DaemonMsg) -> bool {
-        self.tx.push(msg)
-    }
-
-    fn send_output(&self, bytes: &[u8]) -> bool {
-        self.tx.append(bytes)
-    }
-}
-
 /// How long the death path will chase a child's exit status before giving up
 /// and reporting `Exited { code: None }`. The pty hits EOF when the last slave
 /// fd closes, which can land a few milliseconds ahead of the child becoming
@@ -974,52 +953,11 @@ const EXIT_CODE_PROBE_WINDOW: Duration = Duration::from_millis(500);
 
 const EXIT_CODE_PROBE_INTERVAL: Duration = Duration::from_millis(10);
 
-/// Clipboard epoch and permission in one word: `0` is none, else `(epoch << 1) | allowed`.
-struct ClipPermit {
-    word: AtomicU64,
-}
-
-impl ClipPermit {
-    fn new() -> Arc<Self> {
-        Arc::new(Self {
-            word: AtomicU64::new(0),
-        })
-    }
-
-    fn publish(&self, subscriber: bool, epoch: u64, allowed: bool) {
-        let packed = match epoch.checked_shl(1) {
-            Some(shifted) if subscriber && epoch >= 1 => shifted | u64::from(allowed),
-            _ => 0,
-        };
-        self.word.store(packed, Ordering::Release);
-    }
-
-    fn load(&self) -> (Option<u64>, bool) {
-        let packed = self.word.load(Ordering::Acquire);
-        if packed == 0 {
-            (None, false)
-        } else {
-            (Some(packed >> 1), packed & 1 == 1)
-        }
-    }
-}
-
-fn publish_clip(st: &PaneState) {
-    st.clip_live.publish(
-        st.subscriber.is_some(),
-        st.subscriber_epoch,
-        st.allow_remote_clipboard_write,
-    );
-}
-
 struct PaneState {
     id: u64,
     /// Geometry the pty is at. Output bytes are not retained.
     size: WinSize,
-    subscriber: Option<PaneLink>,
-    subscriber_epoch: u64,
-    allow_remote_clipboard_write: bool,
-    clip_live: Arc<ClipPermit>,
+    subscriber: Option<OutputTx>,
     cwd: Option<PathBuf>,
     /// The last title the pane reported over OSC 0/2.
     osc_title: Option<String>,
@@ -1113,7 +1051,7 @@ fn interrupt_key(bytes: &[u8]) -> Option<InterruptKey> {
 
 fn notify(st: &mut PaneState, msg: DaemonMsg) {
     if let Some(sub) = &st.subscriber {
-        sub.send(msg);
+        sub.push(msg);
     }
 }
 
@@ -1127,10 +1065,10 @@ fn publish_standing(st: &PaneState) {
         return;
     };
     if st.remote.is_some() {
-        sub.send(DaemonMsg::RemoteContext(st.remote.clone()));
+        sub.push(DaemonMsg::RemoteContext(st.remote.clone()));
     }
     if let Some(cwd) = &st.cwd {
-        sub.send(DaemonMsg::Cwd(cwd.clone()));
+        sub.push(DaemonMsg::Cwd(cwd.clone()));
     }
 }
 
@@ -1140,9 +1078,9 @@ fn publish_standing(st: &PaneState) {
 /// output is fanned out under the same lock, so the frame lands in the stream
 /// after every byte produced at the old size and before the repaint the PTY
 /// emits once it is actually resized (which happens after the lock is
-/// released). A client that speaks `FEATURE_RESIZE_ECHO` defers its grid
-/// reflow to this marker instead of reflowing the moment its window changed:
-/// the channel can hold megabytes of old-width output (the pane gate allows
+/// released). The client defers its grid reflow to this marker instead of
+/// reflowing the moment its window changed: the channel can hold megabytes
+/// of old-width output (the pane gate allows
 /// 16 MiB), and reflowing ahead of it parsed old-width bytes into a new-width
 /// grid, garbling the pane on maximize during a burst of output.
 ///
@@ -1157,7 +1095,7 @@ fn publish_standing(st: &PaneState) {
 fn resize_state(st: &mut PaneState, size: WinSize) {
     st.size = size;
     if let Some(sub) = &st.subscriber {
-        sub.send(DaemonMsg::Size(size));
+        sub.push(DaemonMsg::Size(size));
     }
 }
 
@@ -1168,7 +1106,7 @@ fn resize_state(st: &mut PaneState, size: WinSize) {
 /// have been taken.
 fn fan_out_one(st: &mut PaneState, msg: DaemonMsg, len: usize, gate: &OutputGate) {
     if let Some(sub) = &st.subscriber
-        && sub.send(msg)
+        && sub.push(msg)
     {
         gate.add(len);
     }
@@ -1190,7 +1128,7 @@ fn fan_out_output(st: &mut PaneState, bytes: &[u8], frames: Vec<GraphicsFrame>, 
         // The coalesced pipe appends into the buffer already queued. Building
         // a `Vec` here would put the 1 KiB allocation back on the hot path.
         if let Some(sub) = &st.subscriber
-            && sub.send_output(bytes)
+            && sub.append(bytes)
         {
             gate.add(bytes.len());
         }
@@ -1209,14 +1147,6 @@ fn fan_out_output(st: &mut PaneState, bytes: &[u8], frames: Vec<GraphicsFrame>, 
                 fan_out_one(st, DaemonMsg::Image(frame), len, gate);
             }
             GraphicsFrame::Delete(sel) => notify(st, DaemonMsg::DeleteImage(sel)),
-            GraphicsFrame::ClipboardWrite(frame) => {
-                let len = frame.len();
-                if let Some(sub) = &st.subscriber
-                    && sub.send(DaemonMsg::ClipboardWrite(frame))
-                {
-                    gate.add(len);
-                }
-            }
         }
     }
 }
@@ -1568,7 +1498,6 @@ enum GraphicsFrame {
     Output(Vec<u8>),
     Image(Vec<u8>),
     Delete(Vec<u8>),
-    ClipboardWrite(Vec<u8>),
 }
 
 /// Queue an encoded image frame for the subscriber, dropping any frame larger
@@ -1627,8 +1556,9 @@ fn process_graphics_output(
 
 /// Strip OSC 5522 clipboard writes and Kitty graphics out of one PTY read
 /// before anything else sees it. On the common path the original slice is
-/// borrowed unchanged; protocol payloads are decoded into out-of-band frames
-/// and never enter the replay ring.
+/// borrowed unchanged. A clipboard write is answered on the pty (`EPERM` for
+/// a write, `ENOSYS` for a read) and never forwarded. Kitty images become
+/// out-of-band frames and never enter the passthrough.
 ///
 /// `frames` receives the ordered list of out-of-band frames to forward *in
 /// stream position*: a kitty image anchors to the cursor cell as it stood when
@@ -1640,7 +1570,6 @@ fn lift_out_of_band<'a>(
     raw: &'a [u8],
     clipboard: &mut ClipboardSniffer,
     graphics: &mut GraphicsSniffer,
-    has_controller: bool,
     writer: &PtyWriter,
     frames: &mut Vec<GraphicsFrame>,
 ) -> std::borrow::Cow<'a, [u8]> {
@@ -1661,17 +1590,8 @@ fn lift_out_of_band<'a>(
                         let sniffed = graphics.sniff(&b);
                         process_graphics_output(sniffed, true, &mut pass, frames, writer);
                     }
-                    ClipboardSegment::Event(ClipboardEvent::Reply(reply)) => {
+                    ClipboardSegment::Reply(reply) => {
                         writer.write(&reply);
-                    }
-                    ClipboardSegment::Event(ClipboardEvent::Write(write)) => {
-                        if has_controller {
-                            frames.push(GraphicsFrame::ClipboardWrite(write.encode_frame()));
-                        } else {
-                            let reply =
-                                crate::core::clipboard::response(write.id.as_deref(), "EBUSY");
-                            writer.write(&reply);
-                        }
                     }
                 }
             }
@@ -1687,7 +1607,6 @@ fn scan_chunk<'a>(
     clipboard: &mut ClipboardSniffer,
     graphics: &mut GraphicsSniffer,
     sniffer: &mut OscSniffer,
-    has_controller: bool,
     writer: &PtyWriter,
 ) -> (std::borrow::Cow<'a, [u8]>, Vec<GraphicsFrame>, SniffSignals) {
     let has_esc = crate::core::osc::contains_esc(raw);
@@ -1695,14 +1614,7 @@ fn scan_chunk<'a>(
     let passthrough = if !has_esc && clipboard.is_ground() && graphics.is_ground() {
         std::borrow::Cow::Borrowed(raw)
     } else {
-        lift_out_of_band(
-            raw,
-            clipboard,
-            graphics,
-            has_controller,
-            writer,
-            &mut frames,
-        )
+        lift_out_of_band(raw, clipboard, graphics, writer, &mut frames)
     };
     let out_has_esc = match &passthrough {
         std::borrow::Cow::Borrowed(_) if !has_esc => false,
@@ -1889,9 +1801,8 @@ impl DaemonPane {
         shell: Option<ShellSpec>,
         owner: Option<String>,
         workspace: Option<String>,
-        allow_remote_clipboard_write: bool,
         use_config_shell: bool,
-        subscriber: PaneLink,
+        subscriber: OutputTx,
         on_dead: impl FnOnce() + Send + 'static,
     ) -> anyhow::Result<Arc<Self>> {
         Self::open(
@@ -1901,7 +1812,6 @@ impl DaemonPane {
             shell,
             owner,
             workspace,
-            allow_remote_clipboard_write,
             use_config_shell,
             Some(subscriber),
             on_dead,
@@ -1916,9 +1826,8 @@ impl DaemonPane {
         shell: Option<ShellSpec>,
         owner: Option<String>,
         workspace: Option<String>,
-        allow_remote_clipboard_write: bool,
         use_config_shell: bool,
-        subscriber: Option<PaneLink>,
+        subscriber: Option<OutputTx>,
         on_dead: impl FnOnce() + Send + 'static,
     ) -> anyhow::Result<Arc<Self>> {
         let pty_size = pty_size(size);
@@ -1947,9 +1856,6 @@ impl DaemonPane {
             id,
             size,
             subscriber: None,
-            subscriber_epoch: 0,
-            allow_remote_clipboard_write,
-            clip_live: ClipPermit::new(),
             cwd: spawn.initial_cwd,
             osc_title: None,
             shell: ShellState::default(),
@@ -1967,7 +1873,6 @@ impl DaemonPane {
             // drops its cwd on every `RemoteContext`, and a later probe that
             // finds the same directory will not send it again.
             state.subscriber = Some(subscriber);
-            state.subscriber_epoch = 1;
             publish_standing(&state);
         }
 
@@ -2007,9 +1912,6 @@ impl DaemonPane {
             reader_handle,
             writer,
         } = parts;
-        // Before the reader exists, so its first chunk loads the controller
-        // this pane was born with rather than "no one".
-        publish_clip(&state);
         let reader_handle = BurstRead::boxed(reader_handle, dup_reader_fd(master.as_ref()));
 
         let id = state.id;
@@ -2133,11 +2035,10 @@ impl DaemonPane {
                 // local can `ssh` out mid-session, so the flag is refreshed from
                 // the same remote-context poll below. Seed it from the pane's
                 // current context so the first probe answers correctly.
-                let (starts_local, clip_permit, mut remote_managed) = {
+                let (starts_local, mut remote_managed) = {
                     let st = state.lock().unwrap();
                     (
                         st.remote.is_none(),
-                        Arc::clone(&st.clip_live),
                         st.remote
                             .as_ref()
                             .is_some_and(|remote| remote.kind != RemoteKind::Ssh),
@@ -2195,15 +2096,11 @@ impl DaemonPane {
                                 tr_bytes += n as u64;
                             }
                             let raw = &buf[..n];
-                            // After `read`, so an attach during the block is already published.
-                            let (clip_epoch, clip_allowed) = clip_permit.load();
-                            clipboard.set_controller(clip_epoch, clip_allowed);
                             let (passthrough, frames, mut signals) = scan_chunk(
                                 raw,
                                 &mut clipboard,
                                 &mut graphics,
                                 &mut sniffer,
-                                clip_epoch.is_some(),
                                 &writer,
                             );
                             let bytes: &[u8] = &passthrough;
@@ -2353,7 +2250,6 @@ impl DaemonPane {
     fn disconnect_clients(&self) {
         let mut st = self.state.lock().unwrap();
         st.subscriber = None;
-        set_clipboard_permission(&mut st, false);
         self.gate.reset();
     }
 
@@ -2533,14 +2429,6 @@ fn pty_size(size: WinSize) -> PtySize {
         pixel_width: size.cols.saturating_mul(size.cell_w),
         pixel_height: size.rows.saturating_mul(size.cell_h),
     }
-}
-
-/// The one place a pane's clipboard permission is decided. A pane that carries
-/// its own spec keeps that spec's answer whatever the controller claims; every
-/// other pane is exactly as permitted as the client controlling it says.
-fn set_clipboard_permission(st: &mut PaneState, allowed: bool) {
-    st.allow_remote_clipboard_write = allowed;
-    publish_clip(st);
 }
 
 #[cfg(test)]
@@ -3516,9 +3404,8 @@ mod tests {
             }),
             None,
             None,
-            false,
             true,
-            PaneLink::coalesced(tx),
+            tx,
             || {},
         )
         .expect("spawn pane");
@@ -3878,19 +3765,12 @@ mod tests {
         let writer = PtyWriter::spawn(Box::new(std::io::sink()));
         let run = |chunks: &[&[u8]]| {
             let mut clipboard = ClipboardSniffer::default();
-            clipboard.set_controller(Some(1), true);
             let mut graphics = GraphicsSniffer::new_local(true);
             let (mut recorded, mut sent) = (Vec::new(), Vec::new());
             for chunk in chunks {
                 let mut frames = Vec::new();
-                let pass = lift_out_of_band(
-                    chunk,
-                    &mut clipboard,
-                    &mut graphics,
-                    true,
-                    &writer,
-                    &mut frames,
-                );
+                let pass =
+                    lift_out_of_band(chunk, &mut clipboard, &mut graphics, &writer, &mut frames);
                 recorded.extend_from_slice(&pass);
                 if frames.is_empty() {
                     sent.extend_from_slice(&pass);
@@ -4569,9 +4449,6 @@ mod tests {
             id: 0,
             size: ws(80, 24),
             subscriber: None,
-            subscriber_epoch: 0,
-            allow_remote_clipboard_write: false,
-            clip_live: ClipPermit::new(),
             cwd: None,
             osc_title: None,
             shell: ShellState::default(),
@@ -4598,7 +4475,7 @@ mod tests {
         });
         st.cwd = Some(PathBuf::from("/home/me"));
         let (tx, rx) = output_pipe();
-        st.subscriber = Some(PaneLink::coalesced(tx));
+        st.subscriber = Some(tx);
         publish_standing(&st);
         let msgs: Vec<_> = rx.try_iter().collect();
         assert!(
@@ -4617,10 +4494,8 @@ mod tests {
     }
 
     /// Install the one subscriber a pane has. There is no replay to drain.
-    fn subscribe(st: &mut PaneState, tx: OutputTx, allow_clipboard: bool) {
-        st.subscriber_epoch = st.subscriber_epoch.saturating_add(1).max(1);
-        st.subscriber = Some(PaneLink::coalesced(tx));
-        set_clipboard_permission(st, allow_clipboard);
+    fn subscribe(st: &mut PaneState, tx: OutputTx) {
+        st.subscriber = Some(tx);
     }
 
     #[test]
@@ -4798,7 +4673,7 @@ mod tests {
 
         let mut st = test_state(true);
         let (tx, rx) = output_pipe();
-        st.subscriber = Some(PaneLink::coalesced(tx));
+        st.subscriber = Some(tx);
 
         let mut sniffer = OscSniffer::new();
         let stream = concat!(
@@ -4944,7 +4819,7 @@ mod tests {
         let mut st = test_state(true);
         st.cwd = Some(PathBuf::from("/Users/alice"));
         let (tx, rx) = output_pipe();
-        st.subscriber = Some(PaneLink::coalesced(tx));
+        st.subscriber = Some(tx);
 
         apply_probed_cwd(&mut st, Some(PathBuf::from("/Users/alice/dev/tty7")));
 
@@ -4967,7 +4842,7 @@ mod tests {
         let mut st = test_state(true);
         st.cwd = Some(link.clone());
         let (tx, rx) = output_pipe();
-        st.subscriber = Some(PaneLink::coalesced(tx));
+        st.subscriber = Some(tx);
 
         apply_probed_cwd(&mut st, Some(real.canonicalize().unwrap()));
 
@@ -4982,7 +4857,7 @@ mod tests {
         let mut st = test_state(true);
         st.cwd = Some(PathBuf::from("/Users/alice/dev/tty7"));
         let (tx, rx) = output_pipe();
-        st.subscriber = Some(PaneLink::coalesced(tx));
+        st.subscriber = Some(tx);
 
         apply_probed_cwd(&mut st, Some(PathBuf::from("/Users/alice/dev/tty7")));
 
@@ -5000,7 +4875,7 @@ mod tests {
         });
         st.cwd = None;
         let (tx, rx) = output_pipe();
-        st.subscriber = Some(PaneLink::coalesced(tx));
+        st.subscriber = Some(tx);
 
         apply_probed_cwd(&mut st, Some(PathBuf::from("/Users/alice/dev/tty7")));
 
@@ -5013,7 +4888,7 @@ mod tests {
         let mut st = test_state(true);
         st.cwd = Some(PathBuf::from("/work"));
         let (tx, rx) = output_pipe();
-        st.subscriber = Some(PaneLink::coalesced(tx));
+        st.subscriber = Some(tx);
 
         apply_probed_cwd(&mut st, None);
 
@@ -5025,7 +4900,7 @@ mod tests {
     fn resize_echoes_size_to_the_controller_between_old_and_new_output() {
         let mut st = test_state(true);
         let (tx, rx) = output_pipe();
-        subscribe(&mut st, tx, false);
+        subscribe(&mut st, tx);
 
         let pane_gate = OutputGate::new();
         fan_out_output(&mut st, b"old-width bytes", Vec::new(), &pane_gate);
@@ -5059,7 +4934,7 @@ mod tests {
 
         let held = Arc::new(Mutex::new(test_state(true)));
         let (tx, rx) = output_pipe();
-        subscribe(&mut held.lock().unwrap(), tx, false);
+        subscribe(&mut held.lock().unwrap(), tx);
         let (dead_tx, dead_rx) = mpsc::channel();
         DeathReporter::new(move || dead_tx.send(()).unwrap())
             .report(&held, &AtomicBool::new(false));
@@ -5074,12 +4949,12 @@ mod tests {
     }
 
     #[test]
-    fn reader_rejects_clipboard_images_when_permission_is_off() {
+    fn reader_rejects_every_clipboard_write() {
         use base64::Engine as _;
 
         let state = Arc::new(Mutex::new(test_state(true)));
         let (tx, rx) = output_pipe();
-        subscribe(&mut state.lock().unwrap(), tx, false);
+        subscribe(&mut state.lock().unwrap(), tx);
 
         #[derive(Clone)]
         struct SharedBuf(Arc<Mutex<Vec<u8>>>);
@@ -5128,106 +5003,18 @@ mod tests {
             !msgs.iter().any(|msg| matches!(msg, DaemonMsg::Output(_))),
             "a rejected clipboard write leaves no text on screen"
         );
-        assert!(
-            !msgs
-                .iter()
-                .any(|msg| matches!(msg, DaemonMsg::ClipboardWrite(_)))
-        );
         assert_eq!(
             *sink.lock().unwrap(),
             crate::core::clipboard::response(Some("nope"), "EPERM")
         );
     }
 
+    /// Text on either side of an OSC 5522 write still reaches the subscriber.
+    /// The write itself does not: its bytes are not a frame, and the pty gets
+    /// `EPERM`.
     #[test]
-    fn reader_strips_allowed_clipboard_images_and_only_notifies_the_controller() {
+    fn reader_strips_clipboard_writes_and_keeps_the_text_around_them() {
         use base64::Engine as _;
-
-        let state = Arc::new(Mutex::new(test_state(true)));
-        let (tx, rx) = output_pipe();
-        subscribe(&mut state.lock().unwrap(), tx, true);
-
-        let mime = base64::engine::general_purpose::STANDARD.encode("image/png");
-        let data = base64::engine::general_purpose::STANDARD.encode(b"png-data");
-        let stream = format!(
-            "before\x1b]5522;type=write:id=req-1\x1b\\\
-             \x1b]5522;type=wdata:mime={mime};{data}\x1b\\\
-             \x1b]5522;type=wdata\x1b\\after"
-        );
-        DaemonPane::spawn_reader(
-            state.clone(),
-            Arc::new(AtomicBool::new(false)),
-            Arc::new(OutputGate::new()),
-            Box::new(std::io::Cursor::new(stream.into_bytes())),
-            null_writer(),
-            || false,
-            ForegroundProbes {
-                group: Box::new(|| None),
-                remote: Box::new(|| None),
-                agent: Box::new(|| None),
-                cwd: Box::new(|| None),
-            },
-            Arc::new(DeathReporter::new(|| {})),
-        )
-        .join()
-        .unwrap();
-
-        assert!(matches!(
-            rx.try_recv(),
-            Ok(DaemonMsg::Output(bytes)) if bytes == b"before"
-        ));
-        let frame = match rx.try_recv().unwrap() {
-            DaemonMsg::ClipboardWrite(frame) => frame,
-            other => panic!("expected ClipboardWrite, got {other:?}"),
-        };
-        let write = crate::core::clipboard::ClipboardWrite::decode_frame(frame).unwrap();
-        assert_eq!(write.mime, "image/png");
-        assert_eq!(write.data, b"png-data");
-        assert_eq!(write.id.as_deref(), Some("req-1"));
-        assert!(matches!(
-            rx.try_recv(),
-            Ok(DaemonMsg::Output(bytes)) if bytes == b"after"
-        ));
-    }
-
-    /// The reader is parked in `read` with no subscriber. Granting clipboard
-    /// permission while it is idle has to apply to the OSC 5522 that wakes
-    /// it. A cache taken before the read would still say "not allowed" and
-    /// answer the first byte with `EPERM`.
-    #[test]
-    fn clipboard_permission_granted_while_idle_applies_to_the_next_byte() {
-        use base64::Engine as _;
-
-        struct Hold {
-            bytes: Vec<u8>,
-            pos: usize,
-            entered: Arc<(Mutex<bool>, Condvar)>,
-            go: Arc<(Mutex<bool>, Condvar)>,
-        }
-
-        impl Read for Hold {
-            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-                if self.pos >= self.bytes.len() {
-                    return Ok(0);
-                }
-                {
-                    let (lock, cv) = &*self.entered;
-                    *lock.lock().unwrap() = true;
-                    cv.notify_one();
-                }
-                {
-                    let (lock, cv) = &*self.go;
-                    let mut go = lock.lock().unwrap();
-                    while !*go {
-                        go = cv.wait(go).unwrap();
-                    }
-                }
-                let n = (self.bytes.len() - self.pos).min(buf.len());
-                buf[..n].copy_from_slice(&self.bytes[self.pos..self.pos + n]);
-                self.pos += n;
-                Ok(n)
-            }
-        }
 
         #[derive(Clone)]
         struct SharedBuf(Arc<Mutex<Vec<u8>>>);
@@ -5241,29 +5028,24 @@ mod tests {
             }
         }
 
-        let entered = Arc::new((Mutex::new(false), Condvar::new()));
-        let go = Arc::new((Mutex::new(false), Condvar::new()));
         let state = Arc::new(Mutex::new(test_state(true)));
         let (tx, rx) = output_pipe();
+        subscribe(&mut state.lock().unwrap(), tx);
         let sink = Arc::new(Mutex::new(Vec::new()));
         let writer = PtyWriter::spawn(Box::new(SharedBuf(sink.clone())));
+
         let mime = base64::engine::general_purpose::STANDARD.encode("image/png");
         let data = base64::engine::general_purpose::STANDARD.encode(b"png-data");
         let stream = format!(
-            "\x1b]5522;type=write:id=wake\x1b\\\
+            "before\x1b]5522;type=write:id=req-1\x1b\\\
              \x1b]5522;type=wdata:mime={mime};{data}\x1b\\\
-             \x1b]5522;type=wdata\x1b\\"
+             \x1b]5522;type=wdata\x1b\\after"
         );
-        let handle = DaemonPane::spawn_reader(
+        DaemonPane::spawn_reader(
             state.clone(),
             Arc::new(AtomicBool::new(false)),
             Arc::new(OutputGate::new()),
-            Box::new(Hold {
-                bytes: stream.into_bytes(),
-                pos: 0,
-                entered: entered.clone(),
-                go: go.clone(),
-            }),
+            Box::new(std::io::Cursor::new(stream.into_bytes())),
             writer.clone(),
             || false,
             ForegroundProbes {
@@ -5273,45 +5055,25 @@ mod tests {
                 cwd: Box::new(|| None),
             },
             Arc::new(DeathReporter::new(|| {})),
-        );
-
-        {
-            let (lock, cv) = &*entered;
-            let ready = lock.lock().unwrap();
-            let (ready, waited) = cv
-                .wait_timeout(ready, Duration::from_secs(2))
-                .expect("entered lock");
-            assert!(
-                !waited.timed_out() && *ready,
-                "reader did not block in read"
-            );
-        }
-        subscribe(&mut state.lock().unwrap(), tx, true);
-        {
-            let (lock, cv) = &*go;
-            *lock.lock().unwrap() = true;
-            cv.notify_one();
-        }
-        handle.join().unwrap();
-        assert!(
-            writer.wait_idle(Duration::from_secs(2)),
-            "a rejection would be written on the pty thread"
-        );
-
-        let frame = rx.try_iter().find_map(|msg| match msg {
-            DaemonMsg::ClipboardWrite(frame) => Some(frame),
-            _ => None,
-        });
-        let write = crate::core::clipboard::ClipboardWrite::decode_frame(
-            frame.expect("the write that woke the reader is allowed"),
         )
+        .join()
         .unwrap();
-        assert_eq!(write.mime, "image/png");
-        assert_eq!(write.data, b"png-data");
-        assert_eq!(write.id.as_deref(), Some("wake"));
-        assert!(
-            sink.lock().unwrap().is_empty(),
-            "a grant that lands while idle must not be answered with EPERM"
+        assert!(writer.wait_idle(Duration::from_secs(2)));
+
+        let mut text = Vec::new();
+        for msg in rx.try_iter() {
+            match msg {
+                DaemonMsg::Output(bytes) => text.extend(bytes),
+                // The cursor hits EOF once the fixture is consumed, and an
+                // attached reader publishes that as `Exited`. It is not the write.
+                DaemonMsg::Exited { code: None } => {}
+                other => panic!("clipboard write must not be forwarded, got {other:?}"),
+            }
+        }
+        assert_eq!(text, b"beforeafter");
+        assert_eq!(
+            *sink.lock().unwrap(),
+            crate::core::clipboard::response(Some("req-1"), "EPERM")
         );
     }
 
@@ -5368,7 +5130,7 @@ mod tests {
 
         let state = Arc::new(Mutex::new(test_state(true)));
         let (sub_tx, sub_rx) = output_pipe();
-        state.lock().unwrap().subscriber = Some(PaneLink::coalesced(sub_tx));
+        state.lock().unwrap().subscriber = Some(sub_tx);
 
         let probes_taken = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let taken = probes_taken.clone();
@@ -5432,7 +5194,7 @@ mod tests {
     fn reader_eof_with_subscriber_sends_exited_not_on_dead() {
         let state = Arc::new(Mutex::new(test_state(true)));
         let (sub_tx, sub_rx) = output_pipe();
-        state.lock().unwrap().subscriber = Some(PaneLink::coalesced(sub_tx));
+        state.lock().unwrap().subscriber = Some(sub_tx);
         let dead = Arc::new(AtomicBool::new(false));
         let dead_flag = dead.clone();
 
@@ -5534,7 +5296,7 @@ mod tests {
             })));
         let state = Arc::new(Mutex::new(test_state(true)));
         let (sub_tx, sub_rx) = output_pipe();
-        state.lock().unwrap().subscriber = Some(PaneLink::coalesced(sub_tx));
+        state.lock().unwrap().subscriber = Some(sub_tx);
 
         let reader = DaemonPane::spawn_reader(
             state,
@@ -5607,7 +5369,7 @@ mod tests {
     ) {
         let state = Arc::new(Mutex::new(test_state(true)));
         let (sub_tx, sub_rx) = output_pipe();
-        state.lock().unwrap().subscriber = Some(PaneLink::coalesced(sub_tx));
+        state.lock().unwrap().subscriber = Some(sub_tx);
         (
             Arc::new(Mutex::new(Some(
                 Box::new(InertMaster) as Box<dyn MasterPty + Send>
@@ -5721,7 +5483,7 @@ mod tests {
 
         let state = Arc::new(Mutex::new(test_state(true)));
         let (sub_tx, sub_rx) = output_pipe();
-        state.lock().unwrap().subscriber = Some(PaneLink::coalesced(sub_tx));
+        state.lock().unwrap().subscriber = Some(sub_tx);
 
         // A writer we can read back, to prove the query reply reached the PTY.
         #[derive(Clone)]
@@ -5792,7 +5554,7 @@ mod tests {
     fn reader_forwards_graphics_deletes() {
         let state = Arc::new(Mutex::new(test_state(true)));
         let (sub_tx, sub_rx) = output_pipe();
-        state.lock().unwrap().subscriber = Some(PaneLink::coalesced(sub_tx));
+        state.lock().unwrap().subscriber = Some(sub_tx);
 
         let handle = DaemonPane::spawn_reader(
             state.clone(),
@@ -5841,7 +5603,7 @@ mod tests {
         {
             let mut st = state.lock().unwrap();
             st.cwd = Some(PathBuf::from("/Users/alice"));
-            st.subscriber = Some(PaneLink::coalesced(sub_tx));
+            st.subscriber = Some(sub_tx);
         }
 
         let handle = DaemonPane::spawn_reader(
@@ -5930,7 +5692,7 @@ mod tests {
     fn death_reporter_notifies_once_across_racing_callers() {
         let state = Arc::new(Mutex::new(test_state(true)));
         let (sub_tx, sub_rx) = output_pipe();
-        state.lock().unwrap().subscriber = Some(PaneLink::coalesced(sub_tx));
+        state.lock().unwrap().subscriber = Some(sub_tx);
         let shutting_down = AtomicBool::new(false);
         let calls = Arc::new(AtomicBool::new(false));
         let calls_flag = calls.clone();
@@ -7538,20 +7300,6 @@ mod tests {
     }
 
     #[test]
-    fn clip_permit_packs_epoch_and_permission_into_one_word() {
-        let permit = ClipPermit::new();
-        assert_eq!(permit.load(), (None, false));
-        permit.publish(true, 1, false);
-        assert_eq!(permit.load(), (Some(1), false));
-        permit.publish(true, 4, true);
-        assert_eq!(permit.load(), (Some(4), true));
-        permit.publish(false, 4, true);
-        assert_eq!(permit.load(), (None, false));
-        permit.publish(true, 0, true);
-        assert_eq!(permit.load(), (None, false));
-    }
-
-    #[test]
     fn osc_133_marks_b_c_and_d_force_a_group_check() {
         let mut sniffer = OscSniffer::new();
         let began = sniffer.feed(b"\x1b]133;B\x07");
@@ -7593,14 +7341,8 @@ mod tests {
         let mut graphics = GraphicsSniffer::new_local(true);
         let mut sniffer = OscSniffer::new();
 
-        let (pass, frames, _) = scan_chunk(
-            chunk1,
-            &mut clipboard,
-            &mut graphics,
-            &mut sniffer,
-            false,
-            &writer,
-        );
+        let (pass, frames, _) =
+            scan_chunk(chunk1, &mut clipboard, &mut graphics, &mut sniffer, &writer);
         assert!(pass.is_empty(), "the APC is not passthrough");
         assert!(frames.is_empty(), "the ST has not arrived");
         assert!(
@@ -7613,7 +7355,6 @@ mod tests {
             &mut clipboard,
             &mut graphics,
             &mut sniffer,
-            false,
             &writer,
         );
         assert_eq!(&pass[..], b"after");
@@ -7633,7 +7374,6 @@ mod tests {
             &mut clipboard,
             &mut graphics,
             &mut sniffer,
-            false,
             &writer,
         );
         assert_eq!(&pass[..], b"plain");
@@ -7650,7 +7390,6 @@ mod tests {
             &mut clipboard,
             &mut graphics,
             &mut sniffer,
-            false,
             &writer,
         );
         assert!(!signals.command_started);
@@ -7660,7 +7399,6 @@ mod tests {
             &mut clipboard,
             &mut graphics,
             &mut sniffer,
-            false,
             &writer,
         );
         assert!(signals.command_started);
@@ -7701,7 +7439,7 @@ mod tests {
 
         let state = Arc::new(Mutex::new(test_state(true)));
         let (sub_tx, sub_rx) = output_pipe();
-        state.lock().unwrap().subscriber = Some(PaneLink::coalesced(sub_tx));
+        state.lock().unwrap().subscriber = Some(sub_tx);
         let handle = DaemonPane::spawn_reader(
             state.clone(),
             Arc::new(AtomicBool::new(false)),

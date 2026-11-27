@@ -146,32 +146,14 @@ pub enum PtySource {
 }
 
 impl PtySource {
-    /// The source a pane spawned or attached on `route` reads from. The
-    /// platform enters here and nowhere else: a local route means a pty this
-    /// machine opened, and only on Windows is that a ConPTY.
-    ///
-    /// `Unroutable` is a route that could not be resolved, so it never gets a
-    /// pty at all; answering as if it were local costs nothing and keeps the
-    /// match total.
-    pub(super) fn for_route(route: &PaneRoute) -> PtySource {
-        let _ = route;
+    /// The source a pane this machine opened reads from. Only on Windows is
+    /// that a ConPTY; everywhere else the pty is raw.
+    pub(super) fn local() -> PtySource {
         if cfg!(windows) {
             PtySource::LocalConpty
         } else {
             PtySource::Raw
         }
-    }
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub enum PaneRoute {
-    #[default]
-    Local,
-}
-
-impl PaneRoute {
-    pub fn is_local(&self) -> bool {
-        true
     }
 }
 
@@ -267,9 +249,7 @@ type Inbox = tty7_core::daemon::pane::OutputRx;
 /// Bytes the output gate charged for this frame, including output appended into one buffer.
 fn queued_gate_len(msg: &DaemonMsg) -> usize {
     match msg {
-        DaemonMsg::Output(bytes) | DaemonMsg::Image(bytes) | DaemonMsg::ClipboardWrite(bytes) => {
-            bytes.len()
-        }
+        DaemonMsg::Output(bytes) | DaemonMsg::Image(bytes) => bytes.len(),
         _ => 0,
     }
 }
@@ -348,7 +328,6 @@ pub struct RemoteTerminal {
     /// On the pane rather than its view so it survives a reader restart; only the
     /// view's poll touches it.
     note_budget: Mutex<NoteBudget>,
-    route: PaneRoute,
     /// Kept so the event channel stays open for the life of the pane.
     #[allow(dead_code)]
     proxy: EventProxy,
@@ -366,9 +345,6 @@ pub struct RemoteTerminal {
     local_conpty: Arc<AtomicBool>,
     /// Whether the program in the pane switched on DEC mode 2031.
     color_scheme_updates: Arc<AtomicBool>,
-    /// This pane's child is a `DaemonPane` in this process, so a resize is
-    /// applied here and echoed back as `DaemonMsg::Size`.
-    direct: bool,
     pane_id: Option<u64>,
 }
 
@@ -377,10 +353,9 @@ pub struct RemoteTerminal {
 ///
 /// This is the same id as `owner`, but decided separately: `owner` is also
 /// gated on FEATURE_PANE_OWNER, while the workspace field rides the owned spawn
-/// kind and needs no feature probe. Local routes only — a remote server keeps
-/// its own machine tree, and this id names a workspace in ours.
-fn spawn_workspace(owner: Option<&str>, route: &PaneRoute) -> Option<String> {
-    owner.filter(|_| route.is_local()).map(|id| id.to_string())
+/// kind and needs no feature probe.
+fn spawn_workspace(owner: Option<&str>) -> Option<String> {
+    owner.map(|id| id.to_string())
 }
 
 impl RemoteTerminal {
@@ -392,44 +367,11 @@ impl RemoteTerminal {
         cwd: Option<PathBuf>,
         shell: Option<ShellSpec>,
     ) -> anyhow::Result<(Self, u64)> {
-        Self::spawn_on(
-            &PaneRoute::Local,
-            size,
-            cell_w,
-            cell_h,
-            cwd,
-            shell,
-            None,
-            true,
-        )
+        Self::spawn_on(size, cell_w, cell_h, cwd, shell, None, true)
     }
 
     #[allow(clippy::too_many_arguments)]
     pub fn spawn_on(
-        route: &PaneRoute,
-        size: TermSize,
-        cell_w: u16,
-        cell_h: u16,
-        cwd: Option<PathBuf>,
-        shell: Option<ShellSpec>,
-        owner: Option<String>,
-        use_config_shell: bool,
-    ) -> anyhow::Result<(Self, u64)> {
-        Self::spawn_once(
-            route,
-            size,
-            cell_w,
-            cell_h,
-            cwd,
-            shell,
-            owner,
-            use_config_shell,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn spawn_once(
-        route: &PaneRoute,
         size: TermSize,
         cell_w: u16,
         cell_h: u16,
@@ -440,7 +382,7 @@ impl RemoteTerminal {
     ) -> anyhow::Result<(Self, u64)> {
         let id = NEXT_PANE.fetch_add(1, Ordering::Relaxed);
         let win = win_size(size, cell_w, cell_h);
-        let workspace = spawn_workspace(owner.as_deref(), route);
+        let workspace = spawn_workspace(owner.as_deref());
         let (tx, inbox) = tty7_core::daemon::pane::output_pipe();
         // The subscriber is installed before the reader starts, so the first
         // output byte is delivered live. There is no replay buffer behind it.
@@ -451,9 +393,8 @@ impl RemoteTerminal {
             shell,
             owner,
             workspace,
-            false,
             use_config_shell,
-            tty7_core::daemon::pane::PaneLink::coalesced(tx),
+            tx,
             || {},
         )?;
         let drain = pane.gate();
@@ -468,12 +409,10 @@ impl RemoteTerminal {
             inbox,
             Some(drain),
             size,
-            PtySource::for_route(route),
+            PtySource::local(),
             Downlink::Pane(hold),
         );
-        term.direct = true;
         term.pane_id = Some(id);
-        term.route = route.clone();
         term.seed_cwd(cwd);
         Ok((term, id))
     }
@@ -492,8 +431,8 @@ impl RemoteTerminal {
         }
     }
 
-    /// A terminal whose pane link is an in-memory pipe. `direct` stays false:
-    /// a test that wants resize-echo semantics sets it.
+    /// A terminal whose pane link is an in-memory pipe. A resize still waits
+    /// for a `DaemonMsg::Size` before the grid moves, the same as a live pane.
     #[cfg(test)]
     pub(crate) fn from_pipe(size: TermSize, pty: PtySource) -> (Self, TestLink) {
         let (tx, rx) = tty7_core::daemon::pane::output_pipe();
@@ -586,13 +525,11 @@ impl RemoteTerminal {
             images,
             osc_notes,
             note_budget: Mutex::default(),
-            route: PaneRoute::Local,
             proxy,
             reader_thread: Some(reader_thread),
             reader_quit,
             local_conpty,
             color_scheme_updates,
-            direct: false,
             pane_id: None,
         }
     }
@@ -902,10 +839,10 @@ impl RemoteTerminal {
                             // Geometry, applied at this exact stream position.
                             // During replay each ring segment is preceded by
                             // its Size; live, the daemon echoes one when it
-                            // applies our Resize (FEATURE_RESIZE_ECHO), which
-                            // is the point in the stream where the bytes stop
-                            // being old-width — everything still queued before
-                            // this frame must be parsed into the old grid.
+                            // applies our Resize, which is the point in the
+                            // stream where the bytes stop being old-width —
+                            // everything still queued before this frame must
+                            // be parsed into the old grid.
                             DaemonMsg::Size(ws) => {
                                 flush_batch!();
                                 // A live echo lands just before the shell's
@@ -989,12 +926,6 @@ impl RemoteTerminal {
                                     proxy.send_event(AlacEvent::Wakeup);
                                 }
                             }
-                            // Clipboard writes are never forwarded: the pane is spawned
-                            // with remote clipboard writes disabled, and the sniffer
-                            // answers `EPERM` itself. The frame is still accounted
-                            // for by `queued_gate_len` so a stray one cannot stall
-                            // the output gate.
-                            DaemonMsg::ClipboardWrite(_) => {}
                             DaemonMsg::Cwd(path) => {
                                 flush_batch!();
                                 if let Ok(mut guard) = cwd.lock() {
@@ -1186,72 +1117,46 @@ impl RemoteTerminal {
         self.link.send(ClientMsg::Input(bytes.into_owned()));
     }
 
-    /// Whether the daemon behind this pane echoes a `DaemonMsg::Size` into the
-    /// output stream when it applies our `ClientMsg::Resize`. When it does, the
-    /// local grid reflow is deferred to that echo on the reader thread: any
-    /// backlog still queued between daemon and client was produced at the old
+    /// Ask the pane for `size`. The grid reflow waits for the daemon's
+    /// `DaemonMsg::Size`: any backlog still queued was produced at the old
     /// geometry, and reflowing before it drains parses old-width bytes into a
     /// new-width grid (maximize during a burst of output garbled the pane).
     ///
-    /// The local daemon is probed directly. A routed pane consults the answer
-    /// its route carries, read off the host's control hello when the route was
-    /// built — the daemon serves one `ClientMsg` per connection, so asking
-    /// `Version` per pane would cost a whole routed connection each time. The
-    /// remaining cases never defer: an older server does not advertise the
-    /// echo, an unroutable route reaches no daemon at all, and deferral must
-    /// not hang the grid on an echo nobody promised.
-    fn resize_echoed(&self) -> bool {
-        // The pane's child is in this process and echoes `DaemonMsg::Size`
-        // when the resize lands. A test link does not, unless the test says
-        // it is playing that daemon (`direct`).
-        self.direct
-    }
-
+    /// The cell size has to be part of the early-out, not just cols/rows: it
+    /// is reported in *device* pixels, so moving the window between a 2x and
+    /// a 1x display changes `ws_xpixel`/`ws_ypixel` while the grid stays
+    /// exactly the same. Comparing only `size` there would skip the resize
+    /// and leave a pixel-aware child rendering for the old framebuffer.
+    ///
+    /// Already asked for is not enough to trust the request (#893). The grid
+    /// moves only when the daemon's `Size` comes back, and a request or an
+    /// echo that went missing left a pane painting a grid shorter than its
+    /// bounds — the bottom rows blank, the child still drawing for the old
+    /// size — with every later frame asking for the same size and being
+    /// skipped here, until a divider drag asked for a different one.
     pub fn resize(&mut self, size: TermSize, cell_w: u16, cell_h: u16) {
-        let echoed = self.resize_echoed();
-        // The cell size has to be part of the early-out, not just cols/rows: it
-        // is reported in *device* pixels, so moving the window between a 2x and
-        // a 1x display changes `ws_xpixel`/`ws_ypixel` while the grid stays
-        // exactly the same. Comparing only `size` there would skip the resize
-        // and leave a pixel-aware child rendering for the old framebuffer.
         let cell = (cell_w, cell_h);
         if self.synced_size && size == self.size && cell == self.synced_cell {
-            // Already asked for, so the only question is whether the grid got
-            // there. It is not enough to trust the request (#893): on an
-            // echoing route the grid moves only when the daemon's `Size` comes
-            // back, and a request or an echo that went missing left a pane
-            // painting a grid shorter than its bounds — the bottom rows blank,
-            // the child still drawing for the old size — with every later
-            // frame asking for the same size and being skipped here, until a
-            // divider drag asked for a different one.
-            if echoed {
-                // Disagreement while an echo can still be on its way is just
-                // the echo (or a replay segment mid-apply) not having landed
-                // yet. Asked first because it needs no lock.
-                if self
-                    .resize_sent_at
-                    .is_some_and(|at| at.elapsed() < RESIZE_ECHO_GRACE)
-                {
-                    return;
-                }
-                // Tried rather than waited for, as the painter does: this runs
-                // every frame, and a held lock is the reader mid-batch — the
-                // next frame asks again.
-                match self.term.try_lock_unfair() {
-                    Some(term) if !grid_holds(&term, size) => {}
-                    _ => return,
-                }
-            } else if grid_holds(&self.term.lock(), size) {
+            // Disagreement while an echo can still be on its way is just
+            // the echo (or a replay segment mid-apply) not having landed
+            // yet. Asked first because it needs no lock.
+            if self
+                .resize_sent_at
+                .is_some_and(|at| at.elapsed() < RESIZE_ECHO_GRACE)
+            {
                 return;
+            }
+            // Tried rather than waited for, as the painter does: this runs
+            // every frame, and a held lock is the reader mid-batch — the
+            // next frame asks again.
+            match self.term.try_lock_unfair() {
+                Some(term) if !grid_holds(&term, size) => {}
+                _ => return,
             }
         }
         self.synced_size = true;
         self.size = size;
         self.synced_cell = cell;
-        if !echoed {
-            let shell_redraws = !self.is_local_conpty() && self.at_prompt();
-            super::prompt_reflow::resize(&mut self.term.lock(), size, shell_redraws);
-        }
 
         let win = win_size(size, cell_w, cell_h);
         self.link.send(ClientMsg::Resize(win));
@@ -1350,15 +1255,9 @@ impl RemoteTerminal {
         self.size
     }
 
-    pub fn list_panes_on(route: &PaneRoute) -> Vec<crate::daemon::protocol::PaneInfo> {
-        Self::try_list_panes_on(route).unwrap_or_default()
-    }
-
-    pub fn try_list_panes_on(
-        _route: &PaneRoute,
-    ) -> anyhow::Result<Vec<crate::daemon::protocol::PaneInfo>> {
+    pub fn list_panes_on() -> Vec<crate::daemon::protocol::PaneInfo> {
         let holds = live_panes().lock().unwrap_or_else(|e| e.into_inner());
-        Ok(holds
+        holds
             .values()
             .filter_map(|hold| {
                 hold.pane
@@ -1366,14 +1265,10 @@ impl RemoteTerminal {
                     .ok()
                     .and_then(|guard| guard.as_ref().map(|pane| pane.info()))
             })
-            .collect())
+            .collect()
     }
 
     pub fn kill_pane(pane_id: u64) {
-        Self::kill_pane_on(&PaneRoute::Local, pane_id)
-    }
-
-    pub fn kill_pane_on(_route: &PaneRoute, pane_id: u64) {
         let hold = live_panes()
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -1892,7 +1787,7 @@ mod replay_tests {
         crate::core::config::pin_test_config_dir();
         let (term, daemon) = RemoteTerminal::from_pipe(
             TermSize::new(80, 24),
-            crate::terminal::remote::PtySource::for_route(&crate::terminal::PaneRoute::Local),
+            crate::terminal::remote::PtySource::local(),
         );
         for frame in frames {
             daemon.send(frame);
@@ -2094,10 +1989,8 @@ mod detach_tests {
     #[test]
     fn detach_link_returns_promptly_when_the_peer_stays_silent() {
         crate::core::config::pin_test_config_dir();
-        let (mut term, daemon_side) = RemoteTerminal::from_pipe(
-            TermSize::new(80, 24),
-            PtySource::for_route(&PaneRoute::Local),
-        );
+        let (mut term, daemon_side) =
+            RemoteTerminal::from_pipe(TermSize::new(80, 24), PtySource::local());
         // Let the reader thread park on the pipe before tearing down.
         std::thread::sleep(std::time::Duration::from_millis(200));
 
@@ -2164,7 +2057,7 @@ mod parked_cursor_tests {
     #[test]
     fn a_local_route_is_a_conpty_only_where_conhost_exists() {
         assert_eq!(
-            PtySource::for_route(&PaneRoute::Local),
+            PtySource::local(),
             if cfg!(windows) {
                 PtySource::LocalConpty
             } else {
@@ -2364,24 +2257,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_local_pane_prefixes_nothing() {
-        assert!(PaneRoute::Local.is_local());
-        assert!(matches!(PaneRoute::default(), PaneRoute::Local));
-    }
-
-    #[test]
-    fn a_local_spawn_carries_its_workspace_so_the_shell_gets_tty7_ws() {
+    fn a_spawn_carries_its_workspace_so_the_shell_gets_tty7_ws() {
         let ws = "0d4e1a54-0000-4000-8000-000000000001";
 
         assert_eq!(
-            spawn_workspace(Some(ws), &PaneRoute::Local).as_deref(),
+            spawn_workspace(Some(ws)).as_deref(),
             Some(ws),
             "without this the pane's shell has no $NTTY7_WS and every \
              workspace-scoped CLI verb in it needs an explicit address"
         );
 
         assert_eq!(
-            spawn_workspace(None, &PaneRoute::Local),
+            spawn_workspace(None),
             None,
             "a pane outside any workspace must not claim one"
         );
@@ -2394,7 +2281,7 @@ mod tests {
 
         let (term, daemon_side) = RemoteTerminal::from_pipe(
             TermSize::new(80, 24),
-            crate::terminal::remote::PtySource::for_route(&crate::terminal::PaneRoute::Local),
+            crate::terminal::remote::PtySource::local(),
         );
 
         daemon_side.send(DaemonMsg::Output(b"\x1b[>7u\x1b[?u".to_vec()));
@@ -2425,7 +2312,7 @@ mod tests {
     fn deep_keyboard_mode_pushes_leave_the_reader_alive() {
         let (term, daemon_side) = RemoteTerminal::from_pipe(
             TermSize::new(80, 24),
-            crate::terminal::remote::PtySource::for_route(&crate::terminal::PaneRoute::Local),
+            crate::terminal::remote::PtySource::local(),
         );
 
         let mut payload = b"\x1b[>1u".repeat(4097);
@@ -2456,7 +2343,7 @@ mod tests {
     fn emoji_presentation_sequences_reserve_two_columns() {
         let (term, daemon_side) = RemoteTerminal::from_pipe(
             TermSize::new(80, 24),
-            crate::terminal::remote::PtySource::for_route(&crate::terminal::PaneRoute::Local),
+            crate::terminal::remote::PtySource::local(),
         );
 
         daemon_side.send(DaemonMsg::Output("\u{2764}\u{FE0F}x".as_bytes().to_vec()));
@@ -2490,10 +2377,8 @@ mod tests {
     #[test]
     fn reader_feeds_local_grid() {
         let size = TermSize::new(80, 24);
-        let (term, daemon_side) = RemoteTerminal::from_pipe(
-            size,
-            crate::terminal::remote::PtySource::for_route(&crate::terminal::PaneRoute::Local),
-        );
+        let (term, daemon_side) =
+            RemoteTerminal::from_pipe(size, crate::terminal::remote::PtySource::local());
 
         daemon_side.send(DaemonMsg::Output(b"hello".to_vec()));
         daemon_side.send(DaemonMsg::Cwd(PathBuf::from("/tmp/work")));
@@ -2544,7 +2429,7 @@ mod tests {
         crate::core::config::pin_test_config_dir();
         let (term, daemon_side) = RemoteTerminal::from_pipe(
             TermSize::new(80, 24),
-            crate::terminal::remote::PtySource::for_route(&crate::terminal::PaneRoute::Local),
+            crate::terminal::remote::PtySource::local(),
         );
         let user_config = crate::core::config::Config(crate::core::config::CoreConfig {
             cursor_style: ConfigCursorStyle::Underline,
@@ -2589,7 +2474,7 @@ mod tests {
         crate::core::config::pin_test_config_dir();
         let (term, daemon_side) = RemoteTerminal::from_pipe(
             TermSize::new(80, 24),
-            crate::terminal::remote::PtySource::for_route(&crate::terminal::PaneRoute::Local),
+            crate::terminal::remote::PtySource::local(),
         );
         let user_config = crate::core::config::Config(crate::core::config::CoreConfig {
             cursor_style: configured,
@@ -2680,7 +2565,7 @@ mod tests {
     fn child_exit_is_distinguished_from_daemon_disconnect() {
         let (term, daemon_side) = RemoteTerminal::from_pipe(
             TermSize::new(80, 24),
-            crate::terminal::remote::PtySource::for_route(&crate::terminal::PaneRoute::Local),
+            crate::terminal::remote::PtySource::local(),
         );
         daemon_side.send(DaemonMsg::Exited { code: Some(0) });
         for _ in 0..200 {
@@ -2697,7 +2582,7 @@ mod tests {
 
         let (term, daemon_side) = RemoteTerminal::from_pipe(
             TermSize::new(80, 24),
-            crate::terminal::remote::PtySource::for_route(&crate::terminal::PaneRoute::Local),
+            crate::terminal::remote::PtySource::local(),
         );
         daemon_side.close();
         for _ in 0..200 {
@@ -2742,7 +2627,7 @@ mod tests {
         crate::core::config::pin_test_config_dir();
         let (term, daemon_side) = RemoteTerminal::from_pipe(
             TermSize::new(80, 24),
-            crate::terminal::remote::PtySource::for_route(&crate::terminal::PaneRoute::Local),
+            crate::terminal::remote::PtySource::local(),
         );
 
         daemon_side.send(DaemonMsg::Output(
@@ -2785,7 +2670,7 @@ mod tests {
         crate::core::config::pin_test_config_dir();
         let (term, daemon_side) = RemoteTerminal::from_pipe(
             TermSize::new(80, 24),
-            crate::terminal::remote::PtySource::for_route(&crate::terminal::PaneRoute::Local),
+            crate::terminal::remote::PtySource::local(),
         );
 
         daemon_side.send(DaemonMsg::Output(b"\x1b[?2026$p".to_vec()));
@@ -2814,7 +2699,7 @@ mod tests {
         crate::core::config::pin_test_config_dir();
         let (term, daemon_side) = RemoteTerminal::from_pipe(
             TermSize::new(80, 24),
-            crate::terminal::remote::PtySource::for_route(&crate::terminal::PaneRoute::Local),
+            crate::terminal::remote::PtySource::local(),
         );
 
         daemon_side.send(DaemonMsg::Output(b"\x1b[?2031$p".to_vec()));
@@ -2856,7 +2741,7 @@ mod tests {
     fn write_sends_input_frames() {
         let (term, daemon_side) = RemoteTerminal::from_pipe(
             TermSize::new(80, 24),
-            crate::terminal::remote::PtySource::for_route(&crate::terminal::PaneRoute::Local),
+            crate::terminal::remote::PtySource::local(),
         );
 
         term.write(Vec::<u8>::new());
@@ -2883,7 +2768,7 @@ mod tests {
         crate::core::config::pin_test_config_dir();
         let (mut term, _daemon_side) = RemoteTerminal::from_pipe(
             TermSize::new(80, 24),
-            crate::terminal::remote::PtySource::for_route(&crate::terminal::PaneRoute::Local),
+            crate::terminal::remote::PtySource::local(),
         );
         term.stop_reader();
 
@@ -2898,7 +2783,7 @@ mod tests {
     fn first_resize_always_syncs_then_dedups() {
         let (mut term, daemon_side) = RemoteTerminal::from_pipe(
             TermSize::new(80, 24),
-            crate::terminal::remote::PtySource::for_route(&crate::terminal::PaneRoute::Local),
+            crate::terminal::remote::PtySource::local(),
         );
 
         term.resize(TermSize::new(80, 24), 8, 17);
@@ -2925,7 +2810,7 @@ mod tests {
     fn sync_update_without_esu_flushes_after_the_deadline() {
         let (term, daemon_side) = RemoteTerminal::from_pipe(
             TermSize::new(80, 24),
-            crate::terminal::remote::PtySource::for_route(&crate::terminal::PaneRoute::Local),
+            crate::terminal::remote::PtySource::local(),
         );
 
         daemon_side.send(DaemonMsg::Output(b"\x1b[?2026habc".to_vec()));
@@ -2956,7 +2841,7 @@ mod tests {
     fn resize_updates_size_and_notifies_daemon() {
         let (mut term, daemon_side) = RemoteTerminal::from_pipe(
             TermSize::new(80, 24),
-            crate::terminal::remote::PtySource::for_route(&crate::terminal::PaneRoute::Local),
+            crate::terminal::remote::PtySource::local(),
         );
 
         term.resize(TermSize::new(100, 40), 9, 18);
@@ -2979,12 +2864,8 @@ mod tests {
 
         let (mut term, daemon_side) = RemoteTerminal::from_pipe(
             TermSize::new(80, 24),
-            crate::terminal::remote::PtySource::for_route(&crate::terminal::PaneRoute::Local),
+            crate::terminal::remote::PtySource::local(),
         );
-        // A remote route whose host advertised the echo. The local daemon's
-        // answer rides the same gate through `local_daemon_supports`, so this
-        // covers the deferral for both.
-        term.direct = true;
 
         term.resize(TermSize::new(120, 30), 8, 17);
         assert!(matches!(
@@ -3035,14 +2916,9 @@ mod tests {
     }
 
     /// A pane that echoes every resize. The test plays the daemon on the
-    /// in-memory link. The switch tests build the same route against a real pane.
+    /// in-memory link.
     fn echoing_pair() -> (RemoteTerminal, TestLink) {
-        let (mut term, daemon_side) = RemoteTerminal::from_pipe(
-            TermSize::new(80, 24),
-            PtySource::for_route(&PaneRoute::Local),
-        );
-        term.direct = true;
-        (term, daemon_side)
+        RemoteTerminal::from_pipe(TermSize::new(80, 24), PtySource::local())
     }
 
     /// The geometry of the next resize the pane sent, if it sent one at all.
@@ -3131,11 +3007,10 @@ mod tests {
         );
     }
 
-    /// The other way the grid and the request can part on an echoing route: a
-    /// `Size` frame that lands after the echo moves the grid off the size the
-    /// layout asked for. The non-echoing path already re-asserts there
-    /// (`layout_resize_reasserts_geometry_after_a_late_size_frame`); the
-    /// echoing one skipped it, since the request itself had not changed.
+    /// The other way the grid and the request can part: a `Size` frame that
+    /// lands after the echo moves the grid off the size the layout asked for.
+    /// The request itself had not changed, so the early-out used to leave it
+    /// there.
     #[test]
     fn an_echoed_resize_reasserts_geometry_after_a_late_size_frame() {
         let (mut term, daemon_side) = echoing_pair();
@@ -3164,7 +3039,7 @@ mod tests {
     fn at_prompt_stays_false_while_shell_integration_is_inactive() {
         let (term, daemon_side) = RemoteTerminal::from_pipe(
             TermSize::new(80, 24),
-            crate::terminal::remote::PtySource::for_route(&crate::terminal::PaneRoute::Local),
+            crate::terminal::remote::PtySource::local(),
         );
         assert!(!term.shell_active(), "no report yet → integration inactive");
 
@@ -3195,7 +3070,7 @@ mod tests {
     fn at_prompt_follows_daemon_prompt_reports() {
         let (term, daemon_side) = RemoteTerminal::from_pipe(
             TermSize::new(80, 24),
-            crate::terminal::remote::PtySource::for_route(&crate::terminal::PaneRoute::Local),
+            crate::terminal::remote::PtySource::local(),
         );
 
         assert!(!term.at_prompt());
@@ -3297,7 +3172,7 @@ mod tests {
     fn foreground_agent_follows_daemon_agent_reports() {
         let (term, daemon_side) = RemoteTerminal::from_pipe(
             TermSize::new(80, 24),
-            crate::terminal::remote::PtySource::for_route(&crate::terminal::PaneRoute::Local),
+            crate::terminal::remote::PtySource::local(),
         );
 
         assert_eq!(term.foreground_agent(), None, "none before any report");
@@ -3325,7 +3200,7 @@ mod tests {
 
         let (term, daemon_side) = RemoteTerminal::from_pipe(
             TermSize::new(80, 24),
-            crate::terminal::remote::PtySource::for_route(&crate::terminal::PaneRoute::Local),
+            crate::terminal::remote::PtySource::local(),
         );
         assert_eq!(term.agent_session(), None, "none before any report");
 
@@ -3368,7 +3243,7 @@ mod tests {
         crate::core::config::pin_test_config_dir();
         let (term, daemon_side) = RemoteTerminal::from_pipe(
             TermSize::new(80, 24),
-            crate::terminal::remote::PtySource::for_route(&crate::terminal::PaneRoute::Local),
+            crate::terminal::remote::PtySource::local(),
         );
         let poll = |want: Option<&str>| {
             let want = want.map(PathBuf::from);
@@ -3401,7 +3276,7 @@ mod tests {
         crate::core::config::pin_test_config_dir();
         let (term, daemon_side) = RemoteTerminal::from_pipe(
             TermSize::new(80, 24),
-            crate::terminal::remote::PtySource::for_route(&crate::terminal::PaneRoute::Local),
+            crate::terminal::remote::PtySource::local(),
         );
 
         daemon_side.send(DaemonMsg::Cwd(PathBuf::from("/somewhere/else")));
@@ -3425,7 +3300,7 @@ mod tests {
         crate::core::config::pin_test_config_dir();
         let (term, daemon_side) = RemoteTerminal::from_pipe(
             TermSize::new(80, 24),
-            crate::terminal::remote::PtySource::for_route(&crate::terminal::PaneRoute::Local),
+            crate::terminal::remote::PtySource::local(),
         );
         let poll = |want: &str| {
             for _ in 0..200 {
@@ -3470,7 +3345,7 @@ mod tests {
     fn shell_vi_mode_follows_live_prompt_mode_marks_without_disarming_zle() {
         let (term, daemon_side) = RemoteTerminal::from_pipe(
             TermSize::new(80, 24),
-            crate::terminal::remote::PtySource::for_route(&crate::terminal::PaneRoute::Local),
+            crate::terminal::remote::PtySource::local(),
         );
         let poll = |vi: bool, zle: bool| {
             for _ in 0..200 {
@@ -3527,7 +3402,7 @@ mod osc_tests {
         crate::core::config::pin_test_config_dir();
         let (term, daemon) = super::RemoteTerminal::from_pipe(
             TermSize::new(80, 24),
-            crate::terminal::remote::PtySource::for_route(&crate::terminal::PaneRoute::Local),
+            crate::terminal::remote::PtySource::local(),
         );
         let burst: Vec<u8> = (0..40)
             .flat_map(|n| format!("\x1b]9;note {n}\x07").into_bytes())
