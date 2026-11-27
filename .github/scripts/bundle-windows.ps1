@@ -5,8 +5,7 @@
 #     (Program Files or per-user, Start Menu shortcut, "Apps" uninstall entry)
 #
 # Fonts are embedded via include_bytes! and the app icon is compiled into the
-# executable as a resource (see build.rs). So the payload is ntty7.exe plus a
-# sibling completions\ dir (loaded at runtime — see terminal::signature), the
+# executable as a resource (see build.rs). So the payload is ntty7.exe, the
 # bundled ConPTY pair (loaded by the DLL search path — see below) and the
 # license/readme. Windows release artifacts are intentionally unsigned. The
 # in-app updater verifies the published SHA-256 checksum and PE file version
@@ -29,8 +28,6 @@ Remove-Item -Recurse -Force dist -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force -Path $Stage | Out-Null
 
 Copy-Item "target/$Target/release/ntty7.exe" "$Stage/ntty7.exe"
-New-Item -ItemType Directory -Force -Path "$Stage/completions" | Out-Null
-Copy-Item "assets/completions/*.json" "$Stage/completions/"
 Copy-Item LICENSE "$Stage/LICENSE.txt"
 Copy-Item README.md "$Stage/README.md"
 

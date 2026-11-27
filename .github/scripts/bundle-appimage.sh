@@ -8,10 +8,6 @@
 # distros that don't ship the exact same set Ubuntu does — Fedora, Arch, etc.
 # (glibc itself is NOT bundled — an AppImage still needs the host glibc to be
 # >= the build machine's, so the release runner's Ubuntu sets the floor.)
-#
-# Completion signatures are loaded at runtime relative to the executable
-# (<exe-dir>/completions — see terminal::signature), so they go beside the
-# binary at usr/bin/completions inside the AppDir.
 set -euo pipefail
 
 TARGET="$1"
@@ -86,13 +82,7 @@ convert assets/app-icon.png -resize 256x256 "$TOOLS/ntty7.png"
   --desktop-file "$TOOLS/ntty7.desktop" \
   --icon-file "$TOOLS/ntty7.png"
 
-# Runtime-loaded completion specs live beside the binary (not bundled by
-# linuxdeploy, which only tracks ELF deps), so drop them in after populate.
-mkdir -p "$APPDIR/usr/bin/completions"
-cp assets/completions/*.json "$APPDIR/usr/bin/completions/"
-
-# Phase 2 — pack the finished AppDir. Done separately from linuxdeploy so the
-# completions added above are included.
+# Phase 2 — pack the finished AppDir.
 "$APPIMAGETOOL" "$APPDIR" "dist/${NAME}.AppImage"
 chmod +x "dist/${NAME}.AppImage"
 rm -rf "$APPDIR" "$TOOLS"

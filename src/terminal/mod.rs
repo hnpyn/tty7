@@ -1,17 +1,10 @@
 mod boxdraw;
-mod cmd_editor;
 mod color_scheme;
 mod command_cursor;
-mod completion;
 mod composer;
 pub mod element;
 pub(crate) mod files;
 pub mod fps;
-mod fuzzy;
-mod generator;
-mod highlight;
-mod history;
-mod hold;
 pub(crate) mod images;
 pub mod input;
 mod notify;
@@ -19,13 +12,10 @@ pub mod palette;
 pub(crate) mod parked_cursor;
 pub(crate) mod prompt_reflow;
 mod remote;
-mod reverse_search;
 pub(crate) mod scrollbar;
 pub mod search;
-mod signature;
 mod size;
 mod smart_select;
-mod typeahead;
 pub mod view;
 
 #[cfg(target_os = "windows")]

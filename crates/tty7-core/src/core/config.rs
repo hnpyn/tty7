@@ -209,22 +209,6 @@ pub struct Config {
     pub confirm_close: ConfirmClose,
     #[serde(default, deserialize_with = "de_lenient")]
     pub bell: BellMode,
-    /// Whether tty7 edits the shell prompt itself. On by default: the inline
-    /// editor is what gives a prompt selection, undo, a completion menu and the
-    /// fuzzy history — none of which a shell's own line editor offers.
-    ///
-    /// Off hands every keystroke at the prompt straight to the PTY, so zsh's
-    /// ZLE / readline / fish own editing again and the keybindings written in a
-    /// dotfile work exactly as they do outside tty7. Shell integration itself
-    /// stays on: prompt boundaries, cwd, exit status and notifications are
-    /// unaffected. `tab_completion` and `history_search` are tty7's own menus,
-    /// so both are moot while this is off.
-    #[serde(default = "default_true")]
-    pub prompt_editor: bool,
-    #[serde(default = "default_true")]
-    pub tab_completion: bool,
-    #[serde(default = "default_true")]
-    pub history_search: bool,
 
     #[serde(default, deserialize_with = "de_lenient")]
     pub cursor_style: CursorStyle,
@@ -541,9 +525,6 @@ impl Default for Config {
             notify_threshold_secs: default_notify_threshold_secs(),
             confirm_close: ConfirmClose::WhenBusy,
             bell: BellMode::Visual,
-            prompt_editor: true,
-            tab_completion: true,
-            history_search: true,
             cursor_style: CursorStyle::Block,
             prompt_cursor_style: PromptCursorStyle::Follow,
             macos_option_as_alt: false,
@@ -1761,27 +1742,24 @@ mod tests {
     fn new_terminal_prefs_default_and_parse_leniently() {
         let cfg = Config::default();
         assert!(cfg.mouse_reporting);
-        assert!(cfg.prompt_editor);
-        assert!(cfg.tab_completion);
-        assert!(cfg.history_search);
         assert_eq!(cfg.notify_threshold_secs, 10);
         assert_eq!(cfg.bell, BellMode::Visual);
         assert_eq!(cfg.startup_mode, StartupMode::Normal);
 
         let cfg: Config = serde_json::from_str(r#"{"font_size": 15.0}"#).unwrap();
         assert!(cfg.mouse_reporting);
-        assert!(cfg.prompt_editor);
-        assert!(cfg.tab_completion);
-        assert!(cfg.history_search);
+        assert_eq!(cfg.font_size, 15.0);
         assert_eq!(cfg.notify_threshold_secs, 10);
         assert_eq!(cfg.bell, BellMode::Visual);
 
-        let cfg: Config = serde_json::from_str(r#"{"tab_completion": false}"#).unwrap();
-        assert!(!cfg.tab_completion);
-        let cfg: Config = serde_json::from_str(r#"{"history_search": false}"#).unwrap();
-        assert!(!cfg.history_search);
-        let cfg: Config = serde_json::from_str(r#"{"prompt_editor": false}"#).unwrap();
-        assert!(!cfg.prompt_editor);
+        // Keys from the removed prompt editor stay readable so an old
+        // config.json does not fail to load.
+        let cfg: Config = serde_json::from_str(
+            r#"{"prompt_editor":false,"tab_completion":false,"history_search":false,"font_size":19.0}"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.font_size, 19.0);
+        assert!(cfg.mouse_reporting);
 
         let cfg: Config =
             serde_json::from_str(r#"{"mouse_reporting": false, "bell": "audible"}"#).unwrap();
@@ -2037,7 +2015,7 @@ mod tests {
         let loaded = Config::load();
         assert_eq!(loaded.font_size, 21.0);
         assert!(
-            loaded.prompt_editor,
+            loaded.mouse_reporting,
             "a retired key beside the marker must not disturb the rest"
         );
 

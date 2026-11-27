@@ -79,12 +79,6 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         L10nKey::ComposerEffortTip => "Reasoning effort  ·  click to change",
         L10nKey::AppMenuMinimize => "Minimize",
         L10nKey::AppMenuZoom => "Zoom",
-        L10nKey::IntegrationNoticeBlocked => {
-            "\u{201c}{wrapper}\u{201d} is intercepting shell reports in this pane, so inline completion and the Ctrl+R menu are unavailable. The shell's own history search still works."
-        }
-        L10nKey::IntegrationNoticeNotEngaged => {
-            "tty7 shell integration hasn't engaged in this pane, so inline completion and the Ctrl+R menu are unavailable. Usual causes: a shell you started with your own arguments, a PTY wrapper, or an unsupported shell."
-        }
         L10nKey::PaneTitleProcessExited => "{title} — process exited",
         L10nKey::ShellFellBack => {
             "Configured shell {shell} failed to start. Using the login shell."

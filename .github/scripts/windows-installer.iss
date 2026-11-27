@@ -81,7 +81,6 @@ Source: "{#StageDir}\ntty7.exe"; DestDir: "{app}"; Flags: ignoreversion
 ; This installer-only marker is the authority for enabling automatic Windows
 ; updates. The portable archive is created before the marker enters the stage.
 Source: "{#StageDir}\.tty7-inno-install"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
-Source: "{#StageDir}\completions\*"; DestDir: "{app}\completions"; Flags: ignoreversion recursesubdirs
 ; Microsoft's redistributable ConPTY. It has to land in {app} rather than a
 ; subdirectory: `portable-pty` finds it through the DLL search path, which
 ; starts at the directory of the executable that loads it (the daemon is

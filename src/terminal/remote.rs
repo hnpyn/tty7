@@ -92,9 +92,6 @@ impl EventRx {
 struct ShellState {
     active: bool,
     at_prompt: bool,
-    last_exit: Option<i32>,
-    seq: u64,
-    cycle: u64,
 }
 
 /// The pane's agent status as the client last heard it.
@@ -111,7 +108,6 @@ struct ReaderSignals {
     agent_session: Arc<Mutex<AgentSlot>>,
     exited: Arc<AtomicBool>,
     child_exited: Arc<AtomicBool>,
-    zle_reading: Arc<AtomicBool>,
     shell_vi_mode: Arc<AtomicBool>,
     running_command: Arc<Mutex<String>>,
     /// Kitty-graphics images the daemon lifted out of the stream (issue #213),
@@ -308,7 +304,6 @@ pub struct RemoteTerminal {
     remote_context: Arc<Mutex<Option<RemoteContext>>>,
     exited_flag: Arc<AtomicBool>,
     child_exited: Arc<AtomicBool>,
-    zle_reading: Arc<AtomicBool>,
     shell_vi_mode: Arc<AtomicBool>,
     /// The line the shell said it is running, from the OSC 133;C mark, still
     /// percent-escaped as the integration sent it. Empty while at a prompt.
@@ -418,7 +413,7 @@ impl RemoteTerminal {
     }
 
     /// Remember the directory the daemon was asked to spawn in, so everything
-    /// that keys off a pane's cwd — completion and link resolution above all —
+    /// that keys off a pane's cwd — link resolution above all —
     /// has an answer before the shell gets far enough to report its own via
     /// OSC 7. The reader thread is already running, so a report that beat us
     /// here wins: it describes where the shell actually landed, which is not
@@ -469,7 +464,6 @@ impl RemoteTerminal {
         let agent_session: Arc<Mutex<AgentSlot>> = Arc::new(Mutex::new(AgentSlot::default()));
         let exited_flag = Arc::new(AtomicBool::new(false));
         let child_exited = Arc::new(AtomicBool::new(false));
-        let zle_reading = Arc::new(AtomicBool::new(false));
         let shell_vi_mode = Arc::new(AtomicBool::new(false));
         let running_command: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
         let images = crate::terminal::images::ImageStore::new();
@@ -492,7 +486,6 @@ impl RemoteTerminal {
                 agent_session: agent_session.clone(),
                 exited: exited_flag.clone(),
                 child_exited: child_exited.clone(),
-                zle_reading: zle_reading.clone(),
                 shell_vi_mode: shell_vi_mode.clone(),
                 running_command: running_command.clone(),
                 images: images.clone(),
@@ -517,7 +510,6 @@ impl RemoteTerminal {
             remote_context,
             exited_flag,
             child_exited,
-            zle_reading,
             shell_vi_mode,
             running_command,
             agent,
@@ -572,7 +564,6 @@ impl RemoteTerminal {
                     agent_session,
                     exited: exited_flag,
                     child_exited,
-                    zle_reading,
                     shell_vi_mode,
                     running_command,
                     images,
@@ -770,7 +761,6 @@ impl RemoteTerminal {
                                         if let Some(mark) = payload.strip_prefix(b"133;") {
                                             match mark.first() {
                                                 Some(b'B') => {
-                                                    zle_reading.store(true, Ordering::Relaxed);
                                                     // Back at a prompt: whatever
                                                     // ran is over, so the name of
                                                     // it must not outlive it into
@@ -789,7 +779,6 @@ impl RemoteTerminal {
                                                     );
                                                 }
                                                 Some(b'C') => {
-                                                    zle_reading.store(false, Ordering::Relaxed);
                                                     // `C` alone is a command start
                                                     // with no line to report — the
                                                     // PowerShell path sends that —
@@ -806,7 +795,7 @@ impl RemoteTerminal {
                                                         *cmd = line;
                                                     }
                                                 }
-                                                _ => zle_reading.store(false, Ordering::Relaxed),
+                                                _ => {}
                                             }
                                         }
                                     });
@@ -935,18 +924,11 @@ impl RemoteTerminal {
                             DaemonMsg::Prompt {
                                 active,
                                 at_prompt,
-                                last_exit,
+                                last_exit: _,
                             } => {
                                 flush_batch!();
                                 if let Ok(mut guard) = shell.lock() {
-                                    *guard = ShellState {
-                                        active,
-                                        at_prompt,
-                                        last_exit,
-                                        seq: guard.seq + 1,
-                                        cycle: guard.cycle
-                                            + u64::from(at_prompt && !guard.at_prompt),
-                                    };
+                                    *guard = ShellState { active, at_prompt };
                                 }
                                 if active && at_prompt {
                                     let mut term = term.lock();
@@ -1178,18 +1160,6 @@ impl RemoteTerminal {
             .unwrap_or(false)
     }
 
-    pub fn prompt_seq(&self) -> u64 {
-        self.shell_state.lock().map(|s| s.seq).unwrap_or(0)
-    }
-
-    pub fn prompt_cycle(&self) -> u64 {
-        self.shell_state.lock().map(|s| s.cycle).unwrap_or(0)
-    }
-
-    pub fn last_exit_code(&self) -> Option<i32> {
-        self.shell_state.lock().ok().and_then(|s| s.last_exit)
-    }
-
     pub fn shell_active(&self) -> bool {
         self.shell_state.lock().map(|s| s.active).unwrap_or(false)
     }
@@ -1233,10 +1203,6 @@ impl RemoteTerminal {
         self.agent_session.lock().ok().and_then(|g| g.state.clone())
     }
 
-    pub fn zle_reading(&self) -> bool {
-        self.zle_reading.load(Ordering::Relaxed)
-    }
-
     pub fn shell_vi_mode(&self) -> bool {
         self.shell_vi_mode.load(Ordering::Relaxed)
     }
@@ -1253,19 +1219,6 @@ impl RemoteTerminal {
 
     pub fn size(&self) -> TermSize {
         self.size
-    }
-
-    pub fn list_panes_on() -> Vec<crate::daemon::protocol::PaneInfo> {
-        let holds = live_panes().lock().unwrap_or_else(|e| e.into_inner());
-        holds
-            .values()
-            .filter_map(|hold| {
-                hold.pane
-                    .lock()
-                    .ok()
-                    .and_then(|guard| guard.as_ref().map(|pane| pane.info()))
-            })
-            .collect()
     }
 
     pub fn kill_pane(pane_id: u64) {
@@ -3342,14 +3295,14 @@ mod tests {
     }
 
     #[test]
-    fn shell_vi_mode_follows_live_prompt_mode_marks_without_disarming_zle() {
+    fn shell_vi_mode_follows_prompt_mode_marks() {
         let (term, daemon_side) = RemoteTerminal::from_pipe(
             TermSize::new(80, 24),
             crate::terminal::remote::PtySource::local(),
         );
-        let poll = |vi: bool, zle: bool| {
+        let poll = |vi: bool, command: &str| {
             for _ in 0..200 {
-                if term.shell_vi_mode() == vi && term.zle_reading() == zle {
+                if term.shell_vi_mode() == vi && term.running_command() == command {
                     return true;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(5));
@@ -3358,25 +3311,31 @@ mod tests {
         };
 
         assert!(!term.shell_vi_mode(), "conservative false before any mark");
-        assert!(!term.zle_reading(), "zle also starts false");
+        assert_eq!(term.running_command(), "");
 
         daemon_side.send(DaemonMsg::Output(b"\x1b]133;B\x07".to_vec()));
-        assert!(poll(false, true), "B should arm zle only");
+        assert!(poll(false, ""), "B should clear the running command");
 
         daemon_side.send(DaemonMsg::Output(b"\x1b]133;V;1\x07".to_vec()));
         assert!(
-            poll(true, true),
-            "V;1 should set shell vi-mode without disarming zle"
+            poll(true, ""),
+            "V;1 should set shell vi-mode and leave the command alone"
         );
 
         daemon_side.send(DaemonMsg::Output(b"\x1b]133;V;0\x07".to_vec()));
+        assert!(poll(false, ""), "V;0 should clear shell vi-mode");
+
+        daemon_side.send(DaemonMsg::Output(b"\x1b]133;C;ls\x07".to_vec()));
         assert!(
-            poll(false, true),
-            "V;0 should clear shell vi-mode without disarming zle"
+            poll(false, "ls"),
+            "C records the command and leaves vi-mode"
         );
 
-        daemon_side.send(DaemonMsg::Output(b"\x1b]133;C\x07".to_vec()));
-        assert!(poll(false, false), "C still disarms zle");
+        daemon_side.send(DaemonMsg::Output(b"\x1b]133;B\x07".to_vec()));
+        assert!(
+            poll(false, ""),
+            "B clears the command when the prompt returns"
+        );
     }
 }
 

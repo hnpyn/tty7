@@ -1842,10 +1842,9 @@ impl GridSnapshot {
 
 impl TerminalElement {
     /// The shape `prompt_cursor_style` puts on the grid cursor while the shell
-    /// waits at a prompt with its own line editor — `prompt_editor` off, or a
-    /// line handed back to ZLE/readline. Shell integration has no mark for "a
-    /// prompt plugin set this shape", so the one it does report, vi mode, keeps
-    /// the shell's own insert/normal shapes.
+    /// waits at a prompt. Shell integration has no mark for "a prompt plugin
+    /// set this shape", so the one it does report, vi mode, keeps the shell's
+    /// own insert/normal shapes.
     pub(super) fn prompt_cursor_shape(&self, cx: &App) -> Option<crate::core::config::CursorStyle> {
         let shape = cx.global::<Config>().prompt_cursor_style.shape()?;
         let terminal = &self.view.read(cx).terminal;
@@ -2097,7 +2096,6 @@ impl TerminalElement {
                 return;
             }
             let (col, row, left) = geom.pos_to_cell(ev.position);
-            let raw_row = geom.pos_to_row_raw(ev.position);
             let mods = ev.modifiers;
             let button = ev.button;
             let clicks = ev.click_count;
@@ -2126,11 +2124,6 @@ impl TerminalElement {
                     v.mouse_press(button, col, row, &mods);
                     return;
                 }
-                if button == MouseButton::Left
-                    && v.editor_click(col, raw_row, clicks, mods.shift, cx)
-                {
-                    return;
-                }
                 if button == MouseButton::Left {
                     v.on_select_start(col, row, left, clicks, mods.shift, cx);
                 }
@@ -2140,7 +2133,6 @@ impl TerminalElement {
         let view = self.view.clone();
         window.on_mouse_event(move |ev: &MouseMoveEvent, _phase, window, cx| {
             let (col, row, left) = geom.pos_to_cell(ev.position);
-            let raw_row = geom.pos_to_row_raw(ev.position);
             let mods = ev.modifiers;
             let Some(button) = ev.pressed_button else {
                 let inside = hitbox.is_hovered(window);
@@ -2167,9 +2159,6 @@ impl TerminalElement {
             view.update(cx, |v, cx| {
                 if v.mouse_mode() && !mods.shift {
                     v.mouse_drag(button, col, row, &mods);
-                    return;
-                }
-                if button == MouseButton::Left && v.editor_drag(col, raw_row, cx) {
                     return;
                 }
                 if button == MouseButton::Left {
@@ -2315,11 +2304,10 @@ impl Element for TerminalElement {
         let fps_start = super::fps::enabled().then(std::time::Instant::now);
 
         let frac = self.view.read(cx).scroll_frac.clamp(0., 1.);
-        let input_shift = self.view.read(cx).input_scroll_rows();
         let geom = CellGeom {
             origin: point(
                 bounds.origin.x,
-                bounds.origin.y + prepaint.line_height * (frac - input_shift as f32),
+                bounds.origin.y + prepaint.line_height * frac,
             ),
             cell_width: prepaint.cell_width,
             line_height: prepaint.line_height,
@@ -2335,7 +2323,6 @@ impl Element for TerminalElement {
         let focused = self.view.read(cx).focus_handle.is_focused(window);
         let cursor_visible = self.view.read(cx).cursor_visible;
         let bell_flash = self.view.read(cx).bell_flash;
-        let editor_active = self.view.read(cx).input_active();
 
         // This pane's previous frame, borrowed for the duration of this one.
         // `build_grid` overwrites it when it gets the terminal lock, and leaves
@@ -2376,22 +2363,14 @@ impl Element for TerminalElement {
         // normal background-then-glyph path instead of being tinted on top of
         // the finished frame. `paint_cursor` skips the focused block for the
         // same reason.
-        if !editor_active
-            && focused
+        if focused
             && cursor_visible
             && let Some((row, col, crate::core::config::CursorStyle::Block)) = render_cursor
         {
             invert_cursor_cell(&mut buf, geom.cols, row, col, &colors);
         }
 
-        // With the input bar up, the IME composes into the bar, which starts a
-        // row below the prompt when the prompt left it too little room.
-        let ime_cell = cursor.map(|c| {
-            self.view
-                .read(cx)
-                .input_ime_cell(c.row, c.col, geom.cols)
-                .unwrap_or((c.row, c.ime_col))
-        });
+        let ime_cell = cursor.map(|c| (c.row, c.ime_col));
         let cursor_bounds = ime_cell.map(|(row, col)| geom.cell_rect(row, col, 1));
         // Unfocused, the anchor is forgotten so the next focus pushes it again.
         let ime_anchor = cursor_bounds.filter(|_| focused);
@@ -2538,27 +2517,25 @@ impl Element for TerminalElement {
                 );
                 paint_special_underlines(window, &sg, row, scale);
             }
-            if !editor_active {
-                paint_cursor(
-                    window,
-                    &geom,
-                    render_cursor,
-                    focused,
-                    cursor_visible,
-                    colors.caret,
-                );
-                paint_marked(
-                    window,
-                    cx,
-                    &geom,
-                    cursor_cell,
-                    &marked,
-                    font_size,
-                    &base_font,
-                    colors.default_fg,
-                    colors.default_bg,
-                );
-            }
+            paint_cursor(
+                window,
+                &geom,
+                render_cursor,
+                focused,
+                cursor_visible,
+                colors.caret,
+            );
+            paint_marked(
+                window,
+                cx,
+                &geom,
+                cursor_cell,
+                &marked,
+                font_size,
+                &base_font,
+                colors.default_fg,
+                colors.default_bg,
+            );
 
             if bell_flash {
                 let mut c = colors.default_fg;
@@ -2615,11 +2592,6 @@ impl CellGeom {
             ((ly / self.line_height.as_f32()).floor() as usize).min(self.rows.saturating_sub(1));
         let left = (colf - colf.floor()) <= 0.5;
         (col, row, left)
-    }
-
-    fn pos_to_row_raw(&self, pos: Point<Pixels>) -> usize {
-        let ly = (pos.y - self.origin.y).as_f32().max(0.);
-        (ly / self.line_height.as_f32()).floor() as usize
     }
 }
 

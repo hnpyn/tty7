@@ -81,12 +81,6 @@ pub fn translate_ja(key: L10nKey) -> Option<&'static str> {
         L10nKey::ComposerEffortTip => "推論の強さ  ·  クリックして変更",
         L10nKey::AppMenuMinimize => "最小化",
         L10nKey::AppMenuZoom => "ズーム",
-        L10nKey::IntegrationNoticeBlocked => {
-            "“{wrapper}”がこのペインのシェルレポートを横取りしているため、インライン補完と Ctrl+R メニューは使えません。シェル独自の履歴検索は引き続き使えます。"
-        }
-        L10nKey::IntegrationNoticeNotEngaged => {
-            "このペインでは tty7 シェル統合が有効になっておらず、インライン補完と Ctrl+R メニューは使えません。よくある原因は、独自の引数で起動したシェル、PTY ラッパー、未対応のシェルです。"
-        }
         L10nKey::PaneTitleProcessExited => "{title} — プロセスが終了しました",
         L10nKey::ShellFellBack => {
             "設定したシェル {shell} の起動に失敗したため、ログインシェルを使います。"

@@ -135,8 +135,6 @@ l10n_keys! {
     ComposerEffortTip,
     AppMenuMinimize,
     AppMenuZoom,
-    IntegrationNoticeBlocked,
-    IntegrationNoticeNotEngaged,
     PaneTitleProcessExited,
     ShellFellBack,
     ShellCouldNotStart,

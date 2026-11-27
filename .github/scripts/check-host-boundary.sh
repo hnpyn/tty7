@@ -67,22 +67,6 @@ src/ui/settings.rs|std::fs::read
 # a passphrase box for one — the same client-side key, never a workspace path.
 src/ui/settings.rs|std::fs::metadata
 
-# Shell history lives in the local user's home (`~/.zsh_history` &co.) and backs
-# this app's own history search. A remote pane's history is the remote shell's
-# business, read over the wire, not through here.
-src/terminal/history.rs|std::fs::
-
-# Completion is already remote-aware: a remote pane is signalled by `cwd: None`,
-# which disables exactly these local-filesystem candidate sources in favour of
-# `remote_path_request` / `remote_path_candidates`. The `$PATH` scan is likewise
-# this machine's `$PATH`, deliberately withheld from remote panes.
-src/terminal/completion.rs|std::fs::read_dir
-src/terminal/completion.rs|.is_absolute()
-
-# Bundled completion specs shipped in `assets/completions`, resolved from the
-# app bundle / dev manifest dir. Program data, not user or workspace data.
-src/terminal/signature.rs|std::fs::read_to_string
-
 # Opening a path scraped out of terminal output resolves it against the local
 # cwd — a local-pane affordance; `resolve_existing_path` declines when there is
 # no local cwd.

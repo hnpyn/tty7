@@ -324,10 +324,9 @@ fn kitty_function_key(key: &str) -> Option<u32> {
 }
 
 /// Whether a key name is one of the function keys — the range that means
-/// nothing to a text editor and everything to a shell. The inline editor asks
-/// this to know a keystroke it holds no meaning for but the shell does; it
-/// still only hands over what actually encodes, which for F13 and up is the
-/// kitty path alone.
+/// nothing to a text field and everything to a shell. F13 and up encode only
+/// once the kitty protocol is negotiated.
+#[cfg(test)]
 pub(crate) fn is_function_key(key: &str) -> bool {
     function_key(key).is_some() || kitty_function_key(key).is_some()
 }

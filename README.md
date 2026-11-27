@@ -9,7 +9,7 @@
 - GPU rendering on [gpui](https://github.com/zed-industries/zed)
 - VT core from [`alacritty_terminal`](https://github.com/alacritty/alacritty)
 - The shell runs in-process through [portable-pty](https://github.com/wezterm/wezterm), with the Windows ConPTY helper bundled in
-- An inline prompt editor, tab completion, and fuzzy history search that step aside for vi-mode
+- Keys at a prompt, including Tab and Ctrl+R, go straight to the shell
 - Kitty graphics
 - Themes, transparency, and window blur
 - Light and dark presets that follow the system appearance
@@ -59,7 +59,7 @@ Custom themes are `themes/*.yaml` or `themes/*.itermcolors` next to `config.json
 | Clear scrollback | ⌘K | Ctrl+Shift+K |
 | Larger / smaller font | ⌘= / ⌘- | Ctrl+= / Ctrl+- |
 | Reset font | ⌘0 | Ctrl+0 |
-| Newline in the prompt editor | Shift+Enter | Shift+Enter |
+| Newline | Shift+Enter | Shift+Enter |
 | Toggle the composer | ⌘I | Ctrl+Shift+I |
 | Full screen | ⌘⌃F | F11 |
 | Open config | ⌘, | Ctrl+, |

@@ -4,8 +4,7 @@
 #   dist/ntty7-<version>-linux-<arch>.tar.gz
 #
 # Fonts and the app icon are embedded via include_bytes!, so the archive is the
-# stripped executable plus a sibling completions/ dir (loaded at runtime — see
-# terminal::signature) and the license/readme. gpui's x11/wayland backends still
+# stripped executable plus the license/readme. gpui's x11/wayland backends still
 # dynamic-link the usual system libs at runtime — see the README's Linux
 # build-dependency list — so this is an unsigned build, not a
 # portable AppImage.
@@ -32,8 +31,6 @@ chmod +x "$STAGE/ntty7"
 # `[profile.release]` already sets `strip = "symbols"`. Strip again so a
 # binary built outside that profile does not ship a ~100 MB unstripped archive.
 strip "$STAGE/ntty7" || echo "⚠️  strip unavailable — shipping unstripped binary"
-mkdir -p "$STAGE/completions"
-cp assets/completions/*.json "$STAGE/completions/"
 cp LICENSE "$STAGE/LICENSE"
 cp README.md "$STAGE/README.md"
 

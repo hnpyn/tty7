@@ -44,10 +44,6 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BIN_DIR/ntty7" "$APP/Contents/MacOS/ntty7"
 chmod +x "$APP/Contents/MacOS/ntty7"
 cp assets/ntty7.icns "$APP/Contents/Resources/ntty7.icns"
-# Completion signatures are loaded at runtime (not embedded), resolved relative
-# to the executable as ../Resources/completions — see terminal::signature.
-mkdir -p "$APP/Contents/Resources/completions"
-cp assets/completions/*.json "$APP/Contents/Resources/completions/"
 printf 'APPL????' > "$APP/Contents/PkgInfo"
 if [[ -n "${TTY7_LOCAL_BUILD_ID:-}" ]]; then
     # A local install's build id, which a running app can watch to offer a restart.

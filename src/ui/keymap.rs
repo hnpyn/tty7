@@ -4,7 +4,7 @@ use crate::core::actions::*;
 use crate::core::config::{Config, KeybindingOverride};
 use crate::terminal::view::{
     AlternatePaste, ClearScrollback, CopyRaw, CopyText, FindInTerminal, FindNext, FindPrevious,
-    InsertNewline, InsertNewlineFallback, PasteText, ToggleComposer,
+    InsertNewline, PasteText, ToggleComposer,
 };
 use crate::ui::theme::set_menus;
 
@@ -29,9 +29,8 @@ pub fn init(cx: &mut App) {
     set_menus(cx);
 }
 
-/// Terminal keys the config table does not carry: Tab is input. Cmd+Enter
-/// while a completion or history-search menu is open falls through to the
-/// editor, which accepts the row and submits the line.
+/// Terminal keys the config table does not carry. Tab stays input: it is bound
+/// here so a reload cannot hand it to a text field.
 fn fixed_bindings() -> Vec<KeyBinding> {
     vec![
         KeyBinding::new("secondary-+", IncreaseFontSize, None),
@@ -75,8 +74,6 @@ pub(crate) fn keybinding_config(cx: &App) -> (Vec<(String, KeybindingOverride)>,
 
 const INSERT_NEWLINE_DEFAULT: &str = "shift-enter";
 
-const INSERT_NEWLINE_ALT_DEFAULT: &str = "alt-enter";
-
 const PASTE_ALT_DEFAULT: &str = "shift-insert";
 
 fn paste_text_default() -> &'static str {
@@ -96,14 +93,7 @@ fn alternate_paste_default() -> &'static str {
 }
 
 fn extra_defaults() -> Vec<(&'static str, &'static str, &'static str)> {
-    vec![
-        (
-            "InsertNewline",
-            INSERT_NEWLINE_DEFAULT,
-            INSERT_NEWLINE_ALT_DEFAULT,
-        ),
-        ("PasteText", paste_text_default(), PASTE_ALT_DEFAULT),
-    ]
+    vec![("PasteText", paste_text_default(), PASTE_ALT_DEFAULT)]
 }
 
 fn extra_keystrokes(effective: &[(String, String)]) -> Vec<(&'static str, &'static str)> {
@@ -114,10 +104,6 @@ fn extra_keystrokes(effective: &[(String, String)]) -> Vec<(&'static str, &'stat
         })
         .map(|(action, _, extra)| (action, extra))
         .collect()
-}
-
-fn is_default_insert_newline_binding(action: &str, key: &str) -> bool {
-    action == "InsertNewline" && key == INSERT_NEWLINE_DEFAULT
 }
 
 /// Installs `key` for `action`, and alongside it the chord the platform will
@@ -171,12 +157,6 @@ fn action_bindings(effective: &[(String, String)]) -> Vec<KeyBinding> {
         }
         if !push_binding(&mut bindings, action, key) {
             log::warn!("ignoring keybinding: unknown action '{action}'");
-        } else if is_default_insert_newline_binding(action, key) {
-            bindings.push(KeyBinding::new(
-                INSERT_NEWLINE_DEFAULT,
-                InsertNewlineFallback,
-                Some("Terminal"),
-            ));
         }
     }
     bindings
@@ -834,7 +814,7 @@ mod tests {
     }
 
     #[test]
-    fn insert_newline_ships_both_default_chords() {
+    fn insert_newline_ships_shift_enter_only() {
         let effective: Vec<(String, String)> = default_bindings()
             .into_iter()
             .map(|(a, k)| (a.to_string(), k.to_string()))
@@ -846,28 +826,23 @@ mod tests {
                 .map(|(_, k)| k.as_str()),
             Some("shift-enter")
         );
-        assert!(extra_keystrokes(&effective).contains(&("InsertNewline", "alt-enter")));
-        for key in ["shift-enter", "alt-enter"] {
-            assert!(keystroke_is_valid(key), "{key} does not parse");
-            assert!(
-                dispatched(&effective, key, "Terminal").contains(&InsertNewline::name_for_type()),
-                "{key} does not reach InsertNewline in a terminal"
-            );
-        }
+        assert!(
+            !extra_keystrokes(&effective)
+                .iter()
+                .any(|(action, _)| *action == "InsertNewline"),
+            "alt-enter is a normal meta-CR, not a second newline chord"
+        );
+        assert!(
+            dispatched(&effective, "shift-enter", "Terminal")
+                .contains(&InsertNewline::name_for_type()),
+            "shift-enter reaches InsertNewline in a terminal"
+        );
+        assert!(
+            !dispatched(&effective, "alt-enter", "Terminal")
+                .contains(&InsertNewline::name_for_type()),
+            "alt-enter must not be claimed by InsertNewline"
+        );
         assert_eq!(key_tokens("shift-enter"), vec![SHIFT, "↵"]);
-    }
-
-    #[test]
-    fn shift_enter_fallback_retires_with_an_insert_newline_rebind() {
-        assert!(is_default_insert_newline_binding(
-            "InsertNewline",
-            "shift-enter"
-        ));
-        assert!(!is_default_insert_newline_binding(
-            "InsertNewline",
-            "ctrl-o"
-        ));
-        assert!(!is_default_insert_newline_binding("InsertNewline", ""));
     }
 
     #[test]
@@ -1001,12 +976,15 @@ mod tests {
             vec![InsertNewline::name_for_type()],
             "the chord the config asks for is the one the keymap dispatches"
         );
-        for retired in ["shift-enter", "alt-enter"] {
-            assert!(
-                dispatched(&effective, retired, "Terminal").is_empty(),
-                "{retired} is off the action now and must dispatch nothing"
-            );
-        }
+        assert!(
+            dispatched(&effective, "shift-enter", "Terminal").is_empty(),
+            "rebinding InsertNewline must give shift-enter back"
+        );
+        assert!(
+            !dispatched(&effective, "alt-enter", "Terminal")
+                .contains(&InsertNewline::name_for_type()),
+            "alt-enter is not an InsertNewline chord"
+        );
 
         let unbound = vec![("InsertNewline".to_string(), String::new())];
         assert!(extra_keystrokes(&unbound).is_empty());
@@ -1019,22 +997,15 @@ mod tests {
             ("InsertNewline".to_string(), "shift-enter".to_string()),
             ("NewTab".to_string(), "secondary-t".to_string()),
         ];
-        // The newline is a terminal chord, and its default ships the fallback
-        // beside it; both are scoped, so neither reaches the rest of the app.
-        let mut newline = dispatched(&effective, "shift-enter", "Terminal");
-        newline.sort_unstable();
+        // The newline is a terminal chord, so it does not reach the rest of the app.
         assert_eq!(
-            newline,
-            vec![
-                InsertNewline::name_for_type(),
-                InsertNewlineFallback::name_for_type(),
-            ]
+            dispatched(&effective, "shift-enter", "Terminal"),
+            vec![InsertNewline::name_for_type()]
         );
         assert!(dispatched(&effective, "shift-enter", "Workspace").is_empty());
-        assert_eq!(
-            dispatched(&effective, "alt-enter", "Terminal"),
-            vec![InsertNewline::name_for_type()],
-            "the extra chord follows its action's scope"
+        assert!(
+            dispatched(&effective, "alt-enter", "Terminal").is_empty(),
+            "alt-enter is left for the shell"
         );
         // A window action has no context: it has to work from a terminal too.
         for context in ["Terminal", "Workspace"] {

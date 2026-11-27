@@ -247,7 +247,6 @@ impl SoloWindow {
             view.reread_fallback_chain(cx);
             view.set_font_features(features, cx);
             view.report_mouse = config.mouse_reporting;
-            view.set_prompt_editor(config.prompt_editor, cx);
             view.terminal.apply_user_config(&config);
             cx.notify();
         });

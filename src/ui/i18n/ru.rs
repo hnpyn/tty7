@@ -79,12 +79,6 @@ pub fn translate_ru(key: L10nKey) -> Option<&'static str> {
         L10nKey::ComposerEffortTip => "Глубина рассуждений · нажмите, чтобы сменить",
         L10nKey::AppMenuMinimize => "Свернуть",
         L10nKey::AppMenuZoom => "Изменить масштаб",
-        L10nKey::IntegrationNoticeBlocked => {
-            "«{wrapper}» перехватывает сообщения оболочки в этой панели. Встроенное дополнение и меню Ctrl+R недоступны. Поиск по истории самой оболочки работает."
-        }
-        L10nKey::IntegrationNoticeNotEngaged => {
-            "Интеграция оболочки tty7 не включилась в этой панели. Встроенное дополнение и меню Ctrl+R недоступны. Возможные причины: свои аргументы запуска оболочки, обёртка PTY или неподдерживаемая оболочка."
-        }
         L10nKey::PaneTitleProcessExited => "{title}: процесс завершён",
         L10nKey::ShellFellBack => {
             "Настроенная оболочка {shell} не запустилась. Используется оболочка входа."

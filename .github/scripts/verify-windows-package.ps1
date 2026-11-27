@@ -8,7 +8,7 @@
 #
 # Checks, in order:
 #   the install marker and the portable marker
-#   the portable archive layout (ntty7.exe, license, readme, completions)
+#   the portable archive layout (ntty7.exe, license, readme)
 #   ProductVersion on ntty7.exe and the setup.exe file version
 #
 # Usage: verify-windows-package.ps1 <arch> [version]
@@ -114,7 +114,7 @@ if (-not (Test-Path -LiteralPath $Zip)) {
     # `validate_portable_relative_path` allows only these top-level names.
     $managed = @(
         'ntty7.exe', '.tty7-portable',
-        'completions', 'server', 'LICENSE.txt', 'README.md',
+        'server', 'LICENSE.txt', 'README.md',
         'conpty.dll', 'OpenConsole.exe', 'LICENSE-ConPTY.txt'
     )
     $roots = @($entries |
@@ -145,10 +145,6 @@ if (-not (Test-Path -LiteralPath $Zip)) {
                 Fail "the portable archive is missing the required file $required"
             }
         }
-        if (-not (Test-Path -LiteralPath (Join-Path $unzipped 'completions') -PathType Container)) {
-            Fail "the portable archive is missing the required directory completions"
-        }
-
         $markerPath = Join-Path $unzipped '.tty7-portable'
         if (Test-Path -LiteralPath $markerPath) {
             $marker = [System.IO.File]::ReadAllBytes($markerPath)

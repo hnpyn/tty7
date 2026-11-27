@@ -9,7 +9,7 @@
 - 用 [gpui](https://github.com/zed-industries/zed) 做 GPU 渲染
 - VT 核心来自 [`alacritty_terminal`](https://github.com/alacritty/alacritty)
 - shell 在进程内通过 [portable-pty](https://github.com/wezterm/wezterm) 启动，Windows 上附带 ConPTY
-- 行内提示符编辑、Tab 补全、模糊历史搜索；进入 vi 模式时它们让开
+- 提示符处的按键（含 Tab 与 Ctrl+R）直接交给 shell
 - Kitty 图形协议
 - 主题、透明和窗口模糊
 - 跟随系统外观的浅色 / 深色主题
@@ -59,7 +59,7 @@ cargo build --release
 | 清空回滚 | ⌘K | Ctrl+Shift+K |
 | 放大 / 缩小字体 | ⌘= / ⌘- | Ctrl+= / Ctrl+- |
 | 重置字体 | ⌘0 | Ctrl+0 |
-| 提示符里换行 | Shift+Enter | Shift+Enter |
+| 换行 | Shift+Enter | Shift+Enter |
 | 打开输入框 | ⌘I | Ctrl+Shift+I |
 | 全屏 | ⌘⌃F | F11 |
 | 打开配置 | ⌘, | Ctrl+, |
