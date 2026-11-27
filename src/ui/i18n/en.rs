@@ -79,7 +79,6 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         L10nKey::ComposerEffortTip => "Reasoning effort  ·  click to change",
         L10nKey::AppMenuMinimize => "Minimize",
         L10nKey::AppMenuZoom => "Zoom",
-        L10nKey::PaneTitleProcessExited => "{title} — process exited",
         L10nKey::ShellFellBack => {
             "Configured shell {shell} failed to start. Using the login shell."
         }

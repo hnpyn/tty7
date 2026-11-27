@@ -26,18 +26,6 @@ pub struct ShellSpec {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PaneInfo {
-    pub pane_id: u64,
-    pub cwd: Option<PathBuf>,
-    pub title: String,
-    /// See [`crate::core::machine::PaneRecord::osc_title`] — the terminal's own
-    /// title, not the foreground process name `title` carries.
-    pub osc_title: Option<String>,
-    pub alive: bool,
-    pub owner: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteContext {
     pub kind: RemoteKind,
     pub argv: Vec<String>,

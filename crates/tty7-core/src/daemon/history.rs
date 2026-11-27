@@ -89,25 +89,6 @@ pub fn env_for(pane: u64, shell: &str) -> Option<(String, String)> {
     Some((FILE_ENV.to_string(), path.to_string_lossy().into_owned()))
 }
 
-/// Hand a dead pane's history to the pane that replaces it.
-///
-/// A pane restored after the daemon died is a new pane with a new id, and
-/// without this its Up key would start from whatever the global file held when
-/// it was seeded — losing exactly the commands its predecessor ran, which are
-/// the ones the user is most likely to want back.
-pub fn carry(from: u64, to: u64) {
-    let (Some(old), Some(new)) = (path_for(from), path_for(to)) else {
-        return;
-    };
-    if !old.exists() {
-        return;
-    }
-    for suffix in ["", ".seed", ".origin"] {
-        let (a, b) = (with_suffix(&old, suffix), with_suffix(&new, suffix));
-        let _ = std::fs::rename(&a, &b);
-    }
-}
-
 /// Give a closed pane's commands back to the history file they came from.
 ///
 /// Only what the pane added: the shell recorded how many bytes it seeded, and
@@ -340,39 +321,6 @@ mod tests {
         // value came from inside a pane, where an rc file can put anything.
         retire(80_004);
         assert!(!Path::new("../relative/history").exists());
-    }
-
-    #[test]
-    fn a_restored_pane_inherits_its_predecessors_history() {
-        pin_config_dir();
-        let origin = a_global_history("carried", "old command\n");
-        let before = seed(80_005, &origin);
-        std::fs::write(&before, "old command\nfrom the dead pane\n").unwrap();
-
-        carry(80_005, 80_006);
-
-        assert!(
-            !before.exists(),
-            "the old name is not left behind as a copy"
-        );
-        let after = path_for(80_006).expect("a path");
-        assert_eq!(
-            std::fs::read_to_string(&after).unwrap(),
-            "old command\nfrom the dead pane\n",
-            "the replacement pane's Up key has to reach what its predecessor ran"
-        );
-        assert_eq!(
-            std::fs::read_to_string(with_suffix(&after, ".seed")).unwrap(),
-            "12",
-            "the mark has to travel too, or the merge would hand back the seed as new"
-        );
-
-        retire(80_006);
-        assert_eq!(
-            std::fs::read_to_string(&origin).unwrap(),
-            "old command\nfrom the dead pane\n"
-        );
-        let _ = std::fs::remove_file(&origin);
     }
 
     #[test]

@@ -135,7 +135,6 @@ l10n_keys! {
     ComposerEffortTip,
     AppMenuMinimize,
     AppMenuZoom,
-    PaneTitleProcessExited,
     ShellFellBack,
     ShellCouldNotStart,
     ShellCouldNotStartTitle,

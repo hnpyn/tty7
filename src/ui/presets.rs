@@ -62,12 +62,6 @@ pub struct Neutrals {
     pub selection: u32,
     pub sidebar: u32,
     pub sidebar_fg: u32,
-    /// The left rail's own fill: a small step off the window toward the
-    /// foreground, so the tab column reads as navigation beside the work.
-    /// The right panel keeps `sidebar` (the window fill).
-    pub rail: u32,
-    /// The tab title ink on `rail`, floored the way `sidebar_fg` is.
-    pub rail_fg: u32,
     pub accent: u32,
 }
 
@@ -101,8 +95,6 @@ pub struct Interactions {
 pub mod state {
     pub const HOVER: f32 = 1.18;
     pub const SELECTED: f32 = 1.30;
-    pub const PRESSED: f32 = 1.55;
-    pub const CURSOR: f32 = 1.70;
     /// The side panels' own, lighter rungs (see `Theme::panel_surface`).
     /// A panel lists many rows at once, and at the window's 1.30 the current
     /// one read as a dark slab; these land on #ededec / #e8e8e7 on the
@@ -118,12 +110,6 @@ pub struct Surface {
     pub base: u32,
     pub hover: u32,
     pub selected: u32,
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub pressed: u32,
-    /// The top rung. No surface paints it today; the ladder tests hold the
-    /// rungs below it apart against it.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub cursor: u32,
     pub text_resting: u32,
     pub text_selected: u32,
 }
@@ -138,9 +124,6 @@ pub struct Scrim {
 pub struct Surfaces {
     pub window: Surface,
     pub sidebar: Surface,
-    /// The left tab rail's ladder, built on `Neutrals::rail`.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub rail: Surface,
     pub popover: Surface,
     pub scrim: Scrim,
 }
@@ -213,7 +196,6 @@ impl Theme {
                 legible_ink(surface, ink, TEXT_FLOOR)
             });
         let title_floor = TITLE_FLOOR.max(contrast(muted_foreground, sidebar) * state::TEXT_STEP);
-        let rail_title_floor = TITLE_FLOOR.max(contrast(muted_foreground, rail) * state::TEXT_STEP);
         // Blended, not bisected, so a palette's own softness carries into the
         // rails — but floored on the fill it is actually painted on. This is
         // the tab title, the top rung of a three-rung column (title / branch /
@@ -257,8 +239,6 @@ impl Theme {
             // the same grey twice, and the column reads as one flat wash with
             // nothing to look at first.
             sidebar_fg: title_ink(sidebar, title_floor),
-            rail,
-            rail_fg: title_ink(rail, rail_title_floor),
             accent: legible_accent(bg, self.accent),
         }
     }
@@ -272,8 +252,6 @@ impl Theme {
             base,
             hover: raise(base, fg, state::HOVER),
             selected,
-            pressed: raise(base, fg, state::PRESSED),
-            cursor: raise(base, fg, state::CURSOR),
             text_resting,
             text_selected: stepped_ink(selected, base, fg, text_resting),
         }
@@ -338,7 +316,8 @@ impl Theme {
     /// darkest one.
     fn clear_ink(&self, seed: u32, floor: f32) -> u32 {
         let m = self.neutrals();
-        [m.background, m.sidebar, m.rail, m.popover]
+        let rail = mix(m.background, m.foreground, RAIL_TINT);
+        [m.background, m.sidebar, rail, m.popover]
             .into_iter()
             .fold(seed, |ink, surface| legible_ink(surface, ink, floor))
     }
@@ -388,11 +367,9 @@ impl Theme {
         // current title is SEMIBOLD now and carries that on its own; a heavy
         // fill on top of it read as a pressed button rather than as a place.
         let sidebar = self.panel_surface(m.sidebar, m.sidebar_fg, fg);
-        let rail = self.panel_surface(m.rail, m.rail_fg, fg);
         Surfaces {
             window: self.surface(m.background),
             sidebar,
-            rail,
             popover: self.surface(m.popover),
             // The v5 scrim: a dim, not a blackout. Dark lands on near-black at
             // 45%; light on a warm near-black at 14%, just enough to say the
@@ -1606,7 +1583,6 @@ mod tests {
                 let sel_base = contrast(sf.selected, sf.base);
                 let sel_hover = contrast(sf.selected, sf.hover);
                 let hover_base = contrast(sf.hover, sf.base);
-                let cursor_sel = contrast(sf.cursor, sf.selected);
                 assert!(
                     sel_base >= 1.25,
                     "{}/{name}: selected is only {sel_base:.2}:1 from the surface",
@@ -1618,18 +1594,8 @@ mod tests {
                     t.id
                 );
                 assert!(
-                    cursor_sel >= 1.2,
-                    "{}/{name}: cursor is only {cursor_sel:.2}:1 from the resting selection",
-                    t.id
-                );
-                assert!(
                     hover_base >= 1.1,
                     "{}/{name}: hover is only {hover_base:.2}:1 from the surface",
-                    t.id
-                );
-                assert!(
-                    contrast(sf.pressed, sf.base) > sel_base,
-                    "{}/{name}: pressed must read past selected",
                     t.id
                 );
             }
@@ -1640,25 +1606,19 @@ mod tests {
     fn panel_state_ladder_is_separable_in_every_theme() {
         for t in builtins() {
             let s = t.surfaces();
-            for (name, sf) in [("sidebar", s.sidebar), ("rail", s.rail)] {
-                let hover_base = contrast(sf.hover, sf.base);
-                let sel_base = contrast(sf.selected, sf.base);
-                assert!(
-                    hover_base >= state::PANEL_HOVER - 0.02,
-                    "{}/{name}: hover is only {hover_base:.2}:1 from the surface",
-                    t.id
-                );
-                assert!(
-                    sel_base >= state::PANEL_SELECTED - 0.02 && sel_base > hover_base,
-                    "{}/{name}: selected is only {sel_base:.2}:1 from the surface",
-                    t.id
-                );
-                assert!(
-                    contrast(sf.pressed, sf.base) > sel_base,
-                    "{}/{name}: pressed must read past selected",
-                    t.id
-                );
-            }
+            let sf = s.sidebar;
+            let hover_base = contrast(sf.hover, sf.base);
+            let sel_base = contrast(sf.selected, sf.base);
+            assert!(
+                hover_base >= state::PANEL_HOVER - 0.02,
+                "{}/sidebar: hover is only {hover_base:.2}:1 from the surface",
+                t.id
+            );
+            assert!(
+                sel_base >= state::PANEL_SELECTED - 0.02 && sel_base > hover_base,
+                "{}/sidebar: selected is only {sel_base:.2}:1 from the surface",
+                t.id
+            );
         }
     }
 
@@ -1689,7 +1649,6 @@ mod tests {
     fn dracula_selection_matches_the_signed_off_greys() {
         let dracula = builtins().into_iter().find(|t| t.id == "dracula").unwrap();
         let bg = dracula.background_color();
-        let s = dracula.surfaces();
         // The resting rung is checked as `state::SELECTED` on the sidebar
         // fill it was signed off on — the old rail, 3% toward the foreground —
         // rather than on today's rail, which has since gone flat onto the
@@ -1697,19 +1656,12 @@ mod tests {
         // that decision.
         let fg = legible_foreground(bg, dracula.foreground);
         let signed_off_rail = mix(bg, fg, 0.03);
-        for (what, now, legacy) in [
-            (
-                "resting",
-                raise(signed_off_rail, fg, state::SELECTED),
-                mix(bg, dracula.foreground, 0.12),
-            ),
-            ("cursor", s.window.cursor, mix(bg, dracula.foreground, 0.17)),
-        ] {
-            assert!(
-                contrast(now, legacy) < 1.05,
-                "Dracula's {what} selection moved: {now:#08x} vs the tuned {legacy:#08x}"
-            );
-        }
+        let now = raise(signed_off_rail, fg, state::SELECTED);
+        let legacy = mix(bg, dracula.foreground, 0.12);
+        assert!(
+            contrast(now, legacy) < 1.05,
+            "Dracula's resting selection moved: {now:#08x} vs the tuned {legacy:#08x}"
+        );
     }
 
     #[test]
@@ -1907,7 +1859,7 @@ mod tests {
     fn captions_are_readable_on_every_surface_they_are_used_on() {
         for theme in builtins() {
             let m = theme.neutrals();
-            for surface in [m.background, m.sidebar, m.rail, m.popover] {
+            for surface in [m.background, m.sidebar, m.popover] {
                 assert!(
                     contrast(m.muted_foreground, surface) >= TEXT_FLOOR,
                     "{}: caption {:#08x} on {surface:#08x}",
@@ -1949,34 +1901,15 @@ mod tests {
                 m.sidebar_fg,
                 m.sidebar
             );
-            let ratio = contrast(m.rail_fg, m.rail);
-            assert!(
-                ratio >= TITLE_FLOOR - 0.01,
-                "{}: rail text {:#08x} is only {ratio:.2}:1 on the rail fill {:#08x}",
-                t.id,
-                m.rail_fg,
-                m.rail
-            );
         }
     }
 
     #[test]
-    fn the_rail_is_tinted_and_the_right_panel_is_not() {
+    fn the_right_panel_matches_the_window_fill() {
         for t in builtins() {
             let m = t.neutrals();
             assert_eq!(m.sidebar, m.background, "{}: right panel fill", t.id);
-            assert_ne!(m.rail, m.background, "{}: rail fill", t.id);
-            let s = t.surfaces().rail;
-            assert!(
-                contrast(s.selected, s.text_selected) >= TEXT_FLOOR,
-                "{}: current rail row",
-                t.id
-            );
         }
-        let light = builtins().into_iter().find(|t| t.id == "light").unwrap();
-        assert!(channel_distance(light.neutrals().rail, 0xf5f5f3) <= 1);
-        let dark = builtins().into_iter().find(|t| t.id == "dark").unwrap();
-        assert!(channel_distance(dark.neutrals().rail, 0x1e1e20) <= 1);
     }
 
     #[test]

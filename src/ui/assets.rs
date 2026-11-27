@@ -4,13 +4,8 @@ use gpui::{AssetSource, Result, SharedString};
 
 pub struct Assets;
 
-const STOCK_PREFIX: &str = "stock/";
-
 impl AssetSource for Assets {
     fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
-        if let Some(downstream) = path.strip_prefix(STOCK_PREFIX) {
-            return gpui_component_assets::Assets.load(downstream);
-        }
         if let Some(bytes) = bundled_icon(path) {
             return Ok(Some(Cow::Borrowed(bytes)));
         }
@@ -41,24 +36,6 @@ fn bundled_icon(path: &str) -> Option<&'static [u8]> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn stock_prefix_bypasses_the_overrides() {
-        for name in ["plus", "file"] {
-            let overridden = Assets
-                .load(&format!("icons/{name}.svg"))
-                .unwrap()
-                .expect("tty7 override present");
-            let stock = Assets
-                .load(&format!("{STOCK_PREFIX}icons/{name}.svg"))
-                .unwrap()
-                .expect("downstream glyph present");
-            assert_ne!(
-                overridden, stock,
-                "`{name}` should resolve to different art with and without `{STOCK_PREFIX}`"
-            );
-        }
-    }
 
     fn glyph(name: &str) -> String {
         let bytes = Assets
@@ -185,14 +162,6 @@ mod tests {
             (grid - grid.round()).abs() < 0.01,
             "plus.svg's cap tip lands at {tip} CSS px, which is not even a half \
              pixel"
-        );
-    }
-
-    #[test]
-    fn stock_prefix_works_for_unoverridden_glyphs() {
-        assert_eq!(
-            Assets.load("stock/icons/check.svg").unwrap(),
-            Assets.load("icons/check.svg").unwrap(),
         );
     }
 }

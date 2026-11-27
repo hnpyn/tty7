@@ -343,16 +343,6 @@ pub struct RemoteTerminal {
     pane_id: Option<u64>,
 }
 
-/// The workspace id a spawn carries, so the pane's shell gets `$NTTY7_WS` and a
-/// CLI running in it can use workspace-scoped verbs with no argument.
-///
-/// This is the same id as `owner`, but decided separately: `owner` is also
-/// gated on FEATURE_PANE_OWNER, while the workspace field rides the owned spawn
-/// kind and needs no feature probe.
-fn spawn_workspace(owner: Option<&str>) -> Option<String> {
-    owner.map(|id| id.to_string())
-}
-
 impl RemoteTerminal {
     #[cfg(test)]
     pub fn spawn(
@@ -362,7 +352,7 @@ impl RemoteTerminal {
         cwd: Option<PathBuf>,
         shell: Option<ShellSpec>,
     ) -> anyhow::Result<(Self, u64)> {
-        Self::spawn_on(size, cell_w, cell_h, cwd, shell, None, true)
+        Self::spawn_on(size, cell_w, cell_h, cwd, shell, true)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -372,12 +362,10 @@ impl RemoteTerminal {
         cell_h: u16,
         cwd: Option<PathBuf>,
         shell: Option<ShellSpec>,
-        owner: Option<String>,
         use_config_shell: bool,
     ) -> anyhow::Result<(Self, u64)> {
         let id = NEXT_PANE.fetch_add(1, Ordering::Relaxed);
         let win = win_size(size, cell_w, cell_h);
-        let workspace = spawn_workspace(owner.as_deref());
         let (tx, inbox) = tty7_core::daemon::pane::output_pipe();
         // The subscriber is installed before the reader starts, so the first
         // output byte is delivered live. There is no replay buffer behind it.
@@ -386,8 +374,6 @@ impl RemoteTerminal {
             cwd.clone(),
             win,
             shell,
-            owner,
-            workspace,
             use_config_shell,
             tx,
             || {},
@@ -591,8 +577,9 @@ impl RemoteTerminal {
                 let mut command_tok = OscTokenizer::new(&[b"133"]);
                 let mut command_cursor = CommandCursorStyle::default();
                 let mut prompt_break = PromptBreak::default();
-                // A new link replays the pane from scratch, 2031 included
-                // (`term_modes` restores it ahead of the ring).
+                // A new link starts the query tracker over. 2031 is learned
+                // again from the bytes that follow, the same way a fresh pane
+                // learns it.
                 let mut modes = TerminalModes::new();
                 color_scheme_updates.store(false, Ordering::Relaxed);
                 let mut queued: VecDeque<DaemonMsg> = VecDeque::new();
@@ -2114,113 +2101,9 @@ mod parked_cursor_tests {
     }
 }
 
-/// Issue #774, from the client's end. A full-screen tool sets its modes once
-/// and the replay ring drops them, so the daemon re-sends them from what it
-/// folded out of the stream ([`tty7_core::core::term_modes`]). This is the
-/// other half of that: the bytes it re-sends have to land the emulator back
-/// where the application left it, because those are the modes `wheel_route`
-/// reads before it decides the pane has a scrollback to move at all.
-#[cfg(test)]
-mod replayed_mode_tests {
-    use super::*;
-    use tty7_core::core::term_modes::TerminalModes;
-
-    /// #1074, checked against the emulator itself rather than against our
-    /// reading of it: wherever the ring's front falls, the prelude plus what
-    /// the ring still holds has to leave the client's kitty keyboard flags
-    /// where the whole stream leaves them — and its stacks too, which only
-    /// show once the program pops or switches screens, so those are probed
-    /// after.
-    #[test]
-    fn a_replay_prelude_lands_the_kitty_keyboard_flags_where_the_stream_does() {
-        use alacritty_terminal::event::VoidListener;
-
-        fn kitty_after(chunks: &[&[u8]], probes: &[&[u8]]) -> Vec<TermMode> {
-            let config = terminal_config_from_user(&crate::core::config::Config::default());
-            let mut term = Term::new(config, &TermSize::new(40, 10), VoidListener);
-            let mut processor: ansi::Processor = ansi::Processor::new();
-            for chunk in chunks {
-                processor.advance(&mut term, chunk);
-            }
-            let mut seen = vec![*term.mode() & TermMode::KITTY_KEYBOARD_PROTOCOL];
-            for probe in probes {
-                processor.advance(&mut term, probe);
-                seen.push(*term.mode() & TermMode::KITTY_KEYBOARD_PROTOCOL);
-            }
-            seen
-        }
-
-        let streams: [&[u8]; 5] = [
-            // An agent CLI: one push at startup, a pop and push around a
-            // subprocess later on.
-            b"\x1b[>1uhello\r\n\x1b[<u$ ls\r\n\x1b[>1uback\r\n",
-            b"\x1b[>1u\x1b[?1049h\x1b[>7uframe\x1b[=3uframe\x1b[>5u",
-            b"\x1b[>1uidle\x1b[=0;1u\x1b[=1;2utyping",
-            b"\x1b[>1u\x1b[>3u\x1b[?1049h\x1b[>7u\x1b[<u\x1b[?1049l\x1b[<u\x1b[>2u",
-            b"\x1b[>1u\x1bc\x1b[>4uafter a reset",
-        ];
-        let probes: [&[u8]; 7] = [
-            b"\x1b[<u",
-            b"\x1b[?1049h",
-            b"\x1b[<u",
-            b"\x1b[?1049l",
-            b"\x1b[<u",
-            b"\x1b[<u",
-            b"\x1b[>8u",
-        ];
-        for stream in streams {
-            let whole = {
-                let mut m = TerminalModes::new();
-                m.feed(stream);
-                m
-            };
-            let expected = kitty_after(&[stream], &probes);
-            for cut in (0..=stream.len()).filter(|&i| i == stream.len() || stream[i] == 0x1b) {
-                let (dropped, kept) = stream.split_at(cut);
-                let (mut head, mut ring) = (TerminalModes::new(), TerminalModes::new());
-                head.feed(dropped);
-                ring.feed(kept);
-                // A ring that starts inside an alternate screen it later leaves
-                // is replayed onto the primary one — the DEC restore's own
-                // limit, not the keyboard's; there is no stack to push it to.
-                let restores_alt = whole.is_on(1049) && !ring.is_on(1049);
-                if head.is_on(1049) && !restores_alt {
-                    continue;
-                }
-                let prelude = whole.replay_prelude(&head, &ring).unwrap_or_default();
-                assert_eq!(
-                    kitty_after(&[&prelude, kept], &probes),
-                    expected,
-                    "cut at {cut} of {:?}, prelude {:?}",
-                    String::from_utf8_lossy(stream),
-                    String::from_utf8_lossy(&prelude),
-                );
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn a_spawn_carries_its_workspace_so_the_shell_gets_tty7_ws() {
-        let ws = "0d4e1a54-0000-4000-8000-000000000001";
-
-        assert_eq!(
-            spawn_workspace(Some(ws)).as_deref(),
-            Some(ws),
-            "without this the pane's shell has no $NTTY7_WS and every \
-             workspace-scoped CLI verb in it needs an explicit address"
-        );
-
-        assert_eq!(
-            spawn_workspace(None),
-            None,
-            "a pane outside any workspace must not claim one"
-        );
-    }
 
     #[test]
     fn kitty_keyboard_negotiation_reports_the_requested_mode() {

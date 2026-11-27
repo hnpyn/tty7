@@ -13,13 +13,6 @@ impl FontFeatures {
     pub fn tag_value_list(&self) -> &[(String, u32)] {
         self.0.as_slice()
     }
-
-    pub fn is_calt_enabled(&self) -> Option<bool> {
-        self.0
-            .iter()
-            .find(|(feature, _)| feature == "calt")
-            .map(|(_, value)| *value == 1)
-    }
 }
 
 impl std::fmt::Debug for FontFeatures {
@@ -439,21 +432,6 @@ pub struct ShellConfig {
     pub args: Vec<String>,
 }
 
-/// A launcher the user put in the new-tab menu themselves.
-///
-/// `shell` names the one command that stands in for the platform default;
-/// these are the rest — a distro, a container, a REPL, the same shell against a
-/// different profile. They are launched exactly as written, which is why `args`
-/// crosses as user-authored: tty7 has no defaults to contribute to a command it
-/// did not choose.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(default)]
-pub struct CustomShell {
-    pub label: String,
-    pub program: String,
-    pub args: Vec<String>,
-}
-
 pub fn default_font_fallbacks() -> Vec<String> {
     let names: &[&str] = if cfg!(target_os = "macos") {
         &[
@@ -749,29 +727,9 @@ impl Config {
 }
 
 static CONFIG_DIR_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
-static RUNTIME_DIR_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
 
 pub fn set_config_dir(dir: PathBuf) {
     let _ = CONFIG_DIR_OVERRIDE.set(dir);
-}
-
-/// Pins the directory transient daemon files live in for this process.
-///
-/// Set once, at startup, to a private directory the process deletes on exit.
-/// A second call is ignored. When it has never been called, [`runtime_dir_path`]
-/// falls back to [`config_dir_path`] so existing tests keep finding their
-/// sockets beside the config they pinned.
-pub fn set_runtime_dir(dir: PathBuf) {
-    let _ = RUNTIME_DIR_OVERRIDE.set(dir);
-}
-
-/// Whether this process pinned a runtime directory of its own.
-///
-/// The machine-tree migration must not run in that case: the runtime directory
-/// is ephemeral, and adopting the legacy tree into it would move the user's
-/// real `machine.json` into a folder that is deleted on exit.
-pub fn runtime_dir_overridden() -> bool {
-    RUNTIME_DIR_OVERRIDE.get().is_some()
 }
 
 fn config_dir() -> Option<PathBuf> {
@@ -863,23 +821,6 @@ pub fn portable_data_dir(exe_dir: &Path) -> Option<PathBuf> {
     (exe_dir.join(PORTABLE_MARKER).is_file() && data.is_dir()).then_some(data)
 }
 
-/// The config directory this machine resolves to when no single invocation
-/// redirects it — `$NTTY7_CONFIG_DIR` where the box names one, the default
-/// under `$HOME` otherwise.
-///
-/// [`config_dir`] with the `--config-dir` override left off, which is the
-/// question "is this the machine's tty7 or a second one somebody pointed
-/// elsewhere" (see `machine::adopt_legacy_data_dir`). It cannot be answered by
-/// whether the override is set: `daemon::spawn` passes `--config-dir` to every
-/// daemon it starts, the ordinary install's included.
-///
-/// A portable install's data folder is deliberately not part of it: that copy
-/// is a second tty7 beside whatever the machine has installed, and must not
-/// inherit the installed one's legacy tree.
-pub fn machine_config_dir() -> Option<PathBuf> {
-    env_config_dir().or_else(default_config_dir)
-}
-
 #[cfg(not(windows))]
 pub fn default_config_dir() -> Option<PathBuf> {
     let home = std::env::var_os("HOME").filter(|h| !h.is_empty())?;
@@ -897,25 +838,6 @@ pub fn default_config_dir() -> Option<PathBuf> {
 
 pub fn config_path(file: &str) -> Option<PathBuf> {
     Some(config_dir()?.join(file))
-}
-
-/// Transient daemon and session files: the pinned runtime directory when this
-/// process set one, otherwise the config directory.
-pub fn runtime_dir_path() -> Option<PathBuf> {
-    resolve_runtime_dir(
-        RUNTIME_DIR_OVERRIDE.get().map(PathBuf::as_path),
-        config_dir_path().as_deref(),
-    )
-}
-
-fn resolve_runtime_dir(override_dir: Option<&Path>, config_dir: Option<&Path>) -> Option<PathBuf> {
-    override_dir
-        .map(Path::to_path_buf)
-        .or_else(|| config_dir.map(Path::to_path_buf))
-}
-
-pub fn runtime_path(file: &str) -> Option<PathBuf> {
-    runtime_dir_path().map(|dir| dir.join(file))
 }
 
 pub fn strip_bom(text: &str) -> &str {
@@ -968,14 +890,6 @@ fn quarantine_path(path: &std::path::Path) -> PathBuf {
 }
 
 pub fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
-    write_atomic_mode(path, bytes, false)
-}
-
-pub fn write_atomic_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
-    write_atomic_mode(path, bytes, true)
-}
-
-fn write_atomic_mode(path: &std::path::Path, bytes: &[u8], private: bool) -> std::io::Result<()> {
     use std::io::Write as _;
     // Renaming over a symlink replaces the link itself, so a config.json
     // symlinked into a dotfiles repo would silently turn into a plain file and
@@ -991,13 +905,6 @@ fn write_atomic_mode(path: &std::path::Path, bytes: &[u8], private: bool) -> std
     {
         let mut open = std::fs::OpenOptions::new();
         open.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        if private {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            open.mode(0o600);
-        }
-        #[cfg(not(unix))]
-        let _ = private;
         let mut f = open.open(&tmp)?;
         f.write_all(bytes)?;
         f.flush()?;
@@ -1379,7 +1286,6 @@ mod tests {
         let cfg: Config =
             serde_json::from_str(r#"{"font_features":{"calt":true,"liga":1}}"#).unwrap();
         let features = cfg.font_features.expect("font features should parse");
-        assert_eq!(features.is_calt_enabled(), Some(true));
         assert!(
             features
                 .tag_value_list()
@@ -2239,25 +2145,6 @@ mod tests {
         assert_eq!(env_config_dir_from(Some(ntty7.clone())), Some(ntty7));
         assert_eq!(env_config_dir_from(Some(PathBuf::new())), None);
         assert_eq!(env_config_dir_from(None), None);
-    }
-
-    #[test]
-    fn runtime_dir_falls_back_to_the_config_dir_until_pinned() {
-        let config = PathBuf::from("/cfg");
-        let runtime = PathBuf::from("/tmp/ntty7-9");
-        assert_eq!(
-            resolve_runtime_dir(None, Some(&config)),
-            Some(config.clone())
-        );
-        assert_eq!(
-            resolve_runtime_dir(Some(&runtime), Some(&config)),
-            Some(runtime.clone())
-        );
-        assert_eq!(resolve_runtime_dir(None, None), None);
-        assert_eq!(
-            resolve_runtime_dir(Some(&runtime), Some(&config)).map(|dir| dir.join("daemon.sock")),
-            Some(runtime.join("daemon.sock"))
-        );
     }
 
     #[test]

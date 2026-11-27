@@ -5,8 +5,6 @@ use gpui::Context;
 use gpui_component::notification::Notification;
 use tty7_core::host::local::LocalHost;
 
-pub use tty7_core::host::HostId;
-
 mod blocking {
     use std::collections::VecDeque;
     use std::sync::{Arc, Condvar, Mutex, OnceLock};

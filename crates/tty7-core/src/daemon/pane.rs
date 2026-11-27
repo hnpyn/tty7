@@ -15,7 +15,7 @@ use crate::core::clipboard::{
 use crate::core::kitty_graphics::{GraphicsSniffer, Segment, Sniffed};
 use crate::core::osc::OscTokenizer;
 use crate::daemon::protocol::{
-    DaemonMsg, MAX_FRAME, PaneInfo, RemoteContext, RemoteKind, ShellSpec, WinSize,
+    DaemonMsg, MAX_FRAME, RemoteContext, RemoteKind, ShellSpec, WinSize,
 };
 use crate::daemon::shell_integration;
 
@@ -154,7 +154,6 @@ fn build_spawn_config(
     pane: u64,
     cwd: Option<PathBuf>,
     shell: Option<ShellSpec>,
-    workspace: Option<&str>,
     use_config_shell: bool,
 ) -> anyhow::Result<SpawnConfig> {
     let initial_cwd = initial_working_directory(cwd);
@@ -171,7 +170,7 @@ fn build_spawn_config(
         anyhow::bail!(problem);
     }
     let remote = wsl_remote_context(configured.as_ref());
-    let (cmd, integration_dir) = build_shell_command(configured, &initial_cwd, pane, workspace)?;
+    let (cmd, integration_dir) = build_shell_command(configured, &initial_cwd, pane)?;
     Ok(SpawnConfig {
         cmd,
         initial_cwd,
@@ -209,7 +208,6 @@ fn build_shell_command(
     configured: Option<ChosenShell>,
     initial_cwd: &Option<PathBuf>,
     pane: u64,
-    workspace: Option<&str>,
 ) -> anyhow::Result<(CommandBuilder, Option<PathBuf>)> {
     let mut cmd = match &configured {
         Some(chosen) => {
@@ -234,7 +232,7 @@ fn build_shell_command(
     }
     let integration_dir = integration.as_ref().and_then(|i| i.dir.clone());
     let launched = launched_shell_program(&cmd, &resolved_program);
-    apply_common_command_setup(&mut cmd, initial_cwd, pane, workspace, &launched);
+    apply_common_command_setup(&mut cmd, initial_cwd, pane, &launched);
     Ok((cmd, integration_dir))
 }
 
@@ -406,7 +404,6 @@ const NTTY7_ENV_MARKER: &str = "NTTY7";
 /// endpoints with the very same functions the server used to open them.
 const NTTY7_CONFIG_DIR_ENV: &str = "NTTY7_CONFIG_DIR";
 pub(crate) const NTTY7_PANE_ENV: &str = "NTTY7_PANE";
-const NTTY7_WS_ENV: &str = "NTTY7_WS";
 
 fn config_dir_env() -> Option<String> {
     // The shell integration and a nested `ntty7` both read this. It is the
@@ -486,7 +483,6 @@ fn pane_environment(
     // Only Windows has a use for it — see the `COLORFGBG` block below.
     #[cfg_attr(not(windows), allow(unused_variables))] dark: bool,
     pane: u64,
-    workspace: Option<&str>,
     shell: &str,
 ) -> Vec<(String, String)> {
     let version = env!("CARGO_PKG_VERSION");
@@ -518,9 +514,6 @@ fn pane_environment(
         // still wins, below.
         let colorfgbg = if dark { "15;0" } else { "0;15" };
         env.push(("COLORFGBG".to_string(), colorfgbg.to_string()));
-    }
-    if let Some(ws) = workspace {
-        env.push((NTTY7_WS_ENV.to_string(), ws.to_string()));
     }
     if let Some(dir) = config_dir_env() {
         env.push((NTTY7_CONFIG_DIR_ENV.to_string(), dir));
@@ -595,7 +588,6 @@ fn apply_common_command_setup(
     cmd: &mut CommandBuilder,
     initial_cwd: &Option<PathBuf>,
     pane: u64,
-    workspace: Option<&str>,
     shell: &str,
 ) {
     if let Some(dir) = initial_cwd {
@@ -651,7 +643,7 @@ fn apply_common_command_setup(
         .filter(|z| shell_integration::is_our_zdotdir(z))
         .map(str::to_owned);
     for (k, v) in reroute_configured_zdotdir(
-        pane_environment(&extra_env, dark, pane, workspace, shell),
+        pane_environment(&extra_env, dark, pane, shell),
         injected_zdotdir.is_some(),
     ) {
         cmd.env(k, v);
@@ -959,8 +951,6 @@ struct PaneState {
     size: WinSize,
     subscriber: Option<OutputTx>,
     cwd: Option<PathBuf>,
-    /// The last title the pane reported over OSC 0/2.
-    osc_title: Option<String>,
     shell: ShellState,
     remote: Option<RemoteContext>,
     agent: Option<crate::core::cli_agent::CLIAgent>,
@@ -968,7 +958,6 @@ struct PaneState {
     agent_session: Option<crate::core::cli_agent::AgentSessionState>,
     agent_clock: AgentClock,
     alive: bool,
-    exit_code: Option<i32>,
 }
 
 /// Whether a pending interrupt key is still waiting, and which generation of
@@ -1187,7 +1176,6 @@ struct PtyParts {
 
 pub struct DaemonPane {
     pub id: u64,
-    owner: Option<String>,
     backend: PtyBackend,
     /// Keyboard input and in-band replies (kitty query acknowledgements,
     /// clipboard errors, detached device-attribute answers). A thread owns
@@ -1409,7 +1397,6 @@ impl DeathReporter {
             .and_then(|probe| probe());
         let mut st = state.lock().unwrap();
         st.alive = false;
-        st.exit_code = code;
         let pane = st.id;
         log::info!(
             "pane {pane} exited; exit_code={code:?} shutdown_requested={}",
@@ -1799,8 +1786,6 @@ impl DaemonPane {
         cwd: Option<PathBuf>,
         size: WinSize,
         shell: Option<ShellSpec>,
-        owner: Option<String>,
-        workspace: Option<String>,
         use_config_shell: bool,
         subscriber: OutputTx,
         on_dead: impl FnOnce() + Send + 'static,
@@ -1810,8 +1795,6 @@ impl DaemonPane {
             cwd,
             size,
             shell,
-            owner,
-            workspace,
             use_config_shell,
             Some(subscriber),
             on_dead,
@@ -1824,8 +1807,6 @@ impl DaemonPane {
         cwd: Option<PathBuf>,
         size: WinSize,
         shell: Option<ShellSpec>,
-        owner: Option<String>,
-        workspace: Option<String>,
         use_config_shell: bool,
         subscriber: Option<OutputTx>,
         on_dead: impl FnOnce() + Send + 'static,
@@ -1840,7 +1821,7 @@ impl DaemonPane {
         crate::daemon::winproc::allow_ctrl_c_in_children();
 
         let pair = native_pty_system().openpty(pty_size)?;
-        let spawn = build_spawn_config(id, cwd, shell, workspace.as_deref(), use_config_shell)?;
+        let spawn = build_spawn_config(id, cwd, shell, use_config_shell)?;
 
         let child = pair.slave.spawn_command(spawn.cmd)?;
         let shell_pid = child.process_id();
@@ -1857,7 +1838,6 @@ impl DaemonPane {
             size,
             subscriber: None,
             cwd: spawn.initial_cwd,
-            osc_title: None,
             shell: ShellState::default(),
             remote: spawn.remote.clone(),
             agent: None,
@@ -1865,7 +1845,6 @@ impl DaemonPane {
             agent_argv: None,
             agent_clock: AgentClock::default(),
             alive: true,
-            exit_code: None,
         };
         if let Some(subscriber) = subscriber {
             // Installed before the reader exists, so the first output byte is
@@ -1886,7 +1865,6 @@ impl DaemonPane {
                 writer,
             },
             state,
-            owner,
             on_dead,
         ))
     }
@@ -1901,7 +1879,6 @@ impl DaemonPane {
     fn over_pty(
         parts: PtyParts,
         state: PaneState,
-        owner: Option<String>,
         on_dead: impl FnOnce() + Send + 'static,
     ) -> Arc<Self> {
         let PtyParts {
@@ -1922,7 +1899,6 @@ impl DaemonPane {
 
         let pane = Arc::new(Self {
             id,
-            owner,
             backend: PtyBackend {
                 master: master.clone(),
                 child: child.clone(),
@@ -2199,10 +2175,6 @@ impl DaemonPane {
         self.writer.write(bytes);
     }
 
-    fn pty(&self) -> Option<&PtyBackend> {
-        Some(&self.backend)
-    }
-
     /// Resize the pty and echo `Size` while the state lock is held, so the
     /// subscriber parses old-width bytes before the geometry changes.
     pub fn resize(&self, size: WinSize) {
@@ -2215,25 +2187,6 @@ impl DaemonPane {
             && let Some(master) = master.as_ref()
         {
             let _ = master.resize(pty_size(size));
-        }
-    }
-
-    pub fn alive(&self) -> bool {
-        self.state.lock().unwrap().alive
-    }
-
-    pub fn info(&self) -> PaneInfo {
-        let (cwd, osc_title, alive) = {
-            let st = self.state.lock().unwrap();
-            (st.cwd.clone(), st.osc_title.clone(), st.alive)
-        };
-        PaneInfo {
-            pane_id: self.id,
-            cwd: cwd.or_else(|| self.foreground_cwd()),
-            title: self.foreground_title(),
-            osc_title,
-            alive,
-            owner: self.owner.clone(),
         }
     }
 
@@ -2338,41 +2291,6 @@ impl DaemonPane {
             }
         }
     }
-
-    fn foreground_cwd(&self) -> Option<PathBuf> {
-        let pty = self.pty()?;
-        foreground_cwd(&pty.master, pty.shell_pid)
-    }
-
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    fn foreground_title(&self) -> String {
-        let Some(pty) = self.pty() else {
-            return String::new();
-        };
-        pty.master
-            .lock()
-            .ok()
-            .and_then(|m| m.as_ref().and_then(|m| m.process_group_leader()))
-            .and_then(super::procinfo::proc_name)
-            .unwrap_or_default()
-    }
-
-    #[cfg(windows)]
-    fn foreground_title(&self) -> String {
-        let Some(pty) = self.pty() else {
-            return String::new();
-        };
-        let Some(pid) = pty.shell_pid else {
-            return String::new();
-        };
-        let procs = crate::daemon::winproc::snapshot();
-        crate::daemon::winproc::foreground_name(&procs, pid).unwrap_or_default()
-    }
-
-    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
-    fn foreground_title(&self) -> String {
-        String::new()
-    }
 }
 
 impl Drop for DaemonPane {
@@ -2454,11 +2372,6 @@ fn apply_signals(st: &mut PaneState, signals: SniffSignals) {
     {
         notify(st, DaemonMsg::Cwd(cwd.clone()));
         st.cwd = Some(cwd);
-    }
-    if let Some(title) = signals.title {
-        // No `notify`: a window renders its own tabs from its own terminal,
-        // which parsed the same sequence. This is only for the tree.
-        st.osc_title = (!title.is_empty()).then_some(title);
     }
     for shell in signals.shell {
         #[cfg(windows)]
@@ -2648,28 +2561,14 @@ fn same_dir(a: &Path, b: &Path) -> bool {
 /// and the pane treats that as this shell sitting at its own prompt (the
 /// prompt cursor, command-duration notifications, coming back off the
 /// alternate screen). A relayed prompt must not say that, so the flag is
-/// cleared across the whole batch.
-///
-/// [`ShellState::mark_at_prompt`] keeps the marks' own reading. Suppression
-/// only writes `at_prompt`, and dedup compares the fields that are actually
-/// emitted. Two marks that used to collapse into one `Prompt` must still
-/// collapse when only that unsuppressed reading tells them apart, and the
-/// survivor has to carry the *newest* one: a whole turn can arrive in one read
-/// (`D`, the prompt's `A`/`B`, then the next command's `C`), and dropping the
-/// last entry's reading would hand the pane back a prompt it has already left.
+/// cleared across the whole batch. Marks that then agree on `active`,
+/// `at_prompt` and `command` collapse into one `Prompt`.
 fn suppress_relayed_prompt_marks(shell: &mut Vec<ShellState>) {
     for s in shell.iter_mut() {
         s.at_prompt = false;
     }
     shell.dedup_by(|a, b| {
-        let same = a.active == b.active && a.at_prompt == b.at_prompt && a.command == b.command;
-        // `dedup_by` keeps `b`, the earlier of the pair, and drops `a`. Move
-        // the reading over first so the collapse costs a `Prompt` message and
-        // nothing else.
-        if same {
-            b.mark_at_prompt = a.mark_at_prompt;
-        }
-        same
+        a.active == b.active && a.at_prompt == b.at_prompt && a.command == b.command
     });
 }
 
@@ -3049,24 +2948,12 @@ fn foreground_agent(
 struct ShellState {
     active: bool,
     at_prompt: bool,
-    /// The OSC 133 reading before suppression. `at_prompt` is what
-    /// [`DaemonMsg::Prompt`] emits, and a foreground program relaying marks
-    /// forces that flag false so the pane does not treat the far prompt as
-    /// its own. This field is the mark itself, so a collapsed batch still
-    /// carries the newest prompt-or-command reading — over `ssh`, the only
-    /// signal this side has that the far shell is at a prompt (#840).
-    /// Suppression never writes it.
-    mark_at_prompt: bool,
     command: Option<String>,
 }
 
 #[derive(Default)]
 struct SniffSignals {
     cwd: Option<PathBuf>,
-    /// The last title the pane set in this read, already capped. `Some("")` is
-    /// a reset — an empty OSC 0/2 clears the title rather than setting a blank
-    /// one, the same way the GUI's terminal treats it.
-    title: Option<String>,
     shell: Vec<ShellState>,
     agent_events: Vec<crate::core::cli_agent::AgentEvent>,
     notification: Option<String>,
@@ -3080,18 +2967,14 @@ struct SniffSignals {
 struct OscSniffer {
     tok: OscTokenizer,
     shell: ShellState,
-    /// Whether the title the pane is showing still belongs to something that
-    /// is running — see [`crate::core::osc::TitleLifetime`] (#889).
-    title_life: crate::core::osc::TitleLifetime,
     notes: crate::core::osc::Notifications,
 }
 
 impl OscSniffer {
     fn new() -> Self {
         Self {
-            tok: OscTokenizer::new(&[b"0", b"2", b"7", b"133", b"9", b"99", b"777"]),
+            tok: OscTokenizer::new(&[b"7", b"133", b"9", b"99", b"777"]),
             shell: ShellState::default(),
-            title_life: crate::core::osc::TitleLifetime::default(),
             notes: crate::core::osc::Notifications::default(),
         }
     }
@@ -3103,18 +2986,10 @@ impl OscSniffer {
     fn feed(&mut self, bytes: &[u8]) -> SniffSignals {
         let mut signals = SniffSignals::default();
         let shell = &mut self.shell;
-        let title_life = &mut self.title_life;
         let notes = &mut self.notes;
         self.tok.feed(bytes, |payload| {
-            // In stream order, so that a shell which re-titles itself right
-            // after the `D` mark gets the last word over the retirement.
-            if title_life.saw(payload) == crate::core::osc::TitleEffect::Retire {
-                signals.title = Some(String::new());
-            }
             if let Some(path) = parse_osc7(payload) {
                 signals.cwd = Some(path);
-            } else if let Some(title) = parse_osc_title(payload) {
-                signals.title = Some(title);
             } else if let Some(rest) = payload.strip_prefix(b"133;") {
                 match rest.first() {
                     Some(b'B' | b'D') => signals.boundary = true,
@@ -3164,10 +3039,6 @@ fn handle_osc133(shell: &mut ShellState, rest: &[u8]) -> bool {
         }
         _ => return false,
     }
-    // The unsuppressed twin, set here so every arm gets it and no future arm
-    // can forget to. Suppression happens later, on the reader thread, and only
-    // ever touches `at_prompt`.
-    shell.mark_at_prompt = shell.at_prompt;
     true
 }
 
@@ -3208,31 +3079,6 @@ pub(crate) fn parse_osc7(payload: &[u8]) -> Option<PathBuf> {
         return None;
     }
     Some(path_from_bytes(&decoded))
-}
-
-/// Longest title the tree will keep. The window that owns the pane shows about
-/// forty columns of it; the rest is only ever paid for — in `machine.json`, and
-/// in a `PaneFacts` delta to every attached client — so it is cut here rather
-/// than at each place that renders one.
-const MAX_OSC_TITLE: usize = 256;
-
-/// The title from an OSC 0 (icon *and* window) or OSC 2 (window) payload,
-/// capped. An empty payload comes back as `Some("")`: that is a reset, which
-/// the caller has to tell apart from "no title in this read".
-///
-/// OSC 1 is deliberately not read. It sets the icon name alone, which the GUI's
-/// terminal ignores — and the point of recording a title at all is to agree
-/// with what the GUI shows.
-pub(crate) fn parse_osc_title(payload: &[u8]) -> Option<String> {
-    let rest = payload
-        .strip_prefix(b"0;")
-        .or_else(|| payload.strip_prefix(b"2;"))?;
-    let title = String::from_utf8_lossy(rest);
-    let title = title.trim();
-    Some(match title.chars().count() > MAX_OSC_TITLE {
-        true => title.chars().take(MAX_OSC_TITLE).collect(),
-        false => title.to_string(),
-    })
 }
 
 fn percent_decode(input: &[u8]) -> Vec<u8> {
@@ -3277,7 +3123,7 @@ mod tests {
     fn the_appimage_runtimes_argv0_does_not_reach_the_pane() {
         let mut cmd = CommandBuilder::new("/bin/sh");
         cmd.env("ARGV0", "./tty7-26.9.5-linux-x86_64.AppImage");
-        apply_common_command_setup(&mut cmd, &None, 1, None, "sh");
+        apply_common_command_setup(&mut cmd, &None, 1, "sh");
         assert_eq!(cmd.get_env("ARGV0"), None);
     }
 
@@ -3290,7 +3136,7 @@ mod tests {
         // directory has to win over it.
         let inherited = cmd.get_env("PWD").map(std::ffi::OsStr::to_owned);
         let dir = Some(std::path::PathBuf::from("/tmp"));
-        apply_common_command_setup(&mut cmd, &dir, 1, None, "sh");
+        apply_common_command_setup(&mut cmd, &dir, 1, "sh");
         assert_ne!(cmd.get_env("PWD").map(std::ffi::OsStr::to_owned), inherited);
         assert_eq!(
             cmd.get_env("PWD"),
@@ -3394,8 +3240,6 @@ mod tests {
                 args: vec!["-c".into(), "cd /usr && exec cat".into()],
                 args_are_tty7_defaults: false,
             }),
-            None,
-            None,
             true,
             tx,
             || {},
@@ -3792,160 +3636,14 @@ mod tests {
         assert_eq!(sig.cwd, Some(PathBuf::from("/Users/me/dev")));
     }
 
-    /// The tree's only source of the name a window actually shows on a tab. A
-    /// tokenizer that does not list 0 and 2 sniffs nothing here, and the
-    /// switcher goes back to calling every agent tab "Claude Code".
+    /// An OSC 0 the sniffer does not track must not eat the cwd or the prompt
+    /// mark that follows it in the same read.
     #[test]
-    fn sniff_osc_title() {
-        let mut s = OscSniffer::new();
-        assert_eq!(
-            s.feed(b"\x1b]0;user@host:~/dev\x07").title.as_deref(),
-            Some("user@host:~/dev")
-        );
-        assert_eq!(
-            s.feed(b"\x1b]2;\xe2\x9c\xb3 fixing the switcher\x1b\\")
-                .title
-                .as_deref(),
-            Some("✳ fixing the switcher")
-        );
-        // The last one in a read is the one that stuck.
-        assert_eq!(
-            s.feed(b"\x1b]0;first\x07\x1b]0;second\x07")
-                .title
-                .as_deref(),
-            Some("second")
-        );
-        // An empty title is a reset, and has to be told apart from a read with
-        // no title in it at all.
-        assert_eq!(s.feed(b"\x1b]2;\x07").title.as_deref(), Some(""));
-        assert_eq!(s.feed(b"plain output\r\n").title, None);
-        // OSC 1 names the icon, which the window ignores; so do we.
-        assert_eq!(s.feed(b"\x1b]1;icon\x07").title, None);
-
-        let long = format!("\x1b]0;{}\x07", "t".repeat(MAX_OSC_TITLE + 10));
-        assert_eq!(
-            s.feed(long.as_bytes()).title.map(|t| t.chars().count()),
-            Some(MAX_OSC_TITLE)
-        );
-    }
-
-    /// Titles arrive interleaved with everything else in the same read, and the
-    /// tokenizer has one identifier filter for the lot: sniffing a title must
-    /// not cost a cwd or a prompt mark.
-    #[test]
-    fn a_title_does_not_swallow_the_other_marks_in_the_same_read() {
+    fn an_untracked_title_does_not_swallow_the_other_marks_in_the_same_read() {
         let mut s = OscSniffer::new();
         let sig = s.feed(b"\x1b]0;user@host:~/dev\x07\x1b]7;file://host/dev\x07\x1b]133;A\x07");
-        assert_eq!(sig.title.as_deref(), Some("user@host:~/dev"));
         assert_eq!(sig.cwd, Some(PathBuf::from("/dev")));
         assert!(sig.shell.last().unwrap().at_prompt);
-    }
-
-    #[test]
-    fn a_title_is_kept_until_it_changes_and_a_reset_clears_it() {
-        let mut st = test_state(true);
-        apply_signals(
-            &mut st,
-            SniffSignals {
-                title: Some("✳ fixing the switcher".into()),
-                ..SniffSignals::default()
-            },
-        );
-        assert_eq!(st.osc_title.as_deref(), Some("✳ fixing the switcher"));
-
-        // A read with no title in it leaves the stored one alone.
-        apply_signals(&mut st, SniffSignals::default());
-        assert_eq!(st.osc_title.as_deref(), Some("✳ fixing the switcher"));
-
-        apply_signals(
-            &mut st,
-            SniffSignals {
-                title: Some(String::new()),
-                ..SniffSignals::default()
-            },
-        );
-        assert_eq!(st.osc_title, None, "an empty title clears, not blanks");
-    }
-
-    /// #889: the tab went on reading "✳ fixing the switcher" long after Claude
-    /// Code had exited and the pane was back at its own prompt, because
-    /// nothing in the pane path ever retired an OSC 0/2 — only another one
-    /// replaced it. The `D` mark says the command that wrote it is over.
-    #[test]
-    fn a_title_a_command_set_is_retired_when_that_command_finishes() {
-        let mut st = test_state(true);
-        let mut s = OscSniffer::new();
-
-        let mut read = |st: &mut PaneState, bytes: &[u8]| apply_signals(st, s.feed(bytes));
-
-        read(
-            &mut st,
-            b"\x1b]7;file://h/work/tty7\x07\x1b]133;A\x07\x1b]133;B\x07",
-        );
-        read(&mut st, b"\x1b]133;C;claude\x07");
-        read(&mut st, b"\x1b]2;\xe2\x9c\xb3 fixing the switcher\x1b\\");
-        assert_eq!(
-            st.osc_title.as_deref(),
-            Some("✳ fixing the switcher"),
-            "a running command names the tab"
-        );
-
-        // The user's precmd chain can take hundreds of ms, which is why the
-        // `D` emitter is prepended to it — so the mark routinely lands in a
-        // read of its own, ahead of anything the next prompt writes.
-        read(&mut st, b"\x1b]133;D;0\x07");
-        assert_eq!(
-            st.osc_title, None,
-            "the program that wrote the title has exited"
-        );
-        assert_eq!(
-            st.cwd.as_deref(),
-            Some(std::path::Path::new("/work/tty7")),
-            "and the rung below it in the label ladder still knows the place"
-        );
-    }
-
-    /// The two cases the retirement must not touch: a program that is still
-    /// running, and a shell that titles its own prompt.
-    #[test]
-    fn a_running_program_and_a_shells_own_prompt_title_both_keep_theirs() {
-        let mut st = test_state(true);
-        let mut s = OscSniffer::new();
-
-        apply_signals(&mut st, s.feed(b"\x1b]133;C;vim\x07\x1b]2;vim\x1b\\"));
-        assert_eq!(
-            st.osc_title.as_deref(),
-            Some("vim"),
-            "nothing said the command ended"
-        );
-
-        // A shell that re-titles itself does it between the `D` and the `A`
-        // (tty7's zsh helper prepends the `D`; the PowerShell one titles in
-        // its prompt function), so the title is the last word in the read.
-        apply_signals(
-            &mut st,
-            s.feed(b"\x1b]133;D;0\x07\x1b]0;me@box:~/dev\x07\x1b]133;A\x07"),
-        );
-        assert_eq!(
-            st.osc_title.as_deref(),
-            Some("me@box:~/dev"),
-            "the prompt's own title outranks the retirement it follows"
-        );
-
-        // And that prompt title is nobody's command to retire.
-        apply_signals(&mut st, s.feed(b"\x1b]133;C;ls\x07\x1b]133;D;0\x07"));
-        assert_eq!(st.osc_title.as_deref(), Some("me@box:~/dev"));
-    }
-
-    /// A pane with no shell integration never sees a mark, so nothing changes
-    /// for it: whatever it last called itself is all tty7 has.
-    #[test]
-    fn a_pane_without_shell_integration_keeps_its_title() {
-        let mut st = test_state(true);
-        let mut s = OscSniffer::new();
-        apply_signals(&mut st, s.feed(b"\x1b]0;user@host:~/dev\x07"));
-        apply_signals(&mut st, s.feed(b"lots of output\r\n"));
-        assert_eq!(st.osc_title.as_deref(), Some("user@host:~/dev"));
     }
 
     #[test]
@@ -4139,11 +3837,6 @@ mod tests {
             !signals.shell.last().unwrap().at_prompt,
             "a foreground program's prompt marks must not report this shell at its prompt"
         );
-        assert!(
-            signals.shell.last().unwrap().mark_at_prompt,
-            "the mark's own reading survives: over `ssh` it is the far shell speaking, and \
-             the only thing this side knows about whether it is busy (#840)"
-        );
 
         let mut local = s.feed(b"\x1b]133;A\x1b]133;B\x07");
         let shell_idle = is_foreground_command(Some(1000), Some(1000));
@@ -4153,40 +3846,22 @@ mod tests {
         assert!(local.shell.last().unwrap().at_prompt);
     }
 
-    /// The collapse that suppression performs must not hand the pane back a
-    /// prompt it has already left. A far shell's whole turn can arrive in one
-    /// read — the previous command's `D`, the prompt's `A`/`B`, then the next
-    /// command's `C` — and once `at_prompt` is cleared across the batch those
-    /// two entries differ only in the mark's own reading. The collapse keeps
-    /// the earlier entry, so that reading has to travel with it or freeness
-    /// answers `free` while a remote command is running (#840).
+    /// A relayed batch still collapses into one `Prompt`. A whole turn can
+    /// arrive in one read — `D`, the prompt's `A`/`B`, then `C` — and once
+    /// `at_prompt` is cleared those entries agree on the fields the message
+    /// actually carries.
     #[test]
-    fn suppression_collapses_a_batch_onto_its_newest_marks_reading() {
+    fn suppression_collapses_a_relayed_batch_into_one_prompt() {
         let mut s = OscSniffer::new();
-        // Bare `133;C`: nushell's integration emits it with no command name, as
-        // do several third-party ones, so `command` cannot tell the two entries
-        // apart either.
         let mut turn = s.feed(b"\x1b]133;D;0\x07\x1b]133;A\x07\x1b]133;B\x07\x1b]133;C\x07");
         suppress_relayed_prompt_marks(&mut turn.shell);
-        assert_eq!(
-            turn.shell.len(),
-            1,
-            "still one `Prompt` message, exactly as before the mark was added"
-        );
-        assert!(
-            !turn.shell.last().unwrap().mark_at_prompt,
-            "the newest mark started a command, so the pane is not at a prompt"
-        );
+        assert_eq!(turn.shell.len(), 1);
+        assert!(!turn.shell.last().unwrap().at_prompt);
 
-        // And the other order: a command that starts and finishes inside one
-        // read has to end at the prompt, not at the `C` that opened it.
         let mut turn = s.feed(b"\x1b]133;C\x07\x1b]133;D;0\x07\x1b]133;A\x07");
         suppress_relayed_prompt_marks(&mut turn.shell);
         assert_eq!(turn.shell.len(), 1);
-        assert!(
-            turn.shell.last().unwrap().mark_at_prompt,
-            "the newest mark is the prompt the far shell just drew"
-        );
+        assert!(!turn.shell.last().unwrap().at_prompt);
     }
 
     #[test]
@@ -4454,7 +4129,6 @@ mod tests {
             size: ws(80, 24),
             subscriber: None,
             cwd: None,
-            osc_title: None,
             shell: ShellState::default(),
             remote: None,
             agent: None,
@@ -4462,7 +4136,6 @@ mod tests {
             agent_argv: None,
             agent_clock: AgentClock::default(),
             alive,
-            exit_code: None,
         }
     }
 
@@ -5542,10 +5215,11 @@ mod tests {
         assert!(matches!(sub_rx.try_recv(), Ok(DaemonMsg::Output(b)) if b == b"beforemid"));
         match sub_rx.try_recv() {
             Ok(DaemonMsg::Image(frame)) => {
-                let img = Image::decode_frame(&frame).expect("decodable image frame");
+                let mut img =
+                    Image::decode_frame_owned(frame.clone()).expect("decodable image frame");
                 assert_eq!(img.id, 1);
                 assert_eq!((img.width, img.height), (1, 1));
-                assert_eq!(img.to_rgba8().unwrap(), pixel);
+                assert_eq!(img.take_rgba8().unwrap(), pixel);
             }
             other => panic!("expected Image frame, got {other:?}"),
         }
@@ -5732,15 +5406,10 @@ mod tests {
 
     #[test]
     fn pane_environment_advertises_the_terminal_under_the_standard_names() {
-        let env: std::collections::HashMap<_, _> = pane_environment(
-            &std::collections::HashMap::new(),
-            false,
-            7,
-            Some("ws-main"),
-            "/bin/zsh",
-        )
-        .into_iter()
-        .collect();
+        let env: std::collections::HashMap<_, _> =
+            pane_environment(&std::collections::HashMap::new(), false, 7, "/bin/zsh")
+                .into_iter()
+                .collect();
         let version = env!("CARGO_PKG_VERSION");
 
         assert_eq!(env.get("TERM_PROGRAM").map(String::as_str), Some("tty7"));
@@ -5759,25 +5428,15 @@ mod tests {
 
     #[test]
     fn pane_environment_hands_the_shell_its_own_address() {
-        let env: std::collections::HashMap<_, _> = pane_environment(
-            &std::collections::HashMap::new(),
-            false,
-            42,
-            Some("ws-main"),
-            "/bin/zsh",
-        )
-        .into_iter()
-        .collect();
+        let env: std::collections::HashMap<_, _> =
+            pane_environment(&std::collections::HashMap::new(), false, 42, "/bin/zsh")
+                .into_iter()
+                .collect();
 
         assert_eq!(
             env.get(NTTY7_PANE_ENV).map(String::as_str),
             Some("42"),
             "a CLI inside the pane needs its own pane id for address-free verbs"
-        );
-        assert_eq!(
-            env.get(NTTY7_WS_ENV).map(String::as_str),
-            Some("ws-main"),
-            "the workspace the spawn was filed under rides into the shell"
         );
         match config_dir_env() {
             Some(dir) => assert_eq!(
@@ -5791,20 +5450,6 @@ mod tests {
                 "no resolvable config dir must not inject an empty NTTY7_CONFIG_DIR"
             ),
         }
-
-        let unfiled: std::collections::HashMap<_, _> = pane_environment(
-            &std::collections::HashMap::new(),
-            false,
-            42,
-            None,
-            "/bin/zsh",
-        )
-        .into_iter()
-        .collect();
-        assert!(
-            !unfiled.contains_key(NTTY7_WS_ENV),
-            "a pane outside any workspace must not claim one"
-        );
     }
 
     #[cfg(unix)]
@@ -5816,7 +5461,6 @@ mod tests {
             &std::collections::HashMap::new(),
             false,
             1,
-            None,
             "/opt/homebrew/bin/fish",
         )
         .into_iter()
@@ -5834,7 +5478,7 @@ mod tests {
     fn an_unconfigured_pane_still_announces_the_shell_it_runs() {
         // No configured shell means the pane runs the login shell, and naming
         // it is both harmless and correct: it is what the pane is running.
-        let cmd = build_shell_command(None, &Some(PathBuf::from("/tmp")), 1, None)
+        let cmd = build_shell_command(None, &Some(PathBuf::from("/tmp")), 1)
             .expect("build default shell command")
             .0;
         let shell = cmd
@@ -5864,7 +5508,7 @@ mod tests {
             .collect();
 
         let applied: std::collections::HashMap<_, _> =
-            pane_environment(&configured, false, 1, None, "/opt/homebrew/bin/fish")
+            pane_environment(&configured, false, 1, "/opt/homebrew/bin/fish")
                 .into_iter()
                 .collect();
 
@@ -5878,7 +5522,6 @@ mod tests {
             &std::collections::HashMap::new(),
             false,
             1,
-            None,
             r"C:\Program Files\PowerShell\7\pwsh.exe",
         );
 
@@ -5967,7 +5610,7 @@ mod tests {
         .collect();
 
         let applied: std::collections::HashMap<_, _> =
-            pane_environment(&configured, false, 1, None, "/bin/zsh")
+            pane_environment(&configured, false, 1, "/bin/zsh")
                 .into_iter()
                 .collect();
 
@@ -5994,14 +5637,12 @@ mod tests {
     #[test]
     fn pane_environment_advertises_light_and_dark_backgrounds() {
         let empty = std::collections::HashMap::new();
-        let light: std::collections::HashMap<_, _> =
-            pane_environment(&empty, false, 1, None, "pwsh.exe")
-                .into_iter()
-                .collect();
-        let dark: std::collections::HashMap<_, _> =
-            pane_environment(&empty, true, 1, None, "pwsh.exe")
-                .into_iter()
-                .collect();
+        let light: std::collections::HashMap<_, _> = pane_environment(&empty, false, 1, "pwsh.exe")
+            .into_iter()
+            .collect();
+        let dark: std::collections::HashMap<_, _> = pane_environment(&empty, true, 1, "pwsh.exe")
+            .into_iter()
+            .collect();
 
         assert_eq!(light.get("COLORFGBG").map(String::as_str), Some("0;15"));
         assert_eq!(dark.get("COLORFGBG").map(String::as_str), Some("15;0"));
@@ -6013,7 +5654,7 @@ mod tests {
         let configured = [("ColorFgBg".to_string(), "3;4".to_string())]
             .into_iter()
             .collect();
-        let applied = pane_environment(&configured, false, 1, None, "pwsh.exe");
+        let applied = pane_environment(&configured, false, 1, "pwsh.exe");
 
         assert!(!applied.iter().any(|(key, _)| key == "COLORFGBG"));
         assert!(
@@ -6031,7 +5672,7 @@ mod tests {
             .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
             .collect();
 
-        let applied = pane_environment(&configured, false, 1, None, "pwsh.exe");
+        let applied = pane_environment(&configured, false, 1, "pwsh.exe");
 
         assert!(
             !applied.iter().any(|(k, _)| k == "Term" || k == "ColorTerm"),
@@ -6159,7 +5800,7 @@ mod tests {
 
     #[test]
     fn spawned_shell_carries_the_tty7_marker() {
-        let cmd = build_shell_command(None, &Some(PathBuf::from("/tmp")), 42, Some("ws-main"))
+        let cmd = build_shell_command(None, &Some(PathBuf::from("/tmp")), 42)
             .expect("build default shell command")
             .0;
         let tty7 = cmd.get_env(NTTY7_ENV_MARKER).and_then(|v| v.to_str());
@@ -6172,11 +5813,6 @@ mod tests {
             cmd.get_env(NTTY7_PANE_ENV).and_then(|v| v.to_str()),
             Some("42"),
             "the daemon must tell every spawned shell which pane it is"
-        );
-        assert_eq!(
-            cmd.get_env(NTTY7_WS_ENV).and_then(|v| v.to_str()),
-            Some("ws-main"),
-            "the daemon must tell every spawned shell which workspace filed it"
         );
         if let Some(dir) = config_dir_env() {
             assert_eq!(
@@ -6206,7 +5842,6 @@ mod tests {
                 shell: vec![ShellState {
                     active: true,
                     at_prompt: true,
-                    mark_at_prompt: true,
                     command: None,
                 }],
                 ..SniffSignals::default()
@@ -7363,9 +6998,9 @@ mod tests {
         assert!(graphics.is_ground());
         match frames.as_slice() {
             [GraphicsFrame::Image(frame), GraphicsFrame::Output(text)] => {
-                let img = Image::decode_frame(frame).expect("image");
+                let mut img = Image::decode_frame_owned(frame.to_vec()).expect("image");
                 assert_eq!(img.id, 1);
-                assert_eq!(img.to_rgba8().unwrap(), pixel);
+                assert_eq!(img.take_rgba8().unwrap(), pixel);
                 assert_eq!(text, b"after");
             }
             other => panic!("image then the text after it, got {other:?}"),
@@ -7485,8 +7120,8 @@ mod tests {
         );
         match &msgs[image_at] {
             DaemonMsg::Image(frame) => {
-                let img = Image::decode_frame(frame).expect("image");
-                assert_eq!(img.to_rgba8().unwrap(), pixel);
+                let mut img = Image::decode_frame_owned(frame.to_vec()).expect("image");
+                assert_eq!(img.take_rgba8().unwrap(), pixel);
             }
             _ => unreachable!(),
         }

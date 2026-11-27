@@ -7,8 +7,9 @@
 # fs-backed APIs quietly answer for the wrong machine:
 # `canonicalize` walks the local filesystem, `is_absolute` says `false` for
 # `/home/me` on Windows, `read_dir` lists the client's disk. Everything that may
-# be looking at a workspace path has to go through `ui::host_ops` / the `Host`
-# trait, which routes to the local disk or the far side as appropriate.
+# be looking at a workspace path has to go through `ui::host_ops`, which reads
+# this machine. A pane on another machine is a `RemoteContext`; its paths are
+# not answered by these calls.
 #
 # This script enforces that. It is deliberately *not* the raw grep from the
 # contract: run bare, that grep reports 42 hits on a clean tree — not one of them
@@ -24,7 +25,7 @@
 #      `std::fs::`. Every entry carries the reason its paths cannot be remote.
 #
 # Adding an entry is a deliberate act: if the path could ever be a workspace
-# path, the answer is `Host`, not an allowlist line.
+# path, the answer is `ui::host_ops`, not an allowlist line.
 #
 # Usage: bash .github/scripts/check-host-boundary.sh
 # Exit 0 = clean, 1 = violations (printed to stderr).
@@ -51,21 +52,6 @@ src/ui/host_ops.rs|*
 # the user's color schemes with it.
 src/ui/presets.rs|std::fs::
 src/ui/presets.rs|.is_absolute()
-src/ui/app.rs|std::fs::create_dir_all
-
-# The editor's record of which files each tab had open is app state under the
-# local config dir, like the themes above — not a file in any workspace.
-src/ui/editor_session.rs|std::fs::read
-
-# Reading a private key off *this* machine to hash it into a keychain account
-# (`core::keychain`). The key is the client's credential; the far side never
-# sees the file, only the resulting auth.
-src/ui/ssh_prompt.rs|std::fs::read
-src/ui/ssh_connect.rs|std::fs::read
-src/ui/settings.rs|std::fs::read
-# The host editor asking which of those keys is on this machine before it offers
-# a passphrase box for one — the same client-side key, never a workspace path.
-src/ui/settings.rs|std::fs::metadata
 
 # Opening a path scraped out of terminal output resolves it against the local
 # cwd — a local-pane affordance; `resolve_existing_path` declines when there is
@@ -76,40 +62,6 @@ src/terminal/search.rs|.is_absolute()
 # can be handed a path. Always `std::env::temp_dir()` on this machine.
 src/terminal/view.rs|std::fs::create_dir_all
 src/terminal/view.rs|std::fs::write
-# The source side of a paste/drop upload into a remote pane: the paths the
-# clipboard or desktop hands over are on this machine by construction, so
-# asking whether one is a directory is a local read. The remote side of the
-# copy goes over SFTP.
-src/terminal/view.rs|std::fs::metadata
-
-# Asking whether a file would be *launched* rather than shown before handing it
-# to the desktop opener. Only reachable behind `host_id.is_local()` — a path on
-# another machine takes the earlier arm and never gets here.
-src/ui/code_editor.rs|std::fs::metadata
-
-# The source side of a file drop. What the desktop hands over is by
-# construction a path on the desktop's own machine, so reading it is a local
-# read even when the tree being dropped on is remote — the destination side of
-# that copy goes through `Host`, and the one `std::fs::copy` that touches a
-# destination sits inside a branch already gated on `host.id().is_local()`.
-src/ui/file_copy.rs|std::fs::
-
-# The code editor's language servers run on this machine and only ever take a
-# local buffer: `OpenFile::local` refuses anything whose host is not local, so
-# every path `ui::lsp` holds is on this disk. It reads files a server points
-# into that are not open (to measure a column, to apply a rename to disk),
-# looks for project markers above a file (`Cargo.toml`, `package.json`, …),
-# and checks a server binary is executable. A remote workspace gets language
-# servers by running them over there, not by routing these reads.
-src/ui/lsp/editor.rs|std::fs::read_to_string
-src/ui/lsp/locations.rs|std::fs::read_to_string
-src/ui/lsp/mod.rs|std::fs::read_to_string
-src/ui/lsp/servers.rs|std::fs::metadata
-src/ui/lsp/servers.rs|std::fs::read_to_string
-# Its tests live in their own file (not a trailing `mod tests`), writing
-# fixtures into a local temp dir.
-src/ui/lsp/tests.rs|std::fs::write
-src/ui/lsp/tests.rs|.canonicalize()
 EOF
 )
 
@@ -185,8 +137,7 @@ if [ "$violations" -ne 0 ]; then
 The GUI reached the filesystem/git directly.
 
 A path in `ui::` or `terminal::` may belong to a remote workspace, where these
-calls answer for the wrong machine. Route it through `ui::host_ops` / `Host`
-instead (`Host::read_dir`, `join`, `is_absolute`, `canonicalize`, …).
+calls answer for the wrong machine. Route it through `ui::host_ops`.
 
 If the path genuinely cannot be remote — app config, bundled assets, the local
 temp dir — add it to the allowlist in this script with the reason why.

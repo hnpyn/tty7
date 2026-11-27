@@ -3507,7 +3507,6 @@ mod tests {
             vec![("calt", 0), ("liga", 0), ("clig", 0)],
             "an unconfigured face must name every ligature feature off",
         );
-        assert_eq!(font.features.is_calt_enabled(), Some(false));
 
         // Every face the grid paints with gets the same set, not just the plain one.
         for (bold, italic) in [(true, false), (false, true), (true, true)] {
@@ -3529,7 +3528,6 @@ mod tests {
             vec![("calt", 1), ("liga", 1)],
             "an explicit request for ligatures must survive untouched",
         );
-        assert_eq!(font.features.is_calt_enabled(), Some(true));
 
         // Explicitly off in `config.json`: also passed through unchanged.
         let mut configured = gpui::font("Test");

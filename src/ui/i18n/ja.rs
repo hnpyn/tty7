@@ -81,7 +81,6 @@ pub fn translate_ja(key: L10nKey) -> Option<&'static str> {
         L10nKey::ComposerEffortTip => "推論の強さ  ·  クリックして変更",
         L10nKey::AppMenuMinimize => "最小化",
         L10nKey::AppMenuZoom => "ズーム",
-        L10nKey::PaneTitleProcessExited => "{title} — プロセスが終了しました",
         L10nKey::ShellFellBack => {
             "設定したシェル {shell} の起動に失敗したため、ログインシェルを使います。"
         }

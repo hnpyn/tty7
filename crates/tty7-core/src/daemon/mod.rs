@@ -1,7 +1,5 @@
 pub mod history;
 pub mod pane;
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-mod procinfo;
 pub mod protocol;
 
 pub(crate) const DETECTED_SHELL_ENV: &str = "NTTY7_DETECTED_SHELL";

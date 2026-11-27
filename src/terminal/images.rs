@@ -586,7 +586,7 @@ impl Drop for DecodeWorker {
 }
 
 /// Decode a daemon [`Image`] frame into GPUI-ready pixels: inflate + expand to
-/// RGBA (via the protocol type's own [`Image::to_rgba8`]), or decode a PNG
+/// RGBA (via the protocol type's own [`Image::take_rgba8`]), or decode a PNG
 /// payload, then swap R↔B to the BGRA the sprite atlas wants. Returns the render
 /// image and its true pixel dimensions (a PNG carries its own, overriding any
 /// `s=`/`v=` the sender may have omitted). `None` if the payload can't be decoded.

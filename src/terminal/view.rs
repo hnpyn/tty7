@@ -56,29 +56,9 @@ impl gpui::EventEmitter<ChildExited> for TerminalView {}
 /// What a pane is called when nothing running in it has said otherwise.
 pub(crate) const DEFAULT_TITLE: &str = "ntty7";
 
-/// What a pane is *saying* about itself, if anything — the reading behind
-/// [`TerminalView::stated_title`], split out so it can be pinned without a
-/// live pane.
-///
-/// Anything but the placeholder counts. That is wider than "arrived over OSC
-/// 0/2" on purpose: an SSH pane answers to the host it dialled and a workspace
-/// pane to its workspace's name, and those are names tty7 gave the pane
-/// deliberately (#438) rather than the absence of one. The literal string
-/// `ntty7` is the only title that says nothing, because it is the app's own
-/// name standing in for a pane that has never introduced itself.
-#[cfg(test)]
-pub(crate) fn stated_title(title: &str) -> Option<&str> {
-    match title.trim() {
-        "" => None,
-        t if t == DEFAULT_TITLE => None,
-        t => Some(t),
-    }
-}
-
 pub struct ShellParts {
     terminal: RemoteTerminal,
     pub(crate) pane_id: u64,
-    shell_spec: Option<ShellSpec>,
     /// Set when a configured shell failed and the login shell was used instead.
     pub(crate) shell_notice: Option<String>,
 }
@@ -123,11 +103,8 @@ const SCROLL_GESTURE_IDLE: std::time::Duration = std::time::Duration::from_milli
 /// this only ever applies to the continuous stream a gesture produces.
 const ZOOM_SCROLL_LINES: f32 = 3.0;
 
-fn cwd_is_on_host(pane_runs_remotely: bool, host_is_local: bool) -> bool {
-    match pane_runs_remotely {
-        false => host_is_local,
-        true => !host_is_local,
-    }
+fn cwd_is_on_host(pane_runs_remotely: bool) -> bool {
+    !pane_runs_remotely
 }
 
 /// Which path dialect a pane's output is written in.
@@ -156,9 +133,7 @@ fn link_path_style(
 
 pub struct TerminalView {
     pub terminal: RemoteTerminal,
-    host_id: crate::ui::host_ops::HostId,
     pub pane_id: u64,
-    shell_spec: Option<ShellSpec>,
     pub focus_handle: FocusHandle,
     pub font: Font,
     pub font_bold: Option<Font>,
@@ -652,13 +627,9 @@ fn wsl_share_path(distro: &str, posix: &str) -> Option<std::path::PathBuf> {
 /// A pane that runs `wsl.exe` is tagged by its remote context. Only this
 /// machine's panes may take the share; a remote host's same-named distro
 /// would list the wrong files.
-fn wsl_share_distro(
-    remote: Option<&crate::daemon::protocol::RemoteContext>,
-    host_is_local: bool,
-) -> Option<String> {
+fn wsl_share_distro(remote: Option<&crate::daemon::protocol::RemoteContext>) -> Option<String> {
     let remote = remote?;
-    (remote.kind == crate::daemon::protocol::RemoteKind::Wsl && host_is_local)
-        .then(|| remote.target.clone())
+    (remote.kind == crate::daemon::protocol::RemoteKind::Wsl).then(|| remote.target.clone())
 }
 
 /// The directory the Files panel lists for a pane, spelled so the pane's
@@ -790,13 +761,11 @@ impl TerminalView {
             17,
             working_directory,
             shell.clone(),
-            None,
             use_config_shell,
         )?;
         Ok(ShellParts {
             terminal,
             pane_id,
-            shell_spec: shell,
             shell_notice: None,
         })
     }
@@ -806,9 +775,7 @@ impl TerminalView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let mut view = Self::with_terminal(parts.terminal, parts.pane_id, window, cx);
-        view.shell_spec = parts.shell_spec;
-        view
+        Self::with_terminal(parts.terminal, parts.pane_id, window, cx)
     }
 
     fn with_terminal(
@@ -949,9 +916,7 @@ impl TerminalView {
 
         Self {
             terminal,
-            host_id: crate::ui::host_ops::HostId::LOCAL,
             pane_id,
-            shell_spec: None,
             focus_handle,
             font,
             font_bold,
@@ -1063,23 +1028,6 @@ impl TerminalView {
         self.terminal.foreground_cwd()
     }
 
-    /// The title this pane is showing, or `None` while it is still answering
-    /// to the app's own name — see [`stated_title`]. The label ladder reads
-    /// this where the machine tree reads
-    /// [`PaneRecord::osc_title`](tty7_core::core::machine::PaneRecord::osc_title),
-    /// which is what lets the tab strip and the switcher name a tab the same
-    /// way.
-    #[cfg(test)]
-    pub(crate) fn stated_title(&self) -> Option<&str> {
-        stated_title(&self.title)
-    }
-
-    /// `name` with the suffix that says how this pane ended.
-    fn ended_title(&self, name: &str) -> String {
-        let key = L10nKey::PaneTitleProcessExited;
-        t_fmt(key, &[("title", name)])
-    }
-
     pub fn remote_context(&self) -> Option<RemoteContext> {
         self.terminal.remote_context()
     }
@@ -1089,17 +1037,11 @@ impl TerminalView {
     }
 
     fn paths_are_local(&self) -> bool {
-        self.remote_context().is_none() && self.host_id.is_local()
+        self.remote_context().is_none()
     }
 
     pub fn host(&self) -> Option<std::sync::Arc<tty7_core::host::local::LocalHost>> {
-        self.host_id
-            .is_local()
-            .then(tty7_core::host::local::LocalHost::shared)
-    }
-
-    pub fn host_id(&self) -> crate::ui::host_ops::HostId {
-        self.host_id
+        Some(tty7_core::host::local::LocalHost::shared())
     }
 
     pub fn host_cwd(&self) -> Option<std::path::PathBuf> {
@@ -1107,7 +1049,7 @@ impl TerminalView {
     }
 
     fn cwd_is_on_host(&self) -> bool {
-        cwd_is_on_host(!self.paths_are_local(), self.host_id.is_local())
+        cwd_is_on_host(self.remote_context().is_some())
     }
 
     pub fn agent(&self) -> Option<crate::core::cli_agent::CLIAgent> {
@@ -1191,26 +1133,13 @@ impl TerminalView {
     /// pane gets no `git_status_cwd` (its paths are not its host's), so the
     /// agent's own cwd is read here directly before the shell's.
     pub fn files_cwd(&self) -> Option<std::path::PathBuf> {
-        let distro = wsl_share_distro(
-            self.terminal.remote_context().as_ref(),
-            self.host_id.is_local(),
-        );
+        let distro = wsl_share_distro(self.terminal.remote_context().as_ref());
         let cwd = self
             .terminal
             .agent_session()
             .and_then(|s| s.cwd)
             .or_else(|| self.cwd());
         files_cwd(self.effective_host_cwd(), distro.as_deref(), cwd)
-    }
-
-    /// The shell binary this pane is running, for the path-quoting rules.
-    ///
-    /// `None` before the pane has resolved one, which [`quote_for_shell`]
-    /// answers from the platform — PowerShell on Windows, POSIX elsewhere.
-    /// The one pane that guess is wrong for is a cmd.exe pane that has not
-    /// reported in yet.
-    pub(super) fn shell_program(&self) -> Option<String> {
-        self.shell_spec.as_ref().map(|s| s.program.clone())
     }
 
     /// Takes a title the program set, and gives it to the tab only once it has
@@ -1266,9 +1195,6 @@ impl TerminalView {
                 // Nothing is left to settle, and a title still waiting its turn
                 // would land on top of the state below a moment from now.
                 self.pending_title = None;
-                // The pane keeps answering to its own name (an SSH pane's
-                // host, #438) — only the state suffix is localized (#602).
-                self.title = self.ended_title(&self.default_title);
                 if self.terminal.child_exited() {
                     cx.emit(ChildExited);
                 }
@@ -1838,7 +1764,7 @@ impl TerminalView {
         let Some(spelled) = self.composer_takes_paths(spelled, cx) else {
             return;
         };
-        let text = pasted_paths_text(&spelled, self.shell_program().as_deref());
+        let text = pasted_paths_text(&spelled, None);
         self.paste(text, cx);
     }
 
@@ -2721,11 +2647,6 @@ impl TerminalView {
     /// "Open with Default App": the file link under the menu, handed to the
     /// OS association whatever `link_file_open` says "Open" does.
     fn open_menu_link_with_default_app(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // The menu only offers this for a local pane; a key binding could
-        // still fire it on a remote one, where the path means nothing here.
-        if !self.host_id.is_local() {
-            return;
-        }
         let Some(path) = self.menu_link_path().map(std::path::Path::to_path_buf) else {
             return;
         };
@@ -2768,14 +2689,6 @@ impl TerminalView {
         let cfg = cx.global::<Config>();
         let mode = cfg.file_open_mode();
         let command = cfg.link_file_command.clone();
-        // A path that was just resolved on another machine means nothing to a
-        // local opener: `open` and a user's `code --goto` would both be handed
-        // a path this filesystem never had.
-        if !self.host_id.is_local() {
-            let shown = path.display().to_string();
-            window.push_notification(t_fmt(L10nKey::LinkFileMissing, &[("path", &shown)]), cx);
-            return;
-        }
         // Both external arms have to answer for a failed spawn (#542): a
         // misspelled `link_file_command` or a missing opener used to hit only
         // the log, and the link read as dead — while the path was only ever
@@ -3028,7 +2941,7 @@ impl TerminalView {
     /// what a build prints. The pane's own directory stays first, so a name
     /// that exists in both is the near one.
     fn link_roots(&mut self, cx: &mut Context<Self>) -> super::search::LinkRoots {
-        let local_home = self.host_id.is_local();
+        let local_home = true;
         let style = self.link_path_style();
         let Some(cwd) = self.effective_host_cwd() else {
             return super::search::LinkRoots {
@@ -3249,14 +3162,13 @@ impl Render for TerminalView {
                 // what it can do goes above what the pane can do.
                 let menu = match view.menu_link_path() {
                     Some(path) => {
-                        let local = view.host_id.is_local();
                         let reveal = match cfg!(target_os = "macos") {
                             true => L10nKey::AppMenuRevealInFinder,
                             false => L10nKey::AppMenuRevealInFolder,
                         };
                         let label = link_menu_label(path);
                         let default_app =
-                            offers_default_app_open(local, cx.global::<Config>().file_open_mode());
+                            offers_default_app_open(cx.global::<Config>().file_open_mode());
                         menu.min_w(px(220.))
                             .action_context(menu_focus.clone())
                             .label(label)
@@ -3267,12 +3179,9 @@ impl Render for TerminalView {
                                     Box::new(OpenLinkWithDefaultApp),
                                 )
                             })
-                            // A file on another machine has no folder here to
-                            // show it in, and naming this one's would show
-                            // whatever it happens to keep at that path.
                             .menu_element_with_disabled(
                                 Box::new(RevealLinkUnderPointer),
-                                !local,
+                                false,
                                 menu_row_with_hint(t(reveal), None),
                             )
                             .menu(
@@ -3413,8 +3322,8 @@ fn select_end_copy(enabled: bool, grid: bool) -> SelectEndCopy {
 /// a remote pane's path names nothing here — or worse, this machine's copy.
 /// And not when "Open" already goes to the OS association, where the two rows
 /// would do the same thing.
-fn offers_default_app_open(host_is_local: bool, open_mode: LinkFileOpen) -> bool {
-    host_is_local && open_mode != LinkFileOpen::System
+fn offers_default_app_open(open_mode: LinkFileOpen) -> bool {
+    open_mode != LinkFileOpen::System
 }
 
 /// Hands a path to whatever the OS has it associated with. Also the fallback
@@ -3677,31 +3586,6 @@ fn drag_scroll_step(overshoot: f32) -> i32 {
 #[cfg(test)]
 mod tests {
 
-    /// What the label ladder asks a pane: are you showing a name of your own,
-    /// or still standing under the app's? (#740)
-    #[test]
-    fn a_pane_states_a_title_whenever_it_is_not_the_placeholder() {
-        use super::stated_title;
-
-        // Nothing has spoken — this is the pane a directory stands in for.
-        assert_eq!(stated_title("ntty7"), None);
-        assert_eq!(stated_title("  ntty7  "), None);
-        assert_eq!(stated_title("   "), None);
-
-        // A title from the program running in it.
-        assert_eq!(stated_title("vim — main.rs"), Some("vim — main.rs"));
-        assert_eq!(stated_title(" user@host:~/repo "), Some("user@host:~/repo"));
-        // A default tty7 chose for the pane itself is a name, not the absence
-        // of one: an SSH pane answers to its host (#438) and a workspace pane
-        // to its workspace, and neither gives way to a directory.
-        assert_eq!(stated_title("prod-web"), Some("prod-web"));
-        // So does the state a finished pane is left showing.
-        assert_eq!(
-            stated_title("ntty7 — process exited"),
-            Some("ntty7 — process exited")
-        );
-    }
-
     #[test]
     fn a_busy_command_name_undoes_the_shell_escaping() {
         use super::unescape_mark_text;
@@ -3836,24 +3720,14 @@ mod tests {
     #[test]
     fn a_wsl_exe_pane_on_this_machine_completes_over_its_own_share() {
         assert_eq!(
-            wsl_share_distro(Some(&wsl_context("Ubuntu-24.04")), true),
+            wsl_share_distro(Some(&wsl_context("Ubuntu-24.04"))),
             Some("Ubuntu-24.04".to_string())
-        );
-    }
-
-    /// The same pane on a remote machine reaches that machine's distro, which
-    /// no share here can list.
-    #[test]
-    fn a_remote_hosts_wsl_exe_pane_leaves_tab_to_the_shell() {
-        assert_eq!(
-            wsl_share_distro(Some(&wsl_context("Ubuntu-24.04")), false),
-            None
         );
     }
 
     #[test]
     fn panes_with_no_distro_of_their_own_have_no_share() {
-        assert_eq!(wsl_share_distro(None, true), None);
+        assert_eq!(wsl_share_distro(None), None);
     }
 
     #[test]
@@ -4507,26 +4381,17 @@ mod tests {
     #[test]
     fn the_default_app_row_is_offered_only_where_it_differs_from_open() {
         use super::{LinkFileOpen, offers_default_app_open};
-        assert!(offers_default_app_open(true, LinkFileOpen::Command));
+        assert!(offers_default_app_open(LinkFileOpen::Command));
         assert!(
-            !offers_default_app_open(true, LinkFileOpen::System),
+            !offers_default_app_open(LinkFileOpen::System),
             "it would repeat Open"
         );
-        for mode in [LinkFileOpen::System, LinkFileOpen::Command] {
-            assert!(
-                !offers_default_app_open(false, mode),
-                "a remote file has nothing here for the OS to open ({mode:?})"
-            );
-        }
     }
 
     #[test]
-    fn only_a_matching_host_may_answer_for_a_panes_paths() {
-        assert!(cwd_is_on_host(false, true));
-        assert!(cwd_is_on_host(true, false));
-
-        assert!(!cwd_is_on_host(true, true));
-        assert!(!cwd_is_on_host(false, false));
+    fn a_local_pane_answers_for_its_paths_and_a_remote_one_does_not() {
+        assert!(cwd_is_on_host(false));
+        assert!(!cwd_is_on_host(true));
     }
 
     /// Which machine's spelling a pane's paths are read in. Ungated on
@@ -7040,7 +6905,7 @@ mod gpui_tests {
             .update(cx, |view, _, cx| {
                 view.handle_event(AlacEvent::Exit, cx);
                 assert!(view.terminal.exited);
-                assert_eq!(view.title, "ntty7 — process exited");
+                assert_eq!(view.title, "ntty7");
             })
             .unwrap();
     }
@@ -8003,7 +7868,10 @@ mod prompt_handover_tests {
             cx.executor().advance_clock(TITLE_SETTLE * 2);
             cx.run_until_parked();
             let showing = window
-                .update(cx, |view, _, _| view.stated_title().map(str::to_string))
+                .update(cx, |view, _, _| {
+                    let title = view.title.trim();
+                    (title != DEFAULT_TITLE && !title.is_empty()).then(|| title.to_string())
+                })
                 .unwrap();
             if showing.as_deref() == expect {
                 return;
@@ -8028,8 +7896,7 @@ mod prompt_handover_tests {
         titled(cx, &window, Some("✳ fixing the switcher"));
 
         // Claude exits and the shell reports the command finished. Nothing
-        // titles the pane after it, so the tab has to fall back down the
-        // label ladder — `stated_title` saying nothing is how it does that.
+        // titles the pane after it, so the tab falls back to the placeholder.
         output(&daemon, b"\x1b]133;D;0\x07");
         titled(cx, &window, None);
     }

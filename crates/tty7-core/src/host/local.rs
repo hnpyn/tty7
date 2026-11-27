@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::core::gitignore::GitignoreChain;
-use crate::host::{Entry, HostId, SearchHit, guard_off_ui};
+use crate::host::{Entry, SearchHit, guard_off_ui};
 
 #[derive(Default)]
 pub struct LocalHost {
@@ -20,10 +20,6 @@ impl LocalHost {
     pub fn shared() -> Arc<Self> {
         static LOCAL: OnceLock<Arc<LocalHost>> = OnceLock::new();
         LOCAL.get_or_init(|| Arc::new(LocalHost::new())).clone()
-    }
-
-    pub fn id(&self) -> HostId {
-        HostId::LOCAL
     }
 
     pub fn join(&self, dir: &Path, name: &str) -> PathBuf {
@@ -184,7 +180,6 @@ mod tests {
     #[test]
     fn shared_is_a_singleton() {
         assert!(Arc::ptr_eq(&LocalHost::shared(), &LocalHost::shared()));
-        assert!(LocalHost::shared().id().is_local());
     }
 
     #[test]

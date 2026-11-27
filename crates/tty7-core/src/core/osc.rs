@@ -331,21 +331,16 @@ pub enum TitleEffect {
 /// nobody in particular and is left alone. A pane with no shell integration
 /// sees neither mark and so keeps every title, exactly as before.
 ///
-/// Both the daemon (which keeps `PaneRecord::osc_title` for the switcher and
-/// the CLI) and the window (which keeps its own terminal's title for its tab
-/// strip) run this over the same bytes, so the two can never disagree about
-/// whether a title is still current. Feeding it in stream order is what makes
-/// the answer right: a shell that re-titles itself in `precmd` emits its OSC
-/// 0/2 *after* the `D`, and that [`Set`](TitleEffect::Set) is simply the last
-/// word.
+/// The window runs this over the pane's bytes so a tab can drop a title whose
+/// command has finished. Feeding it in stream order is what makes the answer
+/// right: a shell that re-titles itself in `precmd` emits its OSC 0/2 *after*
+/// the `D`, and that [`Set`](TitleEffect::Set) is simply the last word.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct TitleLifetime {
     /// A command owns the pane: a `C` has arrived and its `D` has not.
     running: bool,
     /// The title standing right now was set while a command owned the pane.
     from_command: bool,
-    /// Any `133` prompt mark (`A`–`D`) has been read at all.
-    marked: bool,
 }
 
 impl TitleLifetime {
@@ -359,9 +354,6 @@ impl TitleLifetime {
         let Some(rest) = payload.strip_prefix(b"133;") else {
             return TitleEffect::None;
         };
-        if matches!(rest.first(), Some(b'A'..=b'D')) {
-            self.marked = true;
-        }
         match rest.first() {
             Some(b'C') => self.running = true,
             Some(b'D') => {
@@ -379,24 +371,6 @@ impl TitleLifetime {
             _ => {}
         }
         TitleEffect::None
-    }
-
-    /// The stream was picked up partway through a command whose `C` mark is
-    /// not in it — a window reattaching to a pane whose replay ring rolled
-    /// past the `C` while a long session (an agent, an editor) ran on.
-    ///
-    /// If what was read carried no prompt mark at all, every byte of it was
-    /// written under that command, titles included, so the command's `D`
-    /// must retire them just as it would have on a link that saw the `C`.
-    /// Without this a reattached window keeps the dead program's title
-    /// forever — exactly #889 — while the daemon, which saw the whole stream,
-    /// has already dropped it. Any mark read settles the question on its own,
-    /// so this does nothing then.
-    pub fn joined_mid_command(&mut self) {
-        if !self.marked {
-            self.running = true;
-            self.from_command = true;
-        }
     }
 }
 
@@ -681,28 +655,6 @@ mod tests {
     fn a_d_mark_with_no_command_before_it_retires_nothing() {
         let mut life = TitleLifetime::default();
         assert_eq!(life.saw(b"0;pinned"), TitleEffect::Set);
-        assert_eq!(life.saw(b"133;D;0"), TitleEffect::None);
-    }
-
-    /// A reattach whose replay ring no longer holds the running command's `C`:
-    /// the titles in it are that command's, and its `D` retires them.
-    #[test]
-    fn a_stream_joined_mid_command_retires_its_title_at_the_d() {
-        let mut life = TitleLifetime::default();
-        assert_eq!(
-            life.saw(b"2;\xe2\x9c\xb3 fixing the switcher"),
-            TitleEffect::Set
-        );
-        life.joined_mid_command();
-        assert_eq!(life.saw(b"133;D;0"), TitleEffect::Retire);
-
-        // A replay that carried marks already knows who owns the title: a
-        // title pinned at a prompt stays pinned through the next command.
-        let mut life = TitleLifetime::default();
-        assert_eq!(life.saw(b"133;B"), TitleEffect::None);
-        assert_eq!(life.saw(b"0;my tab"), TitleEffect::Set);
-        life.joined_mid_command();
-        assert_eq!(life.saw(b"133;C;ls"), TitleEffect::None);
         assert_eq!(life.saw(b"133;D;0"), TitleEffect::None);
     }
 

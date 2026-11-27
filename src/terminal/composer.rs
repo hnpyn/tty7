@@ -45,7 +45,7 @@ use super::view::{GRID_PAD_X, GRID_PAD_Y, TerminalView, pasted_paths_text, types
 use crate::core::cli_agent::{AgentStatus, CLIAgent};
 use crate::core::shell_quote::{Quoting, quoting_for};
 use crate::terminal::files::{FileIndex, FileList, IndexedFile, rank, walk};
-use crate::ui::host_ops::{HostId, HostOps};
+use crate::ui::host_ops::HostOps;
 use crate::ui::i18n::{L10nKey, t, t_fmt};
 use tty7_core::host::local::LocalHost;
 
@@ -2056,7 +2056,7 @@ fn mode_label(mode: &str) -> String {
 /// switched out and back, and a half-written prompt must not be the price of
 /// looking at another workspace. Kept by pane, for the life of the app.
 #[derive(Default)]
-struct ComposerMemory(HashMap<(HostId, u64), Remembered>);
+struct ComposerMemory(HashMap<u64, Remembered>);
 
 impl gpui::Global for ComposerMemory {}
 
@@ -2210,8 +2210,8 @@ fn alias_label(alias: &str) -> String {
 }
 
 impl TerminalView {
-    fn composer_key(&self) -> (HostId, u64) {
-        (self.host_id(), self.pane_id)
+    fn composer_key(&self) -> u64 {
+        self.pane_id
     }
 
     fn remember_composer(&self, cx: &mut Context<Self>) {
@@ -2729,8 +2729,6 @@ impl TerminalView {
         let Some(trigger) = self.composer_trigger(cx) else {
             return;
         };
-        let host_id = self.host_id();
-        let local = host_id.is_local();
         let cwd = self.files_cwd();
         let agent = self.agent();
         let Some(c) = self.composer.as_mut() else {
@@ -2744,9 +2742,9 @@ impl TerminalView {
                 {
                     return;
                 }
-                let host = local.then(LocalHost::shared);
-                let custom = match (host, agent) {
-                    (Some(host), Some(CLIAgent::Claude)) => {
+                let custom = match agent {
+                    Some(CLIAgent::Claude) => {
+                        let host = LocalHost::shared();
                         let home = std::env::var_os("HOME").map(PathBuf::from);
                         custom_commands(&host, cwd.as_deref(), home.as_deref())
                     }
@@ -2763,15 +2761,11 @@ impl TerminalView {
                 let Some(cwd) = cwd.filter(|_| stale) else {
                     return;
                 };
-                let Some(host) = host_id.is_local().then(LocalHost::shared) else {
-                    return;
-                };
+                let host = LocalHost::shared();
                 if !matches!(c.files, Files::Ready(..)) {
                     c.files = Files::Walking;
                 }
-                let home = local
-                    .then(|| std::env::var_os("HOME").map(PathBuf::from))
-                    .flatten();
+                let home = std::env::var_os("HOME").map(PathBuf::from);
                 HostOps::run(
                     host,
                     cx,
@@ -2818,7 +2812,7 @@ impl TerminalView {
                     &trigger.query,
                     self.files_cwd().as_deref(),
                     self.agent(),
-                    self.shell_program().as_deref(),
+                    None,
                 ),
                 _ => Vec::new(),
             },
@@ -2897,9 +2891,9 @@ impl TerminalView {
         if !self.composer_can_send(cx) {
             return;
         }
-        let shell = self.shell_program();
+        let shell: Option<&str> = None;
         // Where OpenCode's mentions are looked up, to be picked from its list.
-        let mentions_from = match agent == CLIAgent::OpenCode && self.host_id().is_local() {
+        let mentions_from = match agent == CLIAgent::OpenCode {
             true => self.files_cwd(),
             false => None,
         };
@@ -2935,7 +2929,7 @@ impl TerminalView {
         });
         let mut steps = match picked {
             Some(steps) => steps,
-            None => submit_message(agent, message, &c.attached, shell.as_deref(), bracketed),
+            None => submit_message(agent, message, &c.attached, shell, bracketed),
         };
         let mut before = Vec::new();
         // Text left in the agent's own input under the box would run into the

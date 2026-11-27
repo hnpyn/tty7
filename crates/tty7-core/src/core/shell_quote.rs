@@ -127,57 +127,6 @@ fn quote_as(path: &str, quoting: Quoting) -> String {
     }
 }
 
-/// Undo [`quote_for_shell`] far enough to look the path up on disk.
-///
-/// Completion re-reads the word under the cursor after the user has already
-/// accepted one candidate, so whatever quoting went in has to come back out
-/// before the word can be resolved against the filesystem. The word is
-/// mid-typing and therefore usually *un*terminated, so a lone leading quote
-/// counts.
-///
-/// Only a POSIX shell treats a backslash as an escape character. A user who
-/// typed `My\ Docs` by hand there expects it honoured; on Windows the same
-/// character is a path separator and must survive untouched.
-///
-/// Inside single quotes it is neither, on any shell: a single-quoted string is
-/// literal from end to end. Unescaping there would take the separators out of
-/// `'C:\Users\me'` — exactly the form [`quote_for_shell`] produces for that
-/// path.
-///
-/// The scan tracks quoting across the whole word rather than looking at the
-/// first character, because a quote can open partway in: `~/'My Documents'` has
-/// to keep its `~/` outside so the shell expands it, and the `'\''` seam that
-/// carries a quote through a POSIX single-quoted string is three state changes
-/// in a row rather than a special case.
-pub fn unquote_word(word: &str, quoting: Quoting) -> String {
-    let posix_escapes = quoting == Quoting::Posix;
-    let mut out = String::with_capacity(word.len());
-    let mut quote: Option<char> = None;
-    let mut chars = word.chars().peekable();
-    while let Some(c) = chars.next() {
-        match (quote, c) {
-            // PowerShell's own seam: inside `'...'` a doubled quote is one
-            // literal quote and closes nothing.
-            (Some('\''), '\'') if quoting == Quoting::PowerShell && chars.peek() == Some(&'\'') => {
-                chars.next();
-                out.push('\'');
-            }
-            (Some(q), _) if c == q => quote = None,
-            // A backslash escapes inside double quotes and outside quotes, but
-            // never inside single ones. A trailing one has nothing to escape
-            // and stands for itself.
-            (Some('"') | None, '\\') if posix_escapes => match chars.next() {
-                Some(next) => out.push(next),
-                None => out.push('\\'),
-            },
-            (Some(_), _) => out.push(c),
-            (None, '\'' | '"') => quote = Some(c),
-            (None, _) => out.push(c),
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -278,29 +227,6 @@ mod tests {
         assert_eq!(quote_for_shell("~weird name", None), "'~weird name'");
     }
 
-    /// An apostrophe is the one character the three dialects disagree about,
-    /// and `C:\Users\O'Brien` is a real Windows home directory. Whatever a
-    /// shell is handed has to be what comes back out of it.
-    #[test]
-    fn unquoting_undoes_what_quoting_did_in_every_dialect() {
-        for shell in [Some("zsh"), Some("powershell.exe"), Some("cmd.exe")] {
-            for path in [
-                "/Users/me/My File (1).txt",
-                "it's here",
-                r"C:\Users\me\My Docs",
-                r"C:\Users\O'Brien\notes.txt",
-                "~/My Documents",
-            ] {
-                let quoted = quote_for_shell(path, shell);
-                assert_eq!(
-                    unquote_word(&quoted, quoting_for(shell)),
-                    path,
-                    "round trip of {path} under {shell:?} (quoted as {quoted})"
-                );
-            }
-        }
-    }
-
     /// PowerShell does not join a quoted string to the bare word beside it, so
     /// the POSIX `'\''` seam is not a seam there — it is three tokens.
     #[test]
@@ -319,30 +245,6 @@ mod tests {
             "\"C:\\Users\\O'Brien\\a.txt\"",
             "cmd.exe quotes with \", so an apostrophe needs nothing"
         );
-    }
-
-    #[test]
-    fn an_unterminated_quote_still_unquotes() {
-        // What completion actually sees: the user is mid-word.
-        assert_eq!(unquote_word("'My Doc", Quoting::Posix), "My Doc");
-        assert_eq!(unquote_word("\"My Doc", Quoting::Cmd), "My Doc");
-    }
-
-    #[test]
-    fn a_hand_typed_backslash_escape_is_honoured_only_where_it_is_one() {
-        assert_eq!(
-            unquote_word(r"My\ Documents", Quoting::Posix),
-            "My Documents"
-        );
-        // On Windows the same bytes are a path, not an escape — this is the
-        // half of the bug that made inline path completion unable to resolve
-        // any directory there.
-        assert_eq!(unquote_word(r"C:\Users\me", Quoting::Cmd), r"C:\Users\me");
-        assert_eq!(
-            unquote_word(r"C:\Users\me", Quoting::PowerShell),
-            r"C:\Users\me"
-        );
-        assert_eq!(unquote_word(r"trailing\", Quoting::Posix), r"trailing\");
     }
 
     #[test]

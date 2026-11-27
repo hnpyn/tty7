@@ -619,99 +619,6 @@ impl CLIAgent {
         Some(tail)
     }
 
-    pub fn accent_rgb(self) -> u32 {
-        match self {
-            CLIAgent::Claude => 0xD97757,
-            CLIAgent::Codex => 0x000000,
-            // The brand mark carries its own green foreground on a black
-            // field, so the surrounding tab avatar needs to stay black too.
-            CLIAgent::TraeCode => 0x000000,
-            CLIAgent::Gemini => 0x4285F4,
-            CLIAgent::Aider => 0x14B014,
-            CLIAgent::Amp => 0xF34E3F,
-            CLIAgent::OpenCode => 0x6E56CF,
-            CLIAgent::Copilot => 0x8957E5,
-            CLIAgent::Cursor => 0x9AA0A6,
-            CLIAgent::Goose => 0x3ECC5F,
-            CLIAgent::Droid => 0xEF6F2E,
-            CLIAgent::Pi => 0x0EA5E9,
-            CLIAgent::Auggie => 0x16A34A,
-            CLIAgent::Hermes => 0x8B5CF6,
-            CLIAgent::Vibe => 0xFA520F,
-            CLIAgent::Antigravity => 0x3186FF,
-            CLIAgent::Grok => 0x000000,
-            CLIAgent::Qwen => 0x6D44E8,
-            CLIAgent::OhMyPi => 0xF97316,
-            // The blue of the flame in Kimi's brand mark; the glyph itself is
-            // black, which Codex and Grok already have covered.
-            CLIAgent::Kimi => 0x027AFF,
-            CLIAgent::QoderCLI => 0xFFFFFF,
-            // qoder-cn ships the same mark on the same black field.
-            CLIAgent::QoderCLICn => 0xFFFFFF,
-            // The blue-violet field Charm ships the Crush heart on.
-            CLIAgent::Crush => 0x6B50FF,
-            CLIAgent::Empryo => 0xE8663D,
-            CLIAgent::Muse => 0x0866FF,
-            CLIAgent::Jcode => 0x111111,
-            CLIAgent::PrimeAgent => 0x111111,
-            // The near-black field CodeBuddy's own app icon sits on.
-            CLIAgent::CodeBuddy => 0x1F1F1F,
-        }
-    }
-
-    /// The colour the agent's mark is drawn in.
-    ///
-    /// SVG assets render as a single-colour mask, so whatever `fill` the file
-    /// carries is thrown away and the colour has to come from here. It lives
-    /// next to [`Self::accent_rgb`] rather than at either draw site because
-    /// there are two of those — the tab avatar and the tray icon — and a mark
-    /// that answers differently depending on which one is asking is the same
-    /// agent wearing two faces.
-    ///
-    /// White for every mark that is a silhouette sitting on its brand colour.
-    /// TraeCode is the one whose mark is the coloured half of the pair, on an
-    /// accent that is deliberately black.
-    pub fn icon_rgb(self) -> u32 {
-        match self {
-            CLIAgent::TraeCode => 0x32F08C,
-            CLIAgent::QoderCLI | CLIAgent::QoderCLICn => 0x000000,
-            _ => 0xFFFFFF,
-        }
-    }
-
-    pub fn icon_path(self) -> &'static str {
-        match self {
-            CLIAgent::Claude => "icons/agents/claude.svg",
-            CLIAgent::Codex => "icons/agents/codex.svg",
-            CLIAgent::TraeCode => "icons/agents/traecli.svg",
-            CLIAgent::Gemini => "icons/agents/gemini.svg",
-            CLIAgent::Amp => "icons/agents/amp.svg",
-            CLIAgent::OpenCode => "icons/agents/opencode.svg",
-            CLIAgent::Copilot => "icons/agents/copilot.svg",
-            CLIAgent::Cursor => "icons/agents/cursor.svg",
-            CLIAgent::Goose => "icons/agents/goose.svg",
-            CLIAgent::Droid => "icons/agents/droid.svg",
-            CLIAgent::Grok => "icons/agents/grok.svg",
-            CLIAgent::Pi => "icons/agents/pi.svg",
-            CLIAgent::OhMyPi => "icons/agents/omp.svg",
-            CLIAgent::Qwen => "icons/agents/qwen.svg",
-            CLIAgent::Kimi => "icons/agents/kimi.svg",
-            CLIAgent::QoderCLI => "icons/agents/qodercli.svg",
-            CLIAgent::QoderCLICn => "icons/agents/qoderclicn.svg",
-            CLIAgent::Crush => "icons/agents/crush.svg",
-            CLIAgent::CodeBuddy => "icons/agents/codebuddy.svg",
-            CLIAgent::Aider
-            | CLIAgent::Auggie
-            | CLIAgent::Hermes
-            | CLIAgent::Vibe
-            | CLIAgent::Antigravity
-            | CLIAgent::Empryo
-            | CLIAgent::PrimeAgent
-            | CLIAgent::Muse
-            | CLIAgent::Jcode => "icons/bot.svg",
-        }
-    }
-
     fn match_token(token: &str) -> Option<CLIAgent> {
         // Muse Code's `muse` launcher execs a versioned binary,
         // `muse-bin-<version>`, so that is the name the process runs under.
@@ -729,69 +636,6 @@ impl CLIAgent {
     /// is detected by, which is the one its installer puts on `PATH`.
     pub fn binary(self) -> &'static str {
         self.aliases()[0]
-    }
-
-    /// The command line a quick launch types for this agent: the user's
-    /// `agent_launch` entry when there is one, the bare binary otherwise.
-    ///
-    /// Keys are matched the way [`CLIAgent::from_slug`] reads them, so a
-    /// hand-written `"Claude"` still counts. A blank entry is no override.
-    pub fn launch_command(self, overrides: &HashMap<String, String>) -> String {
-        overrides
-            .iter()
-            .find(|(slug, _)| CLIAgent::from_slug(slug) == Some(self))
-            .map(|(_, line)| line.trim())
-            .filter(|line| !line.is_empty())
-            .map_or_else(|| self.binary().to_string(), str::to_string)
-    }
-
-    /// The arguments that start an interactive session whose first message is
-    /// `prompt`. `None` for an agent whose positional prompt means a one-shot,
-    /// non-interactive run, or whose form is not known — the caller then
-    /// starts the agent bare rather than guess.
-    pub fn prompt_args(self, prompt: &str) -> Option<Vec<String>> {
-        match self {
-            CLIAgent::Claude | CLIAgent::Codex => Some(vec![prompt.to_string()]),
-            CLIAgent::Gemini => Some(vec!["-i".to_string(), prompt.to_string()]),
-            _ => None,
-        }
-    }
-
-    /// `argv` as a command line worth launching this agent with again: its
-    /// binary followed by the flags it ran with, minus everything that names
-    /// one particular session (a resume, a fork, a session id) and minus
-    /// positional arguments such as a prompt, which belong to that one run.
-    ///
-    /// A run that went through something that does not name the agent — a
-    /// wrapper script mapped by `agent_commands` — cannot be taken apart, so
-    /// it comes back whole: it is what was typed, and it launched the agent.
-    pub fn launch_argv_for_default(self, argv: &[String]) -> Option<Vec<String>> {
-        let env = argv.iter().take_while(|t| is_env_assignment(t)).count();
-        if argv.len() == env {
-            return None;
-        }
-        let Some(tail) = self.session_free_tail(argv) else {
-            return Some(argv.to_vec());
-        };
-        let mut out: Vec<String> = argv[..env].to_vec();
-        out.push(self.binary().to_string());
-        let mut takes_value = false;
-        for t in tail {
-            let is_flag = t.starts_with('-') && t.len() > 1;
-            if is_flag {
-                out.push(t.to_string());
-                takes_value = !t.contains('=');
-            } else if takes_value {
-                out.push(t.to_string());
-                takes_value = false;
-            }
-        }
-        Some(out)
-    }
-
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn detect_from_argv(argv: &[String]) -> Option<CLIAgent> {
-        Self::detect_from_argv_with(argv, &HashMap::new())
     }
 
     pub fn detect_from_argv_with(
@@ -982,52 +826,6 @@ pub fn launch_aliases(overrides: &HashMap<String, String>) -> HashMap<String, St
     out
 }
 
-/// Whether `program` names an executable file, either directly (it has a
-/// directory in it) or through one of the directories in `path`.
-///
-/// On Windows a bare name is also tried with the extensions an npm or winget
-/// install leaves behind, since `claude` there is really `claude.cmd`.
-pub fn program_on_path(program: &str, path: &std::ffi::OsStr) -> bool {
-    let program = program.trim();
-    if program.is_empty() {
-        return false;
-    }
-    if program.contains(['/', '\\']) {
-        // The launch is typed into a shell, which expands a leading `~/`.
-        let home = program
-            .strip_prefix("~/")
-            .and_then(|rest| Some(std::path::PathBuf::from(std::env::var_os("HOME")?).join(rest)));
-        return is_executable(home.as_deref().unwrap_or(std::path::Path::new(program)));
-    }
-    let exts: &[&str] = if cfg!(windows) {
-        &["", ".exe", ".cmd", ".bat", ".ps1"]
-    } else {
-        &[""]
-    };
-    std::env::split_paths(path).any(|dir| {
-        exts.iter()
-            .any(|ext| is_executable(&dir.join(format!("{program}{ext}"))))
-    })
-}
-
-fn is_executable(path: &std::path::Path) -> bool {
-    let Ok(meta) = std::fs::metadata(path) else {
-        return false;
-    };
-    if !meta.is_file() {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        meta.permissions().mode() & 0o111 != 0
-    }
-    #[cfg(not(unix))]
-    {
-        true
-    }
-}
-
 pub const AGENT_EVENT_SENTINEL: &str = "tty7://cli-agent";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1063,10 +861,9 @@ pub struct AgentSessionState {
     #[serde(default)]
     pub turns: u64,
     /// The status was concluded by tty7, not reported by the agent: a turn
-    /// the user interrupted ([`Self::assume_interrupted`]) or one that went
-    /// quiet for too long ([`Self::assume_stale`]). Cleared by the next real
-    /// event, and a tool finishing after it proves the guess wrong and puts
-    /// the turn back on [`AgentStatus::Working`].
+    /// the user interrupted ([`Self::assume_interrupted`]). Cleared by the next
+    /// real event, and a tool finishing after it proves the guess wrong and
+    /// puts the turn back on [`AgentStatus::Working`].
     #[serde(default)]
     pub inferred: bool,
     /// The agent's settings as its hooks last described them. Only Claude
@@ -1114,17 +911,6 @@ impl AgentReadout {
     }
 }
 
-impl AgentStatus {
-    pub fn dot_rgb(self) -> Option<u32> {
-        match self {
-            AgentStatus::Idle => None,
-            AgentStatus::Working => Some(0x3B82F6),
-            AgentStatus::Waiting => Some(0xF59E0B),
-            AgentStatus::Done => Some(0x22C55E),
-        }
-    }
-}
-
 impl AgentSessionState {
     fn default_status() -> AgentStatus {
         AgentStatus::Idle
@@ -1153,18 +939,6 @@ impl AgentSessionState {
         self.inferred = true;
     }
 
-    /// Give up on a turn that has gone silent for longer than any real one
-    /// stays quiet. Idle rather than Done: nothing says it finished, only
-    /// that nothing says it is still going.
-    pub fn assume_stale(&mut self) {
-        if self.status != AgentStatus::Working {
-            return;
-        }
-        self.status = AgentStatus::Idle;
-        self.message = None;
-        self.inferred = true;
-    }
-
     /// Stamp [`Self::since_ms`] when the status is no longer the one it was
     /// `before` the caller changed anything. Kept out of the transitions
     /// themselves so they stay free of the clock; the daemon, the one place
@@ -1173,13 +947,6 @@ impl AgentSessionState {
         if before != Some(self.status) {
             self.since_ms = Some(now_ms);
         }
-    }
-
-    /// How long the session has held its status, in seconds, by `now_ms`.
-    /// Never negative: a remote daemon's clock can run ahead of this one.
-    pub fn status_age_secs(&self, now_ms: u64) -> Option<u64> {
-        self.since_ms
-            .map(|since| now_ms.saturating_sub(since) / 1000)
     }
 
     pub fn apply_event(&mut self, ev: &AgentEvent) {
@@ -1383,31 +1150,43 @@ mod tests {
     #[test]
     fn detects_native_binaries() {
         assert_eq!(
-            CLIAgent::detect_from_argv(&argv(&["claude"])),
+            CLIAgent::detect_from_argv_with(&argv(&["claude"]), &std::collections::HashMap::new()),
             Some(CLIAgent::Claude)
         );
         assert_eq!(
-            CLIAgent::detect_from_argv(&argv(&["/opt/homebrew/bin/codex", "--model", "o3"])),
+            CLIAgent::detect_from_argv_with(
+                &argv(&["/opt/homebrew/bin/codex", "--model", "o3"]),
+                &std::collections::HashMap::new()
+            ),
             Some(CLIAgent::Codex)
         );
         assert_eq!(
-            CLIAgent::detect_from_argv(&argv(&["/Users/me/.local/bin/traecli"])),
+            CLIAgent::detect_from_argv_with(
+                &argv(&["/Users/me/.local/bin/traecli"]),
+                &std::collections::HashMap::new()
+            ),
             Some(CLIAgent::TraeCode)
         );
         assert_eq!(
-            CLIAgent::detect_from_argv(&argv(&["traex"])),
+            CLIAgent::detect_from_argv_with(&argv(&["traex"]), &std::collections::HashMap::new()),
             Some(CLIAgent::TraeCode)
         );
         assert_eq!(
-            CLIAgent::detect_from_argv(&argv(&["/usr/local/bin/gemini"])),
+            CLIAgent::detect_from_argv_with(
+                &argv(&["/usr/local/bin/gemini"]),
+                &std::collections::HashMap::new()
+            ),
             Some(CLIAgent::Gemini)
         );
         assert_eq!(
-            CLIAgent::detect_from_argv(&argv(&["cursor-agent"])),
+            CLIAgent::detect_from_argv_with(
+                &argv(&["cursor-agent"]),
+                &std::collections::HashMap::new()
+            ),
             Some(CLIAgent::Cursor)
         );
         assert_eq!(
-            CLIAgent::detect_from_argv(&argv(&["claude/"])),
+            CLIAgent::detect_from_argv_with(&argv(&["claude/"]), &std::collections::HashMap::new()),
             Some(CLIAgent::Claude)
         );
     }
@@ -1415,7 +1194,10 @@ mod tests {
     #[test]
     fn strips_leading_env_assignments() {
         assert_eq!(
-            CLIAgent::detect_from_argv(&argv(&["FOO=1", "BAR=baz", "claude"])),
+            CLIAgent::detect_from_argv_with(
+                &argv(&["FOO=1", "BAR=baz", "claude"]),
+                &std::collections::HashMap::new()
+            ),
             Some(CLIAgent::Claude)
         );
     }
@@ -1423,10 +1205,13 @@ mod tests {
     #[test]
     fn detects_node_wrapped_claude_by_package_dir() {
         assert_eq!(
-            CLIAgent::detect_from_argv(&argv(&[
-                "node",
-                "/Users/x/.npm/_npx/node_modules/@anthropic-ai/claude-code/cli.js",
-            ])),
+            CLIAgent::detect_from_argv_with(
+                &argv(&[
+                    "node",
+                    "/Users/x/.npm/_npx/node_modules/@anthropic-ai/claude-code/cli.js",
+                ]),
+                &std::collections::HashMap::new()
+            ),
             Some(CLIAgent::Claude)
         );
     }
@@ -1445,12 +1230,18 @@ mod tests {
             "/opt/homebrew/bin/qodercli",
         ] {
             assert_eq!(
-                CLIAgent::detect_from_argv(&argv(&["node", launcher])),
+                CLIAgent::detect_from_argv_with(
+                    &argv(&["node", launcher]),
+                    &std::collections::HashMap::new()
+                ),
                 Some(CLIAgent::QoderCLI),
                 "on {launcher}"
             );
             assert_eq!(
-                CLIAgent::detect_from_argv(&argv(&[launcher])),
+                CLIAgent::detect_from_argv_with(
+                    &argv(&[launcher]),
+                    &std::collections::HashMap::new()
+                ),
                 Some(CLIAgent::QoderCLI),
                 "on {launcher}"
             );
@@ -1468,14 +1259,17 @@ mod tests {
             "/c/Users/me/.qoder-cn/entry/qodercn.cmd",
         ] {
             assert_eq!(
-                CLIAgent::detect_from_argv(&argv(&[launcher])),
+                CLIAgent::detect_from_argv_with(
+                    &argv(&[launcher]),
+                    &std::collections::HashMap::new()
+                ),
                 Some(CLIAgent::QoderCLICn),
                 "on {launcher}"
             );
         }
         for other in ["qoder", "qodercli"] {
             assert_eq!(
-                CLIAgent::detect_from_argv(&argv(&[other])),
+                CLIAgent::detect_from_argv_with(&argv(&[other]), &std::collections::HashMap::new()),
                 Some(CLIAgent::QoderCLI),
                 "the global build keeps {other}"
             );
@@ -1498,12 +1292,18 @@ mod tests {
             "/usr/local/bin/cbc",
         ] {
             assert_eq!(
-                CLIAgent::detect_from_argv(&argv(&["node", launcher])),
+                CLIAgent::detect_from_argv_with(
+                    &argv(&["node", launcher]),
+                    &std::collections::HashMap::new()
+                ),
                 Some(CLIAgent::CodeBuddy),
                 "on {launcher}"
             );
             assert_eq!(
-                CLIAgent::detect_from_argv(&argv(&[launcher])),
+                CLIAgent::detect_from_argv_with(
+                    &argv(&[launcher]),
+                    &std::collections::HashMap::new()
+                ),
                 Some(CLIAgent::CodeBuddy),
                 "on {launcher}"
             );
@@ -1518,11 +1318,17 @@ mod tests {
     #[test]
     fn detects_npx_package_form() {
         assert_eq!(
-            CLIAgent::detect_from_argv(&argv(&["npx", "@anthropic-ai/claude-code"])),
+            CLIAgent::detect_from_argv_with(
+                &argv(&["npx", "@anthropic-ai/claude-code"]),
+                &std::collections::HashMap::new()
+            ),
             Some(CLIAgent::Claude)
         );
         assert_eq!(
-            CLIAgent::detect_from_argv(&argv(&["npx", "@google/gemini-cli"])),
+            CLIAgent::detect_from_argv_with(
+                &argv(&["npx", "@google/gemini-cli"]),
+                &std::collections::HashMap::new()
+            ),
             Some(CLIAgent::Gemini)
         );
     }
@@ -1530,10 +1336,13 @@ mod tests {
     #[test]
     fn detects_python_wrapped_aider() {
         assert_eq!(
-            CLIAgent::detect_from_argv(&argv(&[
-                "python3",
-                "/usr/lib/python3.12/site-packages/aider/__main__.py",
-            ])),
+            CLIAgent::detect_from_argv_with(
+                &argv(&[
+                    "python3",
+                    "/usr/lib/python3.12/site-packages/aider/__main__.py",
+                ]),
+                &std::collections::HashMap::new()
+            ),
             Some(CLIAgent::Aider)
         );
     }
@@ -1541,24 +1350,45 @@ mod tests {
     #[test]
     fn non_interpreter_does_not_match_on_arguments() {
         assert_eq!(
-            CLIAgent::detect_from_argv(&argv(&["cat", "codex.md"])),
+            CLIAgent::detect_from_argv_with(
+                &argv(&["cat", "codex.md"]),
+                &std::collections::HashMap::new()
+            ),
             None
         );
         assert_eq!(
-            CLIAgent::detect_from_argv(&argv(&["vim", "claude-code/notes.txt"])),
+            CLIAgent::detect_from_argv_with(
+                &argv(&["vim", "claude-code/notes.txt"]),
+                &std::collections::HashMap::new()
+            ),
             None
         );
-        assert_eq!(CLIAgent::detect_from_argv(&argv(&["less", "aider"])), None);
+        assert_eq!(
+            CLIAgent::detect_from_argv_with(
+                &argv(&["less", "aider"]),
+                &std::collections::HashMap::new()
+            ),
+            None
+        );
     }
 
     #[test]
     fn unrelated_commands_are_none() {
-        assert_eq!(CLIAgent::detect_from_argv(&argv(&["zsh"])), None);
         assert_eq!(
-            CLIAgent::detect_from_argv(&argv(&["node", "server.js"])),
+            CLIAgent::detect_from_argv_with(&argv(&["zsh"]), &std::collections::HashMap::new()),
             None
         );
-        assert_eq!(CLIAgent::detect_from_argv(&argv(&[])), None);
+        assert_eq!(
+            CLIAgent::detect_from_argv_with(
+                &argv(&["node", "server.js"]),
+                &std::collections::HashMap::new()
+            ),
+            None
+        );
+        assert_eq!(
+            CLIAgent::detect_from_argv_with(&argv(&[]), &std::collections::HashMap::new()),
+            None
+        );
     }
 
     #[test]
@@ -1566,48 +1396,20 @@ mod tests {
         for a in CLIAgent::ALL {
             assert!(!a.display_name().is_empty());
             assert!(!a.aliases().is_empty());
-            assert!(a.accent_rgb() <= 0xFFFFFF);
             assert_eq!(CLIAgent::from_slug(a.slug()), Some(a));
         }
     }
 
+    /// `binary()` is the name detection has to recognise, for every agent.
     #[test]
-    fn black_branded_avatars_keep_their_brand_field() {
-        assert_eq!(CLIAgent::Codex.accent_rgb(), 0x000000);
-        assert_eq!(CLIAgent::Grok.accent_rgb(), 0x000000);
-    }
-
-    #[test]
-    fn only_the_unbranded_agents_use_the_fallback_glyph() {
-        let fallback: Vec<&str> = CLIAgent::ALL
-            .into_iter()
-            .filter(|a| a.icon_path() == "icons/bot.svg")
-            .map(CLIAgent::slug)
-            .collect();
-        assert_eq!(
-            fallback,
-            [
-                "aider",
-                "auggie",
-                "hermes",
-                "vibe",
-                "antigravity",
-                "empryo",
-                "prime-agent",
-                "muse",
-                "jcode"
-            ]
-        );
-        assert!(
-            !fallback.contains(&"omp"),
-            "Oh My Pi ships its own mark and must not fall back"
-        );
-        for a in CLIAgent::ALL {
-            let path = a.icon_path();
-            assert!(
-                path == "icons/bot.svg" || path == format!("icons/agents/{}.svg", a.slug()),
-                "{} points at an unexpected {path}",
-                a.display_name()
+    fn every_agent_is_detected_from_its_binary() {
+        for agent in CLIAgent::ALL {
+            let argv = command_argv(agent.binary());
+            assert_eq!(
+                CLIAgent::detect_from_argv_with(&argv, &std::collections::HashMap::new()),
+                Some(agent),
+                "{agent:?} binary {:?} is not a name detection knows",
+                agent.binary()
             );
         }
     }
@@ -1615,19 +1417,25 @@ mod tests {
     #[test]
     fn muse_and_jcode_are_detected_and_resume() {
         assert_eq!(
-            CLIAgent::detect_from_argv(&argv(&["muse", "--yolo"])),
+            CLIAgent::detect_from_argv_with(
+                &argv(&["muse", "--yolo"]),
+                &std::collections::HashMap::new()
+            ),
             Some(CLIAgent::Muse)
         );
         // The `muse` launcher execs a versioned binary.
         assert_eq!(
-            CLIAgent::detect_from_argv(&argv(&[
-                "/home/me/.local/share/muse/muse-bin-1.4.2",
-                "--yolo"
-            ])),
+            CLIAgent::detect_from_argv_with(
+                &argv(&["/home/me/.local/share/muse/muse-bin-1.4.2", "--yolo"]),
+                &std::collections::HashMap::new()
+            ),
             Some(CLIAgent::Muse)
         );
         assert_eq!(
-            CLIAgent::detect_from_argv(&argv(&["/home/me/.jcode/builds/stable/jcode"])),
+            CLIAgent::detect_from_argv_with(
+                &argv(&["/home/me/.jcode/builds/stable/jcode"]),
+                &std::collections::HashMap::new()
+            ),
             Some(CLIAgent::Jcode)
         );
         assert_eq!(CLIAgent::from_slug("muse"), Some(CLIAgent::Muse));
@@ -1663,15 +1471,17 @@ mod tests {
     #[test]
     fn empryo_and_prime_agent_are_detected_and_resume() {
         assert_eq!(
-            CLIAgent::detect_from_argv(&argv(&[
-                "/home/me/.empryo/bin/empryo",
-                "--session",
-                "750adff9"
-            ])),
+            CLIAgent::detect_from_argv_with(
+                &argv(&["/home/me/.empryo/bin/empryo", "--session", "750adff9"]),
+                &std::collections::HashMap::new()
+            ),
             Some(CLIAgent::Empryo)
         );
         assert_eq!(
-            CLIAgent::detect_from_argv(&argv(&["prime-agent", "--model", "x"])),
+            CLIAgent::detect_from_argv_with(
+                &argv(&["prime-agent", "--model", "x"]),
+                &std::collections::HashMap::new()
+            ),
             Some(CLIAgent::PrimeAgent)
         );
         assert_eq!(CLIAgent::from_slug("empryo"), Some(CLIAgent::Empryo));
@@ -1726,7 +1536,10 @@ mod tests {
             ("crush", CLIAgent::Crush),
             ("/opt/homebrew/bin/crush", CLIAgent::Crush),
         ] {
-            assert_eq!(CLIAgent::detect_from_argv(&argv(&[cmd])), Some(agent));
+            assert_eq!(
+                CLIAgent::detect_from_argv_with(&argv(&[cmd]), &std::collections::HashMap::new()),
+                Some(agent)
+            );
         }
     }
 
@@ -1735,16 +1548,15 @@ mod tests {
     #[test]
     fn oh_my_pi_and_pi_stay_distinct() {
         assert_eq!(
-            CLIAgent::detect_from_argv(&argv(&["omp"])),
+            CLIAgent::detect_from_argv_with(&argv(&["omp"]), &std::collections::HashMap::new()),
             Some(CLIAgent::OhMyPi)
         );
         assert_eq!(
-            CLIAgent::detect_from_argv(&argv(&["pi"])),
+            CLIAgent::detect_from_argv_with(&argv(&["pi"]), &std::collections::HashMap::new()),
             Some(CLIAgent::Pi)
         );
         assert_eq!(CLIAgent::from_slug("omp"), Some(CLIAgent::OhMyPi));
         assert_eq!(CLIAgent::from_slug("oh-my-pi"), None);
-        assert_ne!(CLIAgent::Pi.icon_path(), CLIAgent::OhMyPi.icon_path());
     }
 
     #[test]
@@ -2046,38 +1858,6 @@ mod tests {
     }
 
     #[test]
-    fn a_stale_turn_goes_idle_and_comes_back_on_the_next_tool() {
-        let ev = |kind| AgentEvent {
-            agent: Some(CLIAgent::Claude),
-            kind,
-            session_id: None,
-            message: None,
-            cwd: None,
-            source: None,
-            readout: Default::default(),
-        };
-
-        let mut s = AgentSessionState::default();
-        s.apply_event(&ev(AgentEventKind::PromptSubmit));
-        s.apply_event(&ev(AgentEventKind::PermissionRequest));
-        s.assume_stale();
-        assert_eq!(
-            s.status,
-            AgentStatus::Waiting,
-            "a prompt nobody answered is not stale"
-        );
-
-        s.apply_event(&ev(AgentEventKind::ToolComplete));
-        s.assume_stale();
-        assert_eq!(s.status, AgentStatus::Idle);
-        assert_eq!(s.turns, 0, "going quiet is not finishing");
-        assert!(s.inferred);
-
-        s.apply_event(&ev(AgentEventKind::ToolComplete));
-        assert_eq!(s.status, AgentStatus::Working);
-    }
-
-    #[test]
     fn a_session_state_from_an_older_daemon_is_not_inferred() {
         let s: AgentSessionState = serde_json::from_str(r#"{"status":"done"}"#).unwrap();
         assert!(!s.inferred);
@@ -2100,9 +1880,6 @@ mod tests {
         s.status = AgentStatus::Waiting;
         s.note_transition(Some(AgentStatus::Working), 9_000);
         assert_eq!(s.since_ms, Some(9_000));
-        assert_eq!(s.status_age_secs(189_000), Some(180));
-        // A daemon clock ahead of ours reads as just now, not as a wrap.
-        assert_eq!(s.status_age_secs(8_000), Some(0));
     }
 
     #[test]
@@ -3000,25 +2777,20 @@ mod tests {
     #[test]
     fn the_python_easter_egg_is_not_a_coding_agent() {
         assert_eq!(
-            CLIAgent::detect_from_argv(&argv(&["python3", "-m", "antigravity"])),
+            CLIAgent::detect_from_argv_with(
+                &argv(&["python3", "-m", "antigravity"]),
+                &std::collections::HashMap::new()
+            ),
             None
         );
         assert_eq!(
-            CLIAgent::detect_from_argv(&argv(&["agy"])),
+            CLIAgent::detect_from_argv_with(&argv(&["agy"]), &std::collections::HashMap::new()),
             Some(CLIAgent::Antigravity)
         );
     }
 
     #[test]
     fn status_metadata_is_consistent() {
-        assert_eq!(AgentStatus::Idle.dot_rgb(), None);
-        for st in [
-            AgentStatus::Working,
-            AgentStatus::Waiting,
-            AgentStatus::Done,
-        ] {
-            assert!(st.dot_rgb().is_some());
-        }
         assert_eq!(
             serde_json::to_string(&AgentStatus::Waiting).unwrap(),
             "\"waiting\""
@@ -3030,44 +2802,6 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect()
-    }
-
-    #[test]
-    fn a_launch_is_the_bare_binary_unless_overridden() {
-        let none = HashMap::new();
-        assert_eq!(CLIAgent::Claude.launch_command(&none), "claude");
-        assert_eq!(CLIAgent::Codex.launch_command(&none), "codex");
-        assert_eq!(CLIAgent::Cursor.launch_command(&none), "cursor-agent");
-        assert_eq!(CLIAgent::Antigravity.launch_command(&none), "agy");
-        assert_eq!(CLIAgent::QoderCLI.launch_command(&none), "qoder");
-
-        let set = overrides(&[
-            ("claude", "  claude --dangerously-skip-permissions "),
-            // Keys are read the way `from_slug` reads them.
-            ("Codex", "codex --model o3"),
-            // A blank entry is no override at all.
-            ("gemini", "   "),
-        ]);
-        assert_eq!(
-            CLIAgent::Claude.launch_command(&set),
-            "claude --dangerously-skip-permissions"
-        );
-        assert_eq!(CLIAgent::Codex.launch_command(&set), "codex --model o3");
-        assert_eq!(CLIAgent::Gemini.launch_command(&set), "gemini");
-        assert_eq!(CLIAgent::Aider.launch_command(&set), "aider");
-    }
-
-    #[test]
-    fn every_agent_launches_as_a_name_it_is_detected_by() {
-        let none = HashMap::new();
-        for agent in CLIAgent::ALL {
-            let argv = command_argv(&agent.launch_command(&none));
-            assert_eq!(
-                CLIAgent::detect_from_argv(&argv),
-                Some(agent),
-                "{agent:?} would launch as something detection does not know"
-            );
-        }
     }
 
     #[test]
@@ -3111,73 +2845,5 @@ mod tests {
             ),
             None
         );
-    }
-
-    #[test]
-    fn launch_args_drop_the_session_and_the_prompt_but_keep_the_flags() {
-        assert_eq!(
-            CLIAgent::Claude.launch_argv_for_default(&argv(&[
-                "node",
-                "/opt/homebrew/lib/node_modules/@anthropic-ai/claude-code/cli.js",
-                "--model",
-                "opus",
-                "--resume",
-                "abc-123",
-                "--append-system-prompt",
-                "be terse",
-                "fix the bug",
-            ])),
-            Some(argv(&[
-                "claude",
-                "--model",
-                "opus",
-                "--append-system-prompt",
-                "be terse",
-            ]))
-        );
-        assert_eq!(
-            CLIAgent::Codex.launch_argv_for_default(&argv(&[
-                "codex",
-                "resume",
-                "019a",
-                "--model=o3",
-                "prompt",
-            ])),
-            Some(argv(&["codex", "--model=o3"]))
-        );
-        // A wrapper cannot be taken apart; what was typed is what launched it.
-        assert_eq!(
-            CLIAgent::Claude.launch_argv_for_default(&argv(&["cc", "--fast", "x"])),
-            Some(argv(&["cc", "--fast", "x"]))
-        );
-        assert_eq!(CLIAgent::Claude.launch_argv_for_default(&[]), None);
-    }
-
-    #[test]
-    fn program_on_path_finds_only_executables() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let bin = dir.path().join("claude");
-        std::fs::write(&bin, "#!/bin/sh\n").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::write(dir.path().join("codex"), "not executable").unwrap();
-            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
-            assert!(!program_on_path("codex", dir.path().as_os_str()));
-        }
-        std::fs::create_dir(dir.path().join("gemini")).unwrap();
-        let path =
-            std::env::join_paths([std::path::Path::new("/nonexistent"), dir.path()]).unwrap();
-        assert!(program_on_path("claude", &path));
-        assert!(
-            !program_on_path("gemini", &path),
-            "a directory is not a program"
-        );
-        assert!(!program_on_path("aider", &path));
-        assert!(program_on_path(
-            bin.to_str().unwrap(),
-            std::ffi::OsStr::new("")
-        ));
-        assert!(!program_on_path("", &path));
     }
 }

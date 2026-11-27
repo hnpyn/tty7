@@ -108,7 +108,6 @@ mod tests {
         let theirs: gpui::FontFeatures = serde_json::from_str(JSON).unwrap();
 
         assert_eq!(ours.tag_value_list(), theirs.tag_value_list());
-        assert_eq!(ours.is_calt_enabled(), theirs.is_calt_enabled());
         assert_eq!(
             serde_json::to_string(&ours).unwrap(),
             serde_json::to_string(&theirs).unwrap()

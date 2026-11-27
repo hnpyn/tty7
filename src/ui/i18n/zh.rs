@@ -75,7 +75,6 @@ pub fn translate_zh(key: L10nKey) -> Option<&'static str> {
         L10nKey::ComposerEffortTip => "推理强度  ·  点击切换",
         L10nKey::AppMenuMinimize => "最小化",
         L10nKey::AppMenuZoom => "缩放",
-        L10nKey::PaneTitleProcessExited => "{title} — 进程已退出",
         L10nKey::ShellFellBack => "配置的 shell {shell} 启动失败，已改用登录 shell。",
         L10nKey::ShellCouldNotStart => "无法启动终端：{error}",
         L10nKey::ShellCouldNotStartTitle => "ntty7 无法启动终端",

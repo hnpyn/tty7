@@ -79,7 +79,6 @@ pub fn translate_ru(key: L10nKey) -> Option<&'static str> {
         L10nKey::ComposerEffortTip => "Глубина рассуждений · нажмите, чтобы сменить",
         L10nKey::AppMenuMinimize => "Свернуть",
         L10nKey::AppMenuZoom => "Изменить масштаб",
-        L10nKey::PaneTitleProcessExited => "{title}: процесс завершён",
         L10nKey::ShellFellBack => {
             "Настроенная оболочка {shell} не запустилась. Используется оболочка входа."
         }

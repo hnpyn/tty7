@@ -44,22 +44,6 @@ impl GitignoreChain {
         }
         state
     }
-
-    pub fn absorb(&mut self, other: Self) {
-        self.matchers.extend(other.matchers);
-    }
-
-    pub fn clear(&mut self) {
-        self.matchers.clear();
-    }
-
-    pub fn len(&self) -> usize {
-        self.matchers.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.matchers.is_empty()
-    }
 }
 
 #[cfg(test)]
@@ -102,26 +86,6 @@ mod tests {
         let mut chain = GitignoreChain::default();
         assert!(chain.is_ignored(&root.join("build"), true, &root));
         assert!(!chain.is_ignored(&root.join("build"), false, &root));
-
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn clear_lets_an_edited_gitignore_take_effect() {
-        let root = scratch("clear");
-        write_ignore(&root, "*.log\n");
-
-        let mut chain = GitignoreChain::default();
-        assert!(chain.is_ignored(&root.join("a.log"), false, &root));
-
-        write_ignore(&root, "*.tmp\n");
-        assert!(
-            chain.is_ignored(&root.join("a.log"), false, &root),
-            "cached"
-        );
-        chain.clear();
-        assert!(!chain.is_ignored(&root.join("a.log"), false, &root));
-        assert!(chain.is_ignored(&root.join("a.tmp"), false, &root));
 
         let _ = std::fs::remove_dir_all(&root);
     }

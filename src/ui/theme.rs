@@ -371,35 +371,6 @@ pub(crate) fn windows_background_appearance(
     }
 }
 
-/// The backdrop presets actually worth offering on a given Windows build.
-/// Mica, Mica Alt and native acrylic all need Windows 11 22H2 (22621); below
-/// that every one of them collapses onto the same classic WCA blur that
-/// `Blur` already offers, so listing them would present several choices that
-/// render identically — hiding them beats misrepresenting them. Below 1809
-/// (17763) there is no blur API at all, so only plain translucency is left.
-/// Pure function so the table is unit-testable on every platform.
-#[cfg(test)]
-pub(crate) fn supported_backdrops_for(build: u32) -> &'static [WindowBackdrop] {
-    if build >= 22_621 {
-        &[
-            WindowBackdrop::Auto,
-            WindowBackdrop::Blur,
-            WindowBackdrop::Mica,
-            WindowBackdrop::MicaAlt,
-            WindowBackdrop::Acrylic,
-            WindowBackdrop::Off,
-        ]
-    } else if build >= 17_763 {
-        &[
-            WindowBackdrop::Auto,
-            WindowBackdrop::Blur,
-            WindowBackdrop::Off,
-        ]
-    } else {
-        &[WindowBackdrop::Auto, WindowBackdrop::Off]
-    }
-}
-
 #[cfg(target_os = "windows")]
 pub(crate) fn windows_build_number() -> u32 {
     static BUILD: OnceLock<u32> = OnceLock::new();
@@ -1284,65 +1255,5 @@ mod tests {
                 "{backdrop:?} with blur off should resolve to Transparent"
             );
         }
-    }
-
-    #[test]
-    fn supported_backdrops_follow_the_build() {
-        use crate::core::config::WindowBackdrop;
-        assert_eq!(
-            supported_backdrops_for(22_621),
-            &[
-                WindowBackdrop::Auto,
-                WindowBackdrop::Blur,
-                WindowBackdrop::Mica,
-                WindowBackdrop::MicaAlt,
-                WindowBackdrop::Acrylic,
-                WindowBackdrop::Off,
-            ]
-        );
-        // Pre-22H2: Mica, Mica Alt and Acrylic all collapse onto the very
-        // same classic WCA blur that `Blur` already offers, so the dropdown
-        // hides them rather than listing choices that render identically.
-        assert_eq!(
-            supported_backdrops_for(22_620),
-            &[
-                WindowBackdrop::Auto,
-                WindowBackdrop::Blur,
-                WindowBackdrop::Off,
-            ]
-        );
-        assert_eq!(
-            supported_backdrops_for(17_763),
-            &[
-                WindowBackdrop::Auto,
-                WindowBackdrop::Blur,
-                WindowBackdrop::Off,
-            ]
-        );
-        // Every offered preset must resolve to a distinct appearance, or the
-        // dropdown is promising a difference the window cannot deliver.
-        // `Auto` is exempt: it has no fixed appearance of its own, it mirrors
-        // whichever way the blur toggle happens to be set.
-        for build in [22_621, 22_620, 17_763, 17_762] {
-            let offered: Vec<_> = supported_backdrops_for(build)
-                .iter()
-                .copied()
-                .filter(|b| *b != WindowBackdrop::Auto)
-                .collect();
-            for (i, a) in offered.iter().enumerate() {
-                for b in &offered[i + 1..] {
-                    assert_ne!(
-                        windows_background_appearance(*a, false, build),
-                        windows_background_appearance(*b, false, build),
-                        "build {build}: {a:?} and {b:?} render identically"
-                    );
-                }
-            }
-        }
-        // Below 1809 there is no blur API at all; only plain translucency.
-        assert_eq!(
-            supported_backdrops_for(17_762),
-            &[WindowBackdrop::Auto, WindowBackdrop::Off]
-        );
     }
 }
