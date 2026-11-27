@@ -24,17 +24,15 @@ impl AssetSource for Assets {
 
 /// Art this window draws itself, in place of gpui-component's stock glyph.
 ///
-/// `IconName::{Plus, Folder, File, Github}` and the composer paths
-/// `icons/file.svg` / `icons/image.svg` load through here. `image.svg` is not
-/// in the stock set, so dropping it would make that path resolve to nothing.
-/// Every other name falls through to stock.
+/// `IconName::Plus` and the composer paths `icons/file.svg` /
+/// `icons/image.svg` load through here. `image.svg` is not in the stock set,
+/// so dropping it would make that path resolve to nothing. Every other name
+/// falls through to stock.
 fn bundled_icon(path: &str) -> Option<&'static [u8]> {
     let bytes: &'static [u8] = match path {
         "icons/plus.svg" => include_bytes!("../../assets/icons/plus.svg"),
-        "icons/folder.svg" => include_bytes!("../../assets/icons/folder.svg"),
         "icons/file.svg" => include_bytes!("../../assets/icons/file.svg"),
         "icons/image.svg" => include_bytes!("../../assets/icons/image.svg"),
-        "icons/github.svg" => include_bytes!("../../assets/icons/github.svg"),
         _ => return None,
     };
     Some(bytes)
@@ -46,7 +44,7 @@ mod tests {
 
     #[test]
     fn stock_prefix_bypasses_the_overrides() {
-        for name in ["plus", "folder"] {
+        for name in ["plus", "file"] {
             let overridden = Assets
                 .load(&format!("icons/{name}.svg"))
                 .unwrap()
@@ -156,7 +154,7 @@ mod tests {
         // land at the same optical density; SF Symbols compensates `plus`
         // against `sidebar.left` the same way.
         const OPEN_FORM: f32 = 7. / 6.;
-        let family: f32 = attr(&glyph("folder"), "stroke-width").parse().unwrap();
+        let family: f32 = attr(&glyph("file"), "stroke-width").parse().unwrap();
         let want = family * OPEN_FORM;
         assert!(
             (stroke - want).abs() < 0.01,

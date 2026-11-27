@@ -2474,7 +2474,6 @@ fn apply_signals(st: &mut PaneState, signals: SniffSignals) {
             DaemonMsg::Prompt {
                 active: shell.active,
                 at_prompt: shell.at_prompt,
-                last_exit: shell.last_exit_code,
             },
         );
     }
@@ -2662,10 +2661,7 @@ fn suppress_relayed_prompt_marks(shell: &mut Vec<ShellState>) {
         s.at_prompt = false;
     }
     shell.dedup_by(|a, b| {
-        let same = a.active == b.active
-            && a.at_prompt == b.at_prompt
-            && a.last_exit_code == b.last_exit_code
-            && a.command == b.command;
+        let same = a.active == b.active && a.at_prompt == b.at_prompt && a.command == b.command;
         // `dedup_by` keeps `b`, the earlier of the pair, and drops `a`. Move
         // the reading over first so the collapse costs a `Prompt` message and
         // nothing else.
@@ -3063,7 +3059,6 @@ struct ShellState {
     /// read about the far one. Keeping both means neither answer has to be
     /// derived from the other's.
     mark_at_prompt: bool,
-    last_exit_code: Option<i32>,
     command: Option<String>,
 }
 
@@ -3163,12 +3158,11 @@ fn handle_osc133(shell: &mut ShellState, rest: &[u8]) -> bool {
                 .filter(|s| !s.trim().is_empty());
         }
         Some(b'D') => {
+            // The optional status (`133;D;130`) is not stored. The mark
+            // itself — back at the prompt, command cleared — is the
+            // command-finished signal.
             shell.at_prompt = true;
             shell.command = None;
-            shell.last_exit_code = rest
-                .strip_prefix(b"D;")
-                .and_then(|c| std::str::from_utf8(c).ok())
-                .and_then(|s| s.trim().parse::<i32>().ok());
         }
         _ => return false,
     }
@@ -3963,12 +3957,21 @@ mod tests {
         assert!(b.shell.last().unwrap().active);
         assert!(b.shell.last().unwrap().at_prompt);
 
-        let c = s.feed(b"\x1b]133;C\x07");
+        let c = s.feed(b"\x1b]133;C;sleep%201\x07");
         assert!(!c.shell.last().unwrap().at_prompt);
+        assert_eq!(
+            c.shell.last().unwrap().command.as_deref(),
+            Some("sleep 1"),
+            "the C mark is the command that is running"
+        );
 
         let d = s.feed(b"\x1b]133;D;130\x07");
         assert!(d.shell.last().unwrap().at_prompt);
-        assert_eq!(d.shell.last().unwrap().last_exit_code, Some(130));
+        assert_eq!(
+            d.shell.last().unwrap().command,
+            None,
+            "the D mark clears the command it finishes"
+        );
     }
 
     #[test]
@@ -3984,7 +3987,6 @@ mod tests {
             vec![false, true],
             "the chunk must report leaving the prompt and coming back, not just the end state"
         );
-        assert_eq!(sig.shell.last().unwrap().last_exit_code, Some(0));
         assert_eq!(sig.shell.last().unwrap().command, None);
     }
 
@@ -3994,7 +3996,7 @@ mod tests {
         let sig = s.feed(b"\x1b]133;D;3\x07\x1b]133;A\x07\x1b]133;B\x07");
         assert_eq!(sig.shell.len(), 1, "D/A/B is one at-prompt state");
         assert!(sig.shell[0].at_prompt);
-        assert_eq!(sig.shell[0].last_exit_code, Some(3));
+        assert_eq!(sig.shell[0].command, None);
     }
 
     #[test]
@@ -4319,18 +4321,22 @@ mod tests {
         assert!(hex_val(b'/').is_none());
     }
 
+    /// `133;D` is "the command finished", with or without a status token.
+    /// The status itself is not kept.
     #[test]
-    fn osc133_exit_code_parsing() {
+    fn a_d_mark_returns_to_the_prompt_with_or_without_a_status() {
         let mut s = OscSniffer::new();
-        let d = s.feed(b"\x1b]133;D\x07");
-        assert!(d.shell.last().unwrap().at_prompt);
-        assert_eq!(d.shell.last().unwrap().last_exit_code, None);
-
-        let d = s.feed(b"\x1b]133;D;oops\x07");
-        assert_eq!(d.shell.last().unwrap().last_exit_code, None);
-
-        let d = s.feed(b"\x1b]133;D;-1\x07");
-        assert_eq!(d.shell.last().unwrap().last_exit_code, Some(-1));
+        for payload in [
+            &b"\x1b]133;D\x07"[..],
+            &b"\x1b]133;D;oops\x07"[..],
+            &b"\x1b]133;D;-1\x07"[..],
+        ] {
+            s.feed(b"\x1b]133;C;ls\x07");
+            let d = s.feed(payload);
+            let shell = d.shell.last().unwrap();
+            assert!(shell.at_prompt, "{}", String::from_utf8_lossy(payload));
+            assert_eq!(shell.command, None);
+        }
     }
 
     /// A discard writer for `spawn_reader` tests that don't inspect the PTY
@@ -6203,14 +6209,12 @@ mod tests {
                     active: true,
                     at_prompt: true,
                     mark_at_prompt: true,
-                    last_exit_code: Some(0),
                     command: None,
                 }],
                 ..SniffSignals::default()
             },
         );
         assert!(st.shell.active && st.shell.at_prompt);
-        assert_eq!(st.shell.last_exit_code, Some(0));
 
         apply_signals(&mut st, SniffSignals::default());
         assert_eq!(st.cwd, Some(PathBuf::from("/tmp/x")));

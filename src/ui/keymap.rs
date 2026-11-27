@@ -1071,6 +1071,16 @@ mod tests {
         }
     }
 
+    /// `f1`..=`f24` — gpui's names for the function keys, the key name alone.
+    /// A modifier does not change it (`shift-f3` is still `f3`). F13 and up
+    /// encode only once the kitty protocol is on; a default on either range
+    /// still hides the key from the shell.
+    fn is_function_key(key: &str) -> bool {
+        key.strip_prefix('f')
+            .and_then(|rest| rest.parse::<u32>().ok())
+            .is_some_and(|n| (1..=24).contains(&n))
+    }
+
     /// F1..F12 now encode (#834), so a default sitting on one takes it away
     /// from the shell the same way a Ctrl binding takes a control code: gpui
     /// matches bindings before the pane's key handler runs, so a bound
@@ -1093,7 +1103,7 @@ mod tests {
         for (action, spec) in default_bindings() {
             for chord in spec.split_whitespace() {
                 let ks = Keystroke::parse(chord).expect("default chords parse");
-                if crate::terminal::input::is_function_key(&ks.key) {
+                if is_function_key(&ks.key) {
                     bound.push((action, chord));
                 }
             }

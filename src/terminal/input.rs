@@ -323,14 +323,6 @@ fn kitty_function_key(key: &str) -> Option<u32> {
     (13..=24).contains(&n).then(|| 57376 + (n - 13))
 }
 
-/// Whether a key name is one of the function keys — the range that means
-/// nothing to a text field and everything to a shell. F13 and up encode only
-/// once the kitty protocol is negotiated.
-#[cfg(test)]
-pub(crate) fn is_function_key(key: &str) -> bool {
-    function_key(key).is_some() || kitty_function_key(key).is_some()
-}
-
 fn text_key_code(ks: &gpui::Keystroke) -> Option<u32> {
     match ks.key.as_str() {
         "space" => Some(0x20),

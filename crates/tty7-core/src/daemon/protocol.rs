@@ -72,7 +72,6 @@ pub enum DaemonMsg {
     Prompt {
         active: bool,
         at_prompt: bool,
-        last_exit: Option<i32>,
     },
     Exited {
         code: Option<i32>,

@@ -2,14 +2,14 @@ use gpui::{
     App, Background, Hsla, Menu, MenuItem, OsAction, Pixels, Styled, SystemMenuType, Window,
     WindowBackgroundAppearance, linear_color_stop, linear_gradient, px, rgb,
 };
+use gpui_component::input::{Cut, Redo, Undo};
 use gpui_component::scroll::ScrollbarShow;
 use gpui_component::{ActiveTheme, Theme, ThemeMode};
 
 use crate::core::actions::*;
 use crate::core::config::{Config, WindowBackdrop};
 use crate::terminal::view::{
-    ClearScrollback, CopyText, CutText, FindInTerminal, FindNext, FindPrevious, PasteText,
-    RedoEdit, SelectAll, UndoEdit,
+    ClearScrollback, CopyText, FindInTerminal, FindNext, FindPrevious, PasteText, SelectAll,
 };
 use crate::ui::i18n::{L10nKey, t};
 use crate::ui::presets;
@@ -22,10 +22,10 @@ pub(crate) fn set_menus(cx: &mut App) {
         application_menu(cx),
         file_menu(cx),
         Menu::new(t(L10nKey::AppMenuEdit)).items([
-            MenuItem::os_action(t(L10nKey::AppMenuUndo), UndoEdit, OsAction::Undo),
-            MenuItem::os_action(t(L10nKey::AppMenuRedo), RedoEdit, OsAction::Redo),
+            MenuItem::os_action(t(L10nKey::AppMenuUndo), Undo, OsAction::Undo),
+            MenuItem::os_action(t(L10nKey::AppMenuRedo), Redo, OsAction::Redo),
             MenuItem::separator(),
-            MenuItem::os_action(t(L10nKey::AppMenuCut), CutText, OsAction::Cut),
+            MenuItem::os_action(t(L10nKey::AppMenuCut), Cut, OsAction::Cut),
             MenuItem::os_action(t(L10nKey::AppMenuCopy), CopyText, OsAction::Copy),
             MenuItem::os_action(t(L10nKey::AppMenuPaste), PasteText, OsAction::Paste),
             MenuItem::os_action(t(L10nKey::AppMenuSelectAll), SelectAll, OsAction::SelectAll),

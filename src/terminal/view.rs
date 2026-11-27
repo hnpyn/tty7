@@ -37,12 +37,9 @@ actions!(
     [
         CopyText,
         CopyRaw,
-        CutText,
         PasteText,
         AlternatePaste,
         SelectAll,
-        UndoEdit,
-        RedoEdit,
         FindInTerminal,
         FindNext,
         FindPrevious,
@@ -1376,17 +1373,18 @@ impl TerminalView {
         // Ctrl+V is not here: off macOS it is the `AlternatePaste` binding,
         // which the keymap withholds on the alternate screen so a full-screen
         // program gets its SYN, and which the user can retire outright. Copy
-        // and cut stay, because both answer a selection this view owns and
-        // fall through to the PTY when there is none.
+        // stays, because it answers a selection this view owns and falls
+        // through to the PTY when there is none. Ctrl+X does not: it is CAN,
+        // and nothing in this view has text to cut.
         //
-        // Ctrl+Shift+C/X are the keymap's alone: rebinding Copy has to retire
+        // Ctrl+Shift+C is the keymap's alone: rebinding Copy has to retire
         // Ctrl+Shift+C, which it cannot if this path answers it too.
         if cfg!(not(target_os = "macos"))
             && m.control
             && !m.platform
             && !m.alt
             && !m.shift
-            && matches!(ks.key.as_str(), "c" | "x")
+            && ks.key.as_str() == "c"
         {
             match self.handle_cmd_shortcut(ks, window, cx) {
                 CmdKey::Consumed => {
@@ -1426,13 +1424,6 @@ impl TerminalView {
                     CmdKey::FallThrough
                 }
             }
-            "x" => {
-                if self.cut_contextual(cx) {
-                    CmdKey::Consumed
-                } else {
-                    CmdKey::FallThrough
-                }
-            }
             // Cmd+V only: macOS leaves `PasteText` unbound and pastes from
             // here, and Cmd carries no control code to lose. The Ctrl+V half
             // of this key lives in the keymap as `AlternatePaste`.
@@ -1442,10 +1433,6 @@ impl TerminalView {
             }
             "a" => {
                 self.select_all_contextual(cx);
-                CmdKey::Consumed
-            }
-            "z" => {
-                self.undo_edit(m.shift, cx);
                 CmdKey::Consumed
             }
             "left" => {
@@ -1814,10 +1801,6 @@ impl TerminalView {
             }
             return true;
         }
-        false
-    }
-    pub fn undo_edit(&mut self, _redo: bool, _cx: &mut Context<Self>) {}
-    pub fn cut_contextual(&mut self, _cx: &mut Context<Self>) -> bool {
         false
     }
 
@@ -3196,17 +3179,9 @@ impl Render for TerminalView {
                     cx.propagate();
                 }
             }))
-            .on_action(cx.listener(|this, _: &CutText, _w, cx| {
-                // Nothing to cut: the chord belongs to the shell.
-                if !this.cut_contextual(cx) {
-                    cx.propagate();
-                }
-            }))
             .on_action(cx.listener(|this, _: &PasteText, _w, cx| this.paste_from_clipboard(cx)))
             .on_action(cx.listener(|this, _: &AlternatePaste, _w, cx| this.alternate_paste(cx)))
             .on_action(cx.listener(|this, _: &SelectAll, _w, cx| this.select_all_contextual(cx)))
-            .on_action(cx.listener(|this, _: &UndoEdit, _w, cx| this.undo_edit(false, cx)))
-            .on_action(cx.listener(|this, _: &RedoEdit, _w, cx| this.undo_edit(true, cx)))
             .on_action(
                 cx.listener(|this, _: &FindInTerminal, window, cx| this.open_search(window, cx)),
             )
@@ -4671,7 +4646,6 @@ mod gpui_tests {
         daemon.send(DaemonMsg::Prompt {
             active: true,
             at_prompt: true,
-            last_exit: None,
         });
         for _ in 0..200 {
             if window
@@ -7256,6 +7230,125 @@ mod gpui_tests {
         assert_eq!(text.as_deref(), Some("hello"));
     }
 
+    /// Cmd+Z used to return `Consumed` after an empty undo, which stopped the
+    /// key outright. The terminal has nothing to undo, so Cmd+Z and
+    /// Cmd+Shift+Z bubble. Kitty still does not encode the platform modifier;
+    /// Ctrl+Z and Ctrl+X keep their sequences.
+    #[gpui::test]
+    fn cmd_z_bubbles_and_ctrl_z_still_reaches_a_kitty_client(cx: &mut TestAppContext) {
+        let (window, daemon) = harness(cx);
+        daemon.send(DaemonMsg::Output(b"\x1b[>1u".to_vec()));
+        for _ in 0..200 {
+            cx.run_until_parked();
+            if window
+                .update(cx, |view, _, _| view.key_flags().kitty_active())
+                .unwrap()
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        window
+            .update(cx, |view, window, cx| {
+                assert!(
+                    view.key_flags().kitty_active(),
+                    "the pane must be speaking the kitty keyboard protocol"
+                );
+                for spec in ["cmd-z", "cmd-shift-z", "cmd-x"] {
+                    let outcome = view.handle_cmd_shortcut(&key(spec), window, cx);
+                    assert!(
+                        matches!(outcome, CmdKey::Bubble),
+                        "{spec} must not be swallowed"
+                    );
+                    view.on_key_down(
+                        &KeyDownEvent {
+                            keystroke: key(spec),
+                            is_held: false,
+                            prefer_character_input: false,
+                        },
+                        window,
+                        cx,
+                    );
+                }
+                for spec in ["ctrl-z", "ctrl-x"] {
+                    view.on_key_down(
+                        &KeyDownEvent {
+                            keystroke: key(spec),
+                            is_held: false,
+                            prefer_character_input: false,
+                        },
+                        window,
+                        cx,
+                    );
+                }
+            })
+            .unwrap();
+
+        assert_eq!(
+            next_input_until_timeout(&daemon),
+            Some(b"\x1b[122;5u".to_vec()),
+            "ctrl-z still reaches a kitty client"
+        );
+        assert_eq!(
+            next_input_until_timeout(&daemon),
+            Some(b"\x1b[120;5u".to_vec()),
+            "ctrl-x still reaches a kitty client"
+        );
+        assert_eq!(next_input_until_timeout(&daemon), None);
+    }
+
+    /// Undo, redo and cut belong to the text field. The grid has no listener
+    /// for them, so the Edit menu must not offer them there — that is what
+    /// used to swallow Cmd+Z — and must offer them once the search field has
+    /// the keyboard.
+    #[gpui::test]
+    fn undo_redo_and_cut_follow_the_search_field(cx: &mut TestAppContext) {
+        use gpui_component::input::{Cut, Redo, Undo};
+
+        let (window, view, _daemon) = rooted_harness(cx);
+        let edits: &[(&str, &dyn gpui::Action)] =
+            &[("undo", &Undo), ("redo", &Redo), ("cut", &Cut)];
+
+        window
+            .update(cx, |_, window, cx| {
+                view.update(cx, |v, cx| window.focus(&v.focus_handle, cx));
+                window.refresh();
+            })
+            .unwrap();
+        window
+            .update(cx, |_, window, cx| {
+                assert!(
+                    view.read(cx).focus_handle.is_focused(window),
+                    "the grid has the keyboard"
+                );
+                for (name, action) in edits {
+                    assert!(
+                        !window.is_action_available(*action, cx),
+                        "{name} must not be available while the grid is focused"
+                    );
+                }
+                view.update(cx, |v, cx| v.open_search(window, cx));
+                window.refresh();
+            })
+            .unwrap();
+        window
+            .update(cx, |_, window, cx| {
+                let input = &view.read(cx).search.as_ref().unwrap().input;
+                assert!(
+                    input.read(cx).focus_handle(cx).is_focused(window),
+                    "the search field has the keyboard"
+                );
+                for (name, action) in edits {
+                    assert!(
+                        window.is_action_available(*action, cx),
+                        "{name} must be available while the search field is focused"
+                    );
+                }
+            })
+            .unwrap();
+    }
+
     #[gpui::test]
     fn cmd_v_pastes_on_the_alternate_screen(cx: &mut TestAppContext) {
         let (window, daemon) = harness(cx);
@@ -7440,7 +7533,6 @@ mod gpui_tests {
         daemon.send(DaemonMsg::Prompt {
             active: true,
             at_prompt: false,
-            last_exit: None,
         });
         for _ in 0..200 {
             cx.run_until_parked();
@@ -7683,7 +7775,6 @@ mod gpui_tests {
         daemon.send(DaemonMsg::Prompt {
             active: true,
             at_prompt: true,
-            last_exit: None,
         });
         wait_for(cx, &|view| view.terminal.at_prompt());
         assert_eq!(shape(cx), Some(CursorStyle::Bar));
@@ -7705,7 +7796,6 @@ mod gpui_tests {
         daemon.send(DaemonMsg::Prompt {
             active: true,
             at_prompt: false,
-            last_exit: None,
         });
         wait_for(cx, &|view| !view.terminal.at_prompt());
         assert_eq!(shape(cx), None, "a running command gets cursor_style back");
@@ -7763,7 +7853,6 @@ mod gpui_tests {
         daemon.send(DaemonMsg::Prompt {
             active: true,
             at_prompt: true,
-            last_exit: Some(255),
         });
 
         let mut state = (false, true, true);

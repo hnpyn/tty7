@@ -921,11 +921,7 @@ impl RemoteTerminal {
                                     *guard = Some(path);
                                 }
                             }
-                            DaemonMsg::Prompt {
-                                active,
-                                at_prompt,
-                                last_exit: _,
-                            } => {
+                            DaemonMsg::Prompt { active, at_prompt } => {
                                 flush_batch!();
                                 if let Ok(mut guard) = shell.lock() {
                                     *guard = ShellState { active, at_prompt };
@@ -1771,7 +1767,6 @@ mod replay_tests {
         DaemonMsg::Prompt {
             active: true,
             at_prompt: true,
-            last_exit: Some(130),
         }
     }
 
@@ -2589,7 +2584,6 @@ mod tests {
         daemon_side.send(DaemonMsg::Prompt {
             active: true,
             at_prompt: true,
-            last_exit: Some(255),
         });
 
         let mut mode = TermMode::NONE;
@@ -2999,7 +2993,6 @@ mod tests {
         daemon_side.send(DaemonMsg::Prompt {
             active: false,
             at_prompt: true,
-            last_exit: None,
         });
         daemon_side.send(DaemonMsg::Output(b"m".to_vec()));
 
@@ -3031,7 +3024,6 @@ mod tests {
         daemon_side.send(DaemonMsg::Prompt {
             active: true,
             at_prompt: true,
-            last_exit: Some(0),
         });
 
         let mut at = false;
@@ -3073,7 +3065,6 @@ mod tests {
         daemon_side.send(DaemonMsg::Prompt {
             active: true,
             at_prompt: true,
-            last_exit: Some(0),
         });
         daemon_side.send(DaemonMsg::Output(redraw(98, "16:46:20")));
         for cols in [92, 86, 92, 98] {
