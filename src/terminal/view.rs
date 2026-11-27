@@ -3188,9 +3188,8 @@ impl Render for TerminalView {
             // Off macOS these two live on F3 and Shift+F3, which is also where
             // PSReadLine keeps CharacterSearch and readline users put their
             // own widgets. With no find bar open there is no next match to
-            // step to, so the keystroke is given back the way `EditorSave`
-            // gives back Ctrl+S — otherwise the action swallows the key and
-            // the shell never sees it (#834).
+            // step to, so the listener calls `cx.propagate()` — otherwise the
+            // binding swallows the key and the shell never sees it (#834).
             .on_action(cx.listener(|this, _: &FindNext, _w, cx| {
                 if this.search.is_none() {
                     cx.propagate();
@@ -7298,15 +7297,17 @@ mod gpui_tests {
         assert_eq!(next_input_until_timeout(&daemon), None);
     }
 
-    /// Undo, redo and cut belong to the text field. The grid has no listener
-    /// for them, so the Edit menu must not offer them there — that is what
-    /// used to swallow Cmd+Z — and must offer them once the search field has
-    /// the keyboard.
+    /// Undo, redo and cut belong to a text field. The grid must not offer
+    /// them: `TerminalView` used to listen for `UndoEdit` and `CutText`, and
+    /// that lit the Edit menu while the grid was focused. Cmd+Z itself was
+    /// swallowed by `handle_cmd_shortcut` consuming `"z"`. Once the search
+    /// field or the composer has the keyboard, the input's own undo, redo
+    /// and cut have to be available.
     #[gpui::test]
     fn undo_redo_and_cut_follow_the_search_field(cx: &mut TestAppContext) {
         use gpui_component::input::{Cut, Redo, Undo};
 
-        let (window, view, _daemon) = rooted_harness(cx);
+        let (window, view, daemon) = rooted_harness(cx);
         let edits: &[(&str, &dyn gpui::Action)] =
             &[("undo", &Undo), ("redo", &Redo), ("cut", &Cut)];
 
@@ -7343,6 +7344,47 @@ mod gpui_tests {
                     assert!(
                         window.is_action_available(*action, cx),
                         "{name} must be available while the search field is focused"
+                    );
+                }
+            })
+            .unwrap();
+
+        // An agent whose box docks under the grid: the input is on screen
+        // without a prompt area to cover.
+        daemon.send(DaemonMsg::Agent(Some(
+            crate::core::cli_agent::CLIAgent::Aider,
+        )));
+        for _ in 0..400 {
+            if cx.update(|cx| view.read(cx).agent().is_some()) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            cx.update(|cx| view.read(cx).agent().is_some()),
+            "the pane has an agent"
+        );
+
+        window
+            .update(cx, |_, window, cx| {
+                view.update(cx, |v, cx| {
+                    v.close_search(window, cx);
+                    v.toggle_composer(window, cx);
+                });
+                window.refresh();
+            })
+            .unwrap();
+        window
+            .update(cx, |_, window, cx| {
+                let input = view.read(cx).composer.as_ref().unwrap().input.clone();
+                assert!(
+                    input.read(cx).focus_handle(cx).is_focused(window),
+                    "the composer has the keyboard"
+                );
+                for (name, action) in edits {
+                    assert!(
+                        window.is_action_available(*action, cx),
+                        "{name} must be available while the composer is focused"
                     );
                 }
             })

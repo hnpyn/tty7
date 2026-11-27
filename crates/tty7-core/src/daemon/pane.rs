@@ -2640,20 +2640,21 @@ fn same_dir(a: &Path, b: &Path) -> bool {
         }
 }
 
-/// Take a batch of prompt marks out of the local line editor's reach.
+/// Clear `at_prompt` on a batch of OSC 133 marks a foreground program is relaying.
 ///
 /// Called when a foreground program owns the pty, which means the marks are
 /// being relayed — an `ssh` passing the far shell's prompt through, a nested
-/// shell drawing its own. The local editor must not engage on those, so
-/// `at_prompt` is cleared across the whole batch.
+/// shell drawing its own. `at_prompt` is what [`DaemonMsg::Prompt`] reports,
+/// and the pane treats that as this shell sitting at its own prompt (the
+/// prompt cursor, command-duration notifications, coming back off the
+/// alternate screen). A relayed prompt must not say that, so the flag is
+/// cleared across the whole batch.
 ///
-/// [`ShellState::mark_at_prompt`] is deliberately left standing: it is the
-/// same marks read for a different question, and on a remote pane it is the
-/// only thing this machine knows about the far shell (#840). Because of it,
-/// dedup has to compare what is actually emitted rather than the whole struct
-/// — two marks that used to collapse into one `Prompt` message must still
-/// collapse when only their unsuppressed twin tells them apart, and the
-/// survivor has to carry the *newest* twin: a whole turn can arrive in one read
+/// [`ShellState::mark_at_prompt`] keeps the marks' own reading. Suppression
+/// only writes `at_prompt`, and dedup compares the fields that are actually
+/// emitted. Two marks that used to collapse into one `Prompt` must still
+/// collapse when only that unsuppressed reading tells them apart, and the
+/// survivor has to carry the *newest* one: a whole turn can arrive in one read
 /// (`D`, the prompt's `A`/`B`, then the next command's `C`), and dropping the
 /// last entry's reading would hand the pane back a prompt it has already left.
 fn suppress_relayed_prompt_marks(shell: &mut Vec<ShellState>) {
@@ -3048,16 +3049,13 @@ fn foreground_agent(
 struct ShellState {
     active: bool,
     at_prompt: bool,
-    /// `at_prompt` as the marks themselves read it, kept out of the
-    /// suppression the reader applies when a foreground program is running.
-    ///
-    /// Two different questions share one pair of marks. "Should the local line
-    /// editor engage?" must say no while `ssh` owns the pty, whoever drew the
-    /// prompt — that is `at_prompt`. "Is anything running in this pane?" wants
-    /// the opposite: the prompt an `ssh` is relaying belongs to the shell that
-    /// is actually driving the pane, and it is the only thing this side can
-    /// read about the far one. Keeping both means neither answer has to be
-    /// derived from the other's.
+    /// The OSC 133 reading before suppression. `at_prompt` is what
+    /// [`DaemonMsg::Prompt`] emits, and a foreground program relaying marks
+    /// forces that flag false so the pane does not treat the far prompt as
+    /// its own. This field is the mark itself, so a collapsed batch still
+    /// carries the newest prompt-or-command reading — over `ssh`, the only
+    /// signal this side has that the far shell is at a prompt (#840).
+    /// Suppression never writes it.
     mark_at_prompt: bool,
     command: Option<String>,
 }
@@ -4139,7 +4137,7 @@ mod tests {
         }
         assert!(
             !signals.shell.last().unwrap().at_prompt,
-            "a foreground program's prompt marks must not engage the local editor"
+            "a foreground program's prompt marks must not report this shell at its prompt"
         );
         assert!(
             signals.shell.last().unwrap().mark_at_prompt,

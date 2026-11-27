@@ -1075,6 +1075,9 @@ mod tests {
     /// A modifier does not change it (`shift-f3` is still `f3`). F13 and up
     /// encode only once the kitty protocol is on; a default on either range
     /// still hides the key from the shell.
+    ///
+    /// Keep this set aligned with `terminal::input`: `function_key` is F1–F12
+    /// and `kitty_function_key` is F13–F24.
     fn is_function_key(key: &str) -> bool {
         key.strip_prefix('f')
             .and_then(|rest| rest.parse::<u32>().ok())
